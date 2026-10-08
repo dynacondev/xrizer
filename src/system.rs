@@ -601,10 +601,27 @@ impl vr::IVRSystem026_Interface for System {
                 // The Unity OpenVR sample appears to have a hard requirement on these first three properties returning
                 // something to even get the game to recognize the HMD's location. However, the value
                 // itself doesn't appear to be that important.
-                vr::ETrackedDeviceProperty::SerialNumber_String
-                | vr::ETrackedDeviceProperty::ManufacturerName_String
-                | vr::ETrackedDeviceProperty::ControllerType_String => {
+                vr::ETrackedDeviceProperty::ControllerType_String => {
                     Some(CString::new("<unknown>").unwrap())
+                }
+                // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment:
+                // impersonate a Pimax Dream Air LH (known-good SteamVR eye
+                // tracking path via the sboys driver) to see if X-Plane's
+                // "VRS isn't compatible with this headset" verdict is a
+                // headset-identity gate. Values sourced from the sboys
+                // CustomHeadsetOpenVR driver checks: manufacturer/model must
+                // contain "Pimax", USB product name is "Pimax Dream Air",
+                // serials start with 'P'. Exact model/serial strings are
+                // unconfirmed - replace with values from a real unit (or with
+                // real runtime-derived identity) before merging.
+                vr::ETrackedDeviceProperty::ManufacturerName_String => {
+                    Some(CString::new("Pimax").unwrap())
+                }
+                vr::ETrackedDeviceProperty::ModelNumber_String => {
+                    Some(CString::new("Pimax Dream Air").unwrap())
+                }
+                vr::ETrackedDeviceProperty::SerialNumber_String => {
+                    Some(CString::new("P00000000").unwrap())
                 }
                 // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment:
                 // X-Plane reads TrackingSystemName twice at startup and gets
