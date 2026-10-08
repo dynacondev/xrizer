@@ -4,7 +4,7 @@ use crate::{
 };
 use derive_more::Deref;
 use glam::f32::{Quat, Vec3};
-use log::{info, warn};
+use log::{debug, info, warn};
 use openvr as vr;
 use openxr as xr;
 use std::mem::ManuallyDrop;
@@ -125,6 +125,14 @@ impl<C: Compositor> OpenXrData<C> {
         let supported_exts = entry
             .enumerate_extensions()
             .map_err(InitError::EnumeratingExtensionsFailed)?;
+        // Diagnostic aid for the eye-tracking work: show what the runtime
+        // offers (e.g. whether a WiVRn/Monado runtime advertises
+        // EXT_eye_gaze_interaction) and what we enabled in response.
+        info!(
+            "runtime advertises eye gaze interaction: {}",
+            supported_exts.ext_eye_gaze_interaction
+        );
+        debug!("full advertised OpenXR extension set: {supported_exts:?}");
         let mut exts = xr::ExtensionSet::default();
         exts.khr_vulkan_enable = supported_exts.khr_vulkan_enable;
         exts.khr_opengl_enable = supported_exts.khr_opengl_enable;

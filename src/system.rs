@@ -599,6 +599,15 @@ impl vr::IVRSystem026_Interface for System {
                 | vr::ETrackedDeviceProperty::ControllerType_String => {
                     Some(CString::new("<unknown>").unwrap())
                 }
+                // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment:
+                // X-Plane reads TrackingSystemName twice at startup and gets
+                // UnknownProperty without this. Report the Quest-family value
+                // to see if its "VRS isn't compatible with this headset"
+                // verdict is an unknown-headset gate. Revisit when reporting
+                // real identity.
+                vr::ETrackedDeviceProperty::TrackingSystemName_String => {
+                    Some(CString::new("oculus").unwrap())
+                }
                 _ => None,
             },
             _ => self
