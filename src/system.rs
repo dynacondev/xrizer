@@ -601,12 +601,15 @@ impl vr::IVRSystem026_Interface for System {
                 }
                 // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment:
                 // X-Plane reads TrackingSystemName twice at startup and gets
-                // UnknownProperty without this. Report the Quest-family value
-                // to see if its "VRS isn't compatible with this headset"
-                // verdict is an unknown-headset gate. Revisit when reporting
-                // real identity.
+                // UnknownProperty without this. Report the SteamVR/Lighthouse
+                // value used by SteamVR-native eye-tracked headsets (Vive Pro
+                // Eye, Pimax Crystal, Varjo) to see if its "VRS isn't
+                // compatible with this headset" verdict is an unknown-headset
+                // gate. ("oculus" was tried and moved nothing; Laminar only
+                // supports eye tracking outside the Quest family.) Revisit
+                // when reporting real identity.
                 vr::ETrackedDeviceProperty::TrackingSystemName_String => {
-                    Some(CString::new("oculus").unwrap())
+                    Some(CString::new("lighthouse").unwrap())
                 }
                 _ => None,
             },
