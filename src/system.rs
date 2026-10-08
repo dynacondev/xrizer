@@ -205,6 +205,10 @@ impl vr::IVRSystem026_Interface for System {
             )
             .unwrap();
 
+        debug!(
+            "GetRecommendedRenderTargetSize: {}x{}",
+            views[0].recommended_image_rect_width, views[0].recommended_image_rect_height
+        );
         if !width.is_null() {
             unsafe { *width = views[0].recommended_image_rect_width };
         }
@@ -214,6 +218,7 @@ impl vr::IVRSystem026_Interface for System {
         }
     }
     fn GetProjectionMatrix(&self, eye: vr::EVREye, near_z: f32, far_z: f32) -> vr::HmdMatrix44_t {
+        trace!("GetProjectionMatrix: {eye:?} near={near_z} far={far_z}");
         // https://github.com/ValveSoftware/openvr/wiki/IVRSystem::GetProjectionRaw
         let [mut left, mut right, mut up, mut down] = [0.0; 4];
         self.GetProjectionRaw(eye, &mut left, &mut right, &mut down, &mut up);
@@ -246,6 +251,7 @@ impl vr::IVRSystem026_Interface for System {
             .session_data
             .get()
             .current_origin_as_reference_space();
+        trace!("GetProjectionRaw: {eye:?}");
         let view = self.get_views(ty).views[eye as usize];
 
         // Top and bottom are flipped, for some reason
@@ -279,6 +285,7 @@ impl vr::IVRSystem026_Interface for System {
         false
     }
     fn GetEyeToHeadTransform(&self, eye: vr::EVREye) -> vr::HmdMatrix34_t {
+        trace!("GetEyeToHeadTransform: {eye:?}");
         let views = self.get_views(xr::ReferenceSpaceType::VIEW).views;
         let view = views[eye as usize];
         let view_rot = view.pose.orientation;
@@ -764,6 +771,19 @@ impl vr::IVRSystem026_Interface for System {
         // OpenXR SystemEyeGazeInteractionProperties before merging.
         if device_index == vr::k_unTrackedDeviceIndex_Hmd
             && prop == vr::ETrackedDeviceProperty::SupportsXrEyeGazeInteraction_Bool
+        {
+            if let Some(err) = unsafe { err.as_mut() } {
+                *err = vr::ETrackedPropertyError::Success;
+            }
+            return true;
+        }
+        // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment: every
+        // physical HMD has a proximity sensor and X-Plane notices ours is
+        // missing ("This device does NOT have a proximity sensor"). Claim one
+        // to see if mount-detection factors into its "VRS isn't compatible
+        // with this headset" verdict. Revisit when reporting real caps.
+        if device_index == vr::k_unTrackedDeviceIndex_Hmd
+            && prop == vr::ETrackedDeviceProperty::ContainsProximitySensor_Bool
         {
             if let Some(err) = unsafe { err.as_mut() } {
                 *err = vr::ETrackedPropertyError::Success;

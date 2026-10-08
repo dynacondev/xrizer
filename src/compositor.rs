@@ -730,6 +730,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
         bounds: *const vr::VRTextureBounds_t,
         submit_flags: vr::EVRSubmitFlags,
     ) -> vr::EVRCompositorError {
+        trace!(
+            "Submit: {eye:?} flags={submit_flags:?} bounds={:?}",
+            unsafe { bounds.as_ref() }
+        );
         let bounds = unsafe { bounds.as_ref() }
             .copied()
             .unwrap_or(vr::VRTextureBounds_t {
@@ -874,6 +878,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         game_pose_array: *mut vr::TrackedDevicePose_t,
         game_pose_count: u32,
     ) -> vr::EVRCompositorError {
+        trace!("WaitGetPoses: render_count={render_pose_count} game_count={game_pose_count}");
         tracy_span!("WaitGetPoses impl");
         // This should be called every frame - we must regularly poll events
         self.openxr.poll_events();
