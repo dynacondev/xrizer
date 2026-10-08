@@ -986,26 +986,65 @@ impl<C: openxr_data::Compositor> vr::IVRInput011_Interface for Input<C> {
         vr::EVRInputError::None
     }
 
+    // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment: report a
+    // synthetic fixated-forward gaze so we can see whether X-Plane's "VRS
+    // isn't compatible with this hardware" message goes away. Replace with
+    // real OpenXR eye-gaze values (EXT_eye_gaze_interaction) before merging.
     fn GetEyeTrackingDataRelativeToNow(
         &self,
         _: openvr::VRActionHandle_t,
         _: openvr::ETrackingUniverseOrigin,
         _: f32,
-        _: *mut openvr::VREyeTrackingData_t,
-        _: u32,
+        eye_data: *mut openvr::VREyeTrackingData_t,
+        eye_data_size: u32,
     ) -> openvr::EVRInputError {
-        crate::warn_unimplemented!("GetEyeTrackingDataRelativeToNow");
-        vr::EVRInputError::NoData
+        assert_eq!(
+            eye_data_size as usize,
+            std::mem::size_of::<vr::VREyeTrackingData_t>()
+        );
+        if eye_data.is_null() {
+            return vr::EVRInputError::InvalidParam;
+        }
+        unsafe {
+            eye_data.write(vr::VREyeTrackingData_t {
+                bActive: true,
+                bValid: true,
+                bTracked: true,
+                vGazeOrigin: vr::HmdVector3_t { v: [0.0, 0.0, 0.0] },
+                vGazeTarget: vr::HmdVector3_t {
+                    v: [0.0, 0.0, -1.0],
+                },
+            });
+        }
+        vr::EVRInputError::None
     }
+    // XXX DIAGNOSTIC HACK, see above.
     fn GetEyeTrackingDataForNextFrame(
         &self,
         _: openvr::VRActionHandle_t,
         _: openvr::ETrackingUniverseOrigin,
-        _: *mut openvr::VREyeTrackingData_t,
-        _: u32,
+        eye_data: *mut openvr::VREyeTrackingData_t,
+        eye_data_size: u32,
     ) -> openvr::EVRInputError {
-        crate::warn_unimplemented!("GetEyeTrackingDataForNextFrame");
-        vr::EVRInputError::NoData
+        assert_eq!(
+            eye_data_size as usize,
+            std::mem::size_of::<vr::VREyeTrackingData_t>()
+        );
+        if eye_data.is_null() {
+            return vr::EVRInputError::InvalidParam;
+        }
+        unsafe {
+            eye_data.write(vr::VREyeTrackingData_t {
+                bActive: true,
+                bValid: true,
+                bTracked: true,
+                vGazeOrigin: vr::HmdVector3_t { v: [0.0, 0.0, 0.0] },
+                vGazeTarget: vr::HmdVector3_t {
+                    v: [0.0, 0.0, -1.0],
+                },
+            });
+        }
+        vr::EVRInputError::None
     }
 
     fn UpdateActionState(

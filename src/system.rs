@@ -461,21 +461,38 @@ impl vr::IVRSystem026_Interface for System {
         }
     }
 
+    // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment: report a
+    // synthetic center-screen gaze so we can see whether X-Plane's "VRS isn't
+    // compatible with this hardware" message goes away. Replace with real
+    // OpenXR eye-gaze values (EXT_eye_gaze_interaction) before merging.
     fn GetEyeTrackedFoveationCenter(
         &self,
-        _: *mut openvr::HmdVector2_t,
-        _: *mut openvr::HmdVector2_t,
+        left: *mut openvr::HmdVector2_t,
+        right: *mut openvr::HmdVector2_t,
     ) -> bool {
-        crate::warn_unimplemented!("GetEyeTrackedFoveationCenter");
-        false
+        const CENTER: openvr::HmdVector2_t = openvr::HmdVector2_t { v: [0.0, 0.0] };
+        unsafe {
+            if let Some(left) = left.as_mut() {
+                *left = CENTER;
+            }
+            if let Some(right) = right.as_mut() {
+                *right = CENTER;
+            }
+        }
+        true
     }
+    // XXX DIAGNOSTIC HACK, see above.
     fn GetEyeTrackedFoveationCenterForProjection(
         &self,
         _: *const openvr::HmdMatrix44_t,
-        _: *mut openvr::HmdVector2_t,
+        center: *mut openvr::HmdVector2_t,
     ) -> bool {
-        crate::warn_unimplemented!("GetEyeTrackedFoveationCenterForProjection");
-        false
+        unsafe {
+            if let Some(center) = center.as_mut() {
+                *center = openvr::HmdVector2_t { v: [0.0, 0.0] };
+            }
+        }
+        true
     }
 
     fn GetEventTypeNameFromEnum(&self, _: vr::EVREventType) -> *const std::os::raw::c_char {
@@ -729,6 +746,18 @@ impl vr::IVRSystem026_Interface for System {
         err: *mut vr::ETrackedPropertyError,
     ) -> bool {
         debug!(target: log_tags::TRACKED_PROP, "requesting bool property: {prop:?} ({device_index})");
+        // XXX DIAGNOSTIC HACK for X-Plane eye-tracking gate experiment: claim
+        // eye-gaze support so we can see whether X-Plane's "VRS isn't
+        // compatible with this hardware" message goes away. Gate on the real
+        // OpenXR SystemEyeGazeInteractionProperties before merging.
+        if device_index == vr::k_unTrackedDeviceIndex_Hmd
+            && prop == vr::ETrackedDeviceProperty::SupportsXrEyeGazeInteraction_Bool
+        {
+            if let Some(err) = unsafe { err.as_mut() } {
+                *err = vr::ETrackedPropertyError::Success;
+            }
+            return true;
+        }
         if let Some(err) = unsafe { err.as_mut() } {
             *err = vr::ETrackedPropertyError::UnknownProperty;
         }
