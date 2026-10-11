@@ -209,20 +209,17 @@ fn parse_fov_override(s: &str) -> Option<FovOverride> {
 /// projection-layer FOV (see end_frame) so render and display stay
 /// consistent. X-Plane reads Raw once at startup and builds its own
 /// matrices, so the Raw path is the load-bearing one for it.
+/// See fov_override_right/fov_override_for_eye for per-eye control.
 pub(crate) fn fov_override() -> Option<FovOverride> {
     static PARSED: std::sync::OnceLock<(Option<FovOverride>, &'static str)> =
         std::sync::OnceLock::new();
     let (ov, src) = PARSED.get_or_init(|| {
-        if let Some(a) = std::env::args()
-            .skip(1)
-            .find_map(|a| a.strip_prefix("--xrizer-fov=").map(str::to_owned))
-        {
-            return (parse_fov_override(&a), "cli --xrizer-fov");
-        }
-        match std::env::var("XRIZER_FOV") {
-            Ok(s) => (parse_fov_override(&s), "env XRIZER_FOV"),
-            Err(_) => (None, ""),
-        }
+        parse_fov_from(
+            "--xrizer-fov=",
+            "XRIZER_FOV",
+            "cli --xrizer-fov",
+            "env XRIZER_FOV",
+        )
     });
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| match ov {
@@ -242,6 +239,70 @@ pub(crate) fn fov_override() -> Option<FovOverride> {
         }
     });
     *ov
+}
+
+fn parse_fov_from(
+    cli_flag: &str,
+    env_name: &str,
+    cli_label: &'static str,
+    env_label: &'static str,
+) -> (Option<FovOverride>, &'static str) {
+    if let Some(a) = std::env::args()
+        .skip(1)
+        .find_map(|a| a.strip_prefix(cli_flag).map(str::to_owned))
+    {
+        return (parse_fov_override(&a), cli_label);
+    }
+    match std::env::var(env_name) {
+        Ok(s) => (parse_fov_override(&s), env_label),
+        Err(_) => (None, ""),
+    }
+}
+
+/// Right-eye-specific FOV override (CLI `--xrizer-fov-right=...`, else env
+/// `XRIZER_FOV_RIGHT`, same formats). Falls back to the shared
+/// fov_override() when unset, so symmetric setups need only one variable.
+/// Needed because stock HMD frustums are asymmetric per eye and the render
+/// frustum under test may be too.
+pub(crate) fn fov_override_right() -> Option<FovOverride> {
+    static PARSED: std::sync::OnceLock<(Option<FovOverride>, &'static str)> =
+        std::sync::OnceLock::new();
+    let (ov, src) = PARSED.get_or_init(|| {
+        parse_fov_from(
+            "--xrizer-fov-right=",
+            "XRIZER_FOV_RIGHT",
+            "cli --xrizer-fov-right",
+            "env XRIZER_FOV_RIGHT",
+        )
+    });
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| match ov {
+        Some(o) => log::info!(
+            "xrizer-debug: FOV override (right eye) from {src}: l={:.2} r={:.2} u={:.2} d={:.2} deg halves",
+            o.left_deg,
+            o.right_deg,
+            o.up_deg,
+            o.down_deg,
+        ),
+        None => {
+            if !src.is_empty() {
+                log::warn!(
+                    "xrizer-debug: ignoring malformed FOV override (right eye) from {src}; want \"l,r,u,d\" half-deg or \"h,v\" total-deg"
+                );
+            }
+        }
+    });
+    (*ov).unwrap_or_else(fov_override)
+}
+
+/// Override for one eye: left uses the shared fov_override(), right uses
+/// the right-specific one when set, else the shared one.
+pub(crate) fn fov_override_for_eye(right: bool) -> Option<FovOverride> {
+    if right {
+        fov_override_right()
+    } else {
+        fov_override()
+    }
 }
 
 fn parse_render_target(s: &str) -> Option<(u32, u32)> {
@@ -398,7 +459,8 @@ impl vr::IVRSystem026_Interface for System {
         // FOV override path (see fov_override): replaces served tangents,
         // mirroring the default path's convention exactly, flip included:
         // served (left,right,top,bottom) = (-tan l, +tan r, -tan d, +tan u).
-        if let Some(o) = fov_override() {
+        // Per-eye: right uses XRIZER_FOV_RIGHT when set, else the shared one.
+        if let Some(o) = fov_override_for_eye((eye as usize) == 1) {
             let (l, r, t, b) = (
                 -o.left_deg.to_radians().tan(),
                 o.right_deg.to_radians().tan(),

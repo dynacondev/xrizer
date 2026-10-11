@@ -1306,8 +1306,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             let crate::system::ViewData { flags, views } =
                 system.get_views(session_data.current_origin_as_reference_space());
             // FOV override: keep the submitted layer consistent with what
-            // GetProjectionRaw served the app (see fov_override).
-            let fov_ov = crate::system::fov_override();
+            // GetProjectionRaw served the app (see fov_override). Per-eye:
+            // right uses XRIZER_FOV_RIGHT when set, else the shared one.
             proj_layer_views = views
                 .into_iter()
                 .enumerate()
@@ -1331,7 +1331,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     } = self.eyes_submitted[eye_index]
                         .unwrap_or_else(|| panic!("Eye {eye_index} has not been submitted!"));
                     let mut fov = view.fov;
-                    if let Some(o) = fov_ov {
+                    if let Some(o) = crate::system::fov_override_for_eye(eye_index == 1) {
                         // Mirror the runtime convention: up positive, down
                         // negative. (A positive angle_down is invalid and
                         // gets the layer rejected -> black feed.)
@@ -1341,6 +1341,13 @@ impl<G: GraphicsBackend> FrameController<G> {
                             angle_up: o.up_deg.to_radians(),
                             angle_down: -o.down_deg.to_radians(),
                         };
+                        log::debug!(
+                            "xrizer-debug: submitted layer fov eye={eye_index} L/R/U/D=({:.2},{:.2},{:.2},{:.2}) deg",
+                            o.left_deg,
+                            o.right_deg,
+                            o.up_deg,
+                            o.down_deg,
+                        );
                     }
                     if flip_vertically {
                         std::mem::swap(&mut fov.angle_up, &mut fov.angle_down);
