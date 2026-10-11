@@ -430,6 +430,79 @@ fn render_target_override() -> Option<(u32, u32)> {
     *ov
 }
 
+/// Inverse-radial warp strength (pincushion) from CLI `--xrizer-warp=...`
+/// (wins) or env `XRIZER_WARP`. Single float `k` in `r' = r*(1 + k*r^2)`
+/// with `r` in aspect-corrected centered UV units:
+/// - `k > 0` = pincushion (edges magnify; samples outward),
+/// - `k < 0` = barrel (edges shrink; samples inward),
+/// - `k == 0` / unset / malformed = off (fast straight-copy path).
+/// Vulkan eye-submit path only for this experiment; GL ignores it.
+pub(crate) fn warp_strength() -> f32 {
+    static PARSED: std::sync::OnceLock<(f32, &'static str)> = std::sync::OnceLock::new();
+    let (k, src) = PARSED.get_or_init(|| {
+        if let Some(a) = std::env::args()
+            .skip(1)
+            .find_map(|a| a.strip_prefix("--xrizer-warp=").map(str::to_owned))
+        {
+            return (a.trim().parse().unwrap_or(0.0), "cli --xrizer-warp");
+        }
+        match std::env::var("XRIZER_WARP") {
+            Ok(s) => (s.trim().parse().unwrap_or(0.0), "env XRIZER_WARP"),
+            Err(_) => (0.0, ""),
+        }
+    });
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        if *k != 0.0 {
+            log::info!("xrizer-debug: warp active k={k:.4} from {src} (k>0 pincushion, k<0 barrel)");
+        } else if !src.is_empty() {
+            log::warn!("xrizer-debug: ignoring malformed warp override from {src}; want single float like \"0.2\"");
+        }
+    });
+    *k
+}
+
+/// Optical center for the warp in `0-1` UV (texCoord) space, derived from
+/// the display-path FOV (layer override wins, else render-path override),
+/// falling back to texture center when no override is set.
+///
+/// Horizontal is unambiguous (`u=0` left `-tanL`, `u=1` right `+tanR`):
+/// `cx = tanL/(tanL+tanR)`. Vertical assumes `v=0` top (`+up`) so
+/// `cy = tanU/(tanU+tanD)`, mirroring `end_frame`'s flip handling by
+/// inverting when `bounds` are flipped. Symmetric FOVs give `(0.5, 0.5)`.
+pub(crate) fn warp_center_for_eye(right: bool, bounds: vr::VRTextureBounds_t) -> (f32, f32) {
+    let fov = fov_layer_for_eye(right).or_else(|| fov_override_for_eye(right));
+    let Some(o) = fov else {
+        return (0.5, 0.5);
+    };
+    let tan_l = o.left_deg.to_radians().tan();
+    let tan_r = o.right_deg.to_radians().tan();
+    let tan_u = o.up_deg.to_radians().tan();
+    let tan_d = o.down_deg.to_radians().tan();
+    let mut cx = if tan_l + tan_r > 0.0 {
+        tan_l / (tan_l + tan_r)
+    } else {
+        0.5
+    };
+    let mut cy = if tan_u + tan_d > 0.0 {
+        tan_u / (tan_u + tan_d)
+    } else {
+        0.5
+    };
+    // Mirror end_frame flip handling: flipped bounds invert the axis.
+    if bounds.uMin > bounds.uMax {
+        cx = 1.0 - cx;
+    }
+    if bounds.vMin > bounds.vMax {
+        cy = 1.0 - cy;
+    }
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        log::info!("xrizer-debug: warp center from display FOV: cx={cx:.4} cy={cy:.4}");
+    });
+    (cx, cy)
+}
+
 #[derive(macros::InterfaceImpl)]
 #[interface = "IVRSystem"]
 #[versions(026, 023, 022, 021, 020, 019, 017, 016, 015, 014, 012, 011, 009)]

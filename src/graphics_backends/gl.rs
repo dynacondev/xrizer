@@ -214,6 +214,18 @@ impl GraphicsBackend for GlData {
         image_index: usize,
         _submit_flags: vr::EVRSubmitFlags,
     ) -> xr::Extent2Di {
+        // XRIZER_WARP experiment is Vulkan-only; make that visible instead of
+        // silently doing a straight copy here.
+        let warp_k = crate::system::warp_strength();
+        if warp_k != 0.0 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                log::warn!(
+                    "xrizer-debug: XRIZER_WARP={warp_k:.4} ignored on OpenGL backend (Vulkan-only experiment)"
+                );
+            });
+        }
+
         let swapchain_texture = self.images[image_index];
 
         let xr::Rect2Di { extent, offset } = texture_rect_from_bounds(texture, bounds);
