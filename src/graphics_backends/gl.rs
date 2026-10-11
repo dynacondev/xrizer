@@ -340,7 +340,7 @@ impl GraphicsBackend for GlData {
             static LOGGED_GL_WARP: std::sync::Once = std::sync::Once::new();
             LOGGED_GL_WARP.call_once(|| {
                 log::info!(
-                    "xrizer-debug: warp active on OpenGL backend k={warp_k:.4} zoom={zoom:.4} (k>0 pincushion, k<0 barrel; zoom<1 minify, zoom>1 magnify)"
+                    "xrizer-debug: warp active on OpenGL backend k={warp_k:.4} zoom={zoom:.4} (k>0 pulls content inward, k<0 pushes outward; s<1 zooms-in, s>1 zooms-out)"
                 );
             });
             if let Some(extent) =
@@ -465,9 +465,9 @@ in vec2 baseUV;
 out vec4 color;
 uniform sampler2D src;
 uniform vec2 center; // optical center in baseUV space
-uniform float k;     // >0 pincushion, <0 barrel, 0 off
+uniform float k;     // >0 pulls content inward, <0 pushes outward, 0 off
 uniform float aspect; // extent.width / extent.height
-uniform float zoom;  // uniform scale: <1 minify, >1 magnify, 1 identity
+uniform float zoom;  // <1 zooms-in, >1 zooms-out, 1 identity
 void main() {
     vec2 p = vec2((baseUV.x - center.x) * aspect, baseUV.y - center.y);
     float r2 = dot(p, p);

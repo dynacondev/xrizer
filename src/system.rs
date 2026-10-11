@@ -430,11 +430,14 @@ fn render_target_override() -> Option<(u32, u32)> {
     *ov
 }
 
-/// Inverse-radial warp strength (pincushion) from CLI `--xrizer-warp=...`
+/// Inverse-radial warp strength from CLI `--xrizer-warp=...`
 /// (wins) or env `XRIZER_WARP`. Single float `k` in `r' = s*r*(1 + k*r^2)`
-/// with `r` in aspect-corrected centered UV units (`s` is [`zoom_factor`]):
-/// - `k > 0` = pincushion (edges magnify; samples outward),
-/// - `k < 0` = barrel (edges shrink; samples inward),
+/// with `r` in aspect-corrected centered UV units (`s` is [`zoom_factor`]).
+/// The shader samples *outward* (output pixel shows a farther-out texel):
+/// - `k > 0` = displayed content pulled inward (barrel-look; minifies edges,
+///   shows more of the source per pixel),
+/// - `k < 0` = displayed content pushed outward (pincushion-look; magnifies
+///   edges),
 /// - `k == 0` = no curvature (warp pass still runs when zoom != 1).
 /// Applied on eye submit (Vulkan) and in the GL blit path; see
 /// [`warp_center_for_eye`] / [`warp_center_for_eye_gl`] for the centers.
@@ -455,7 +458,7 @@ pub(crate) fn warp_strength() -> f32 {
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| {
         if *k != 0.0 {
-            log::info!("xrizer-debug: warp active k={k:.4} from {src} (k>0 pincushion, k<0 barrel)");
+            log::info!("xrizer-debug: warp active k={k:.4} from {src} (k>0 pulls content inward, k<0 pushes outward)");
         } else if !src.is_empty() {
             log::warn!("xrizer-debug: ignoring malformed warp override from {src}; want single float like \"0.2\"");
         }
@@ -465,12 +468,17 @@ pub(crate) fn warp_strength() -> f32 {
 
 /// Uniform (linear) zoom for the warp experiment, from CLI `--xrizer-zoom=...`
 /// (wins) or env `XRIZER_ZOOM`. Single float `s`, applied center-anchored
-/// *before* the cubic term: `r' = s*r*(1 + k*r^2)` (see [`warp_strength`]):
-/// - `s < 1` = minify (pull content toward the optical center),
-/// - `s > 1` = magnify,
+/// *before* the cubic term: `r' = s*r*(1 + k*r^2)` (see [`warp_strength`]).
+/// `s` is the source-sampling scale, so displayed magnification is `1/s`:
+/// - `s < 1` = magnify / zoom in (central region enlarged, outer content
+///   cropped away),
+/// - `s > 1` = minify / zoom out (full source compressed toward the center;
+///   beyond-edge samples clamp-smear),
 /// - `s == 1` / unset / malformed = identity (warp is pure curvature).
-/// This is the knob for uniform scale errors (e.g. content rendered for one
-/// FOV but displayed at another); `k` only bends, it cannot zoom.
+/// To squeeze a 110-degree render into a ~90-degree frame, `s` ≈ 1.17-1.22
+/// (NOT its inverse). This is the knob for uniform scale errors (e.g.
+/// content rendered for one FOV but displayed at another); `k` only bends,
+/// it cannot zoom.
 pub(crate) fn zoom_factor() -> f32 {
     static PARSED: std::sync::OnceLock<(f32, &'static str)> = std::sync::OnceLock::new();
     let (s, src) = PARSED.get_or_init(|| {
@@ -488,9 +496,9 @@ pub(crate) fn zoom_factor() -> f32 {
     static LOGGED_ZOOM: std::sync::Once = std::sync::Once::new();
     LOGGED_ZOOM.call_once(|| {
         if *s != 1.0 {
-            log::info!("xrizer-debug: warp zoom active s={s:.4} from {src} (s<1 minify, s>1 magnify)");
+            log::info!("xrizer-debug: warp zoom active s={s:.4} from {src} (s<1 magnifies/zooms-in, s>1 minifies/zooms-out)");
         } else if !src.is_empty() {
-            log::warn!("xrizer-debug: ignoring malformed zoom override from {src}; want single float like \"0.82\"");
+            log::warn!("xrizer-debug: ignoring malformed zoom override from {src}; want single float like \"1.22\"");
         }
     });
     *s

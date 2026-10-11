@@ -1,5 +1,6 @@
 #version 450
-// Inverse-radial warp (pincushion when k > 0) for the xrizer experiment.
+// Inverse-radial warp (barrel-look when k > 0: samples outward, pulling
+// displayed content inward) for the xrizer experiment.
 // Reuses overlay.vert's fullscreen quad + texBounds-mapped texCoord varying;
 // this fragment stage applies r' = r*(1 + k*r^2) around the FOV-derived
 // center and samples outward (k > 0 magnifies edges).
@@ -13,9 +14,9 @@ layout(location = 0) out vec4 color;
 layout(push_constant, std430) uniform pc {
 	vec4 texBounds; // uMin, uMax, vMin, vMax (vertex use; padding here)
 	vec2 center;    // optical center in texCoord 0-1 space
-	float k;        // strength: >0 pincushion, <0 barrel, 0 off
+	float k;        // >0 pulls content inward, <0 pushes outward, 0 off
 	float aspect;   // extent.width / extent.height
-	float zoom;     // uniform scale: <1 minify, >1 magnify, 1 identity
+	float zoom;     // <1 zooms-in, >1 zooms-out, 1 identity
 };
 
 void main() {
