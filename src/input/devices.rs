@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::Mutex;
 
-use glam::Mat4;
+use glam::{Mat4, Quat, Vec3};
 use openvr as vr;
 use openxr as xr;
 use openxr::sys::Handle;
@@ -84,12 +84,25 @@ pub struct TrackedDevice {
     pose_cache: Mutex<Option<vr::TrackedDevicePose_t>>,
 }
 
+/// Parses XRIZER_NECK_MODEL="x,y,z" (head-local meters, OpenVR axes:
+/// +X right, +Y up, -Z forward so back-of-head is +Z).
+fn parse_neck_offset(s: &str) -> Option<Vec3> {
+    let mut it = s.split(',');
+    let x: f32 = it.next()?.trim().parse().ok()?;
+    let y: f32 = it.next()?.trim().parse().ok()?;
+    let z: f32 = it.next()?.trim().parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some(Vec3::new(x, y, z))
+}
+
 fn get_hmd_pose(
     xr_data: &OpenXrData<impl crate::openxr_data::Compositor>,
     session_data: &SessionData,
     origin: vr::ETrackingUniverseOrigin,
 ) -> Option<vr::TrackedDevicePose_t> {
-    let (location, velocity) = {
+    let (mut location, mut velocity) = {
         session_data
             .view_space
             .relate(
@@ -98,6 +111,51 @@ fn get_hmd_pose(
             )
             .ok()?
     };
+
+    // T5 neck model: emulate the SteamVR head-model convention X-Plane was
+    // authored against. The raw VIEW pose pivots about the eyes; SteamVR apps
+    // expect the HMD rig to pivot about the neck. With neck offset `d`
+    // (head-local), report p' = p + R.d - d so the rig rotates about the
+    // neck point instead. Identity at recenter (R=I gives p'=p).
+    // Opt-in via XRIZER_NECK_MODEL="x,y,z"; unset or unparseable = off.
+    // Measured on Quest 3 (T4 circle-fit): d ~= (0.0, -0.03, +0.09).
+    match std::env::var("XRIZER_NECK_MODEL") {
+        Ok(s) => match parse_neck_offset(&s) {
+            Some(d) => {
+                static LOG_NECK_ONCE: std::sync::Once = std::sync::Once::new();
+                LOG_NECK_ONCE.call_once(|| {
+                    log::info!(
+                        "xrizer-debug: neck model active d=({:.3},{:.3},{:.3})m",
+                        d.x,
+                        d.y,
+                        d.z
+                    );
+                });
+                let o = &location.pose.orientation;
+                let r = Quat::from_xyzw(o.x, o.y, o.z, o.w);
+                let rd = r * d;
+                let off = rd - d;
+                location.pose.position.x += off.x;
+                location.pose.position.y += off.y;
+                location.pose.position.z += off.z;
+                // First-order velocity correction: v' = v + w x (R.d).
+                let w = &velocity.angular_velocity;
+                let dv = Vec3::new(w.x, w.y, w.z).cross(rd);
+                velocity.linear_velocity.x += dv.x;
+                velocity.linear_velocity.y += dv.y;
+                velocity.linear_velocity.z += dv.z;
+            }
+            None => {
+                static LOG_NECK_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                LOG_NECK_WARN_ONCE.call_once(|| {
+                    log::warn!(
+                        "xrizer-debug: ignoring malformed XRIZER_NECK_MODEL={s:?}, want \"x,y,z\""
+                    );
+                });
+            }
+        },
+        Err(_) => {}
+    }
 
     // T4 pivot logging: per-frame HMD pose CSV, enabled via
     // XRIZER_LOG_HMD=<path>. One row per pose query (i.e. per WaitGetPoses).
