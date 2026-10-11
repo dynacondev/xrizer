@@ -615,6 +615,7 @@ impl vr::IVRSystem026_Interface for System {
         ty: vr::EHiddenAreaMeshType,
     ) -> vr::HiddenAreaMesh_t {
         if !self.openxr.enabled_extensions.khr_visibility_mask {
+            crate::warn_once!("khr_visibility_mask unavailable, returning EMPTY HiddenAreaMesh");
             return Default::default();
         }
 
@@ -663,6 +664,38 @@ impl vr::IVRSystem026_Interface for System {
 
         trace!("vertices: {vertices:#?}");
         let count = vertices.len() / 3;
+        // Audit logging: which mesh the app gets (empty = runtime has no
+        // mask; bbox shows the covered [0,1] UV region after scaling).
+        // First call at info level, every call at debug level.
+        let (min_x, max_x, min_y, max_y) = if vertices.is_empty() {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            vertices.iter().fold(
+                (
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                ),
+                |(min_x, max_x, min_y, max_y), v| {
+                    (
+                        min_x.min(v.v[0]),
+                        max_x.max(v.v[0]),
+                        min_y.min(v.v[1]),
+                        max_y.max(v.v[1]),
+                    )
+                },
+            )
+        };
+        static LOGGED_MASK: std::sync::Once = std::sync::Once::new();
+        LOGGED_MASK.call_once(|| {
+            log::info!(
+                "xrizer-debug: GetHiddenAreaMesh first call eye={eye:?} type={ty:?} triangles={count} uv_bbox x=[{min_x:.3},{max_x:.3}] y=[{min_y:.3},{max_y:.3}]"
+            );
+        });
+        log::debug!(
+            "xrizer-debug: GetHiddenAreaMesh eye={eye:?} type={ty:?} triangles={count} uv_bbox x=[{min_x:.3},{max_x:.3}] y=[{min_y:.3},{max_y:.3}]"
+        );
         // XXX: what are we supposed to do here? pVertexData is a random pointer and there's no
         // clear way for the application to deallocate it
         // fortunately it seems like applications don't call this often, so this leakage isn't a
