@@ -496,40 +496,54 @@ pub(crate) fn zoom_factor() -> f32 {
     *s
 }
 
-/// Optical center for the warp in `0-1` UV (texCoord) space, derived from
-/// the display-path FOV (layer override wins, else render-path override),
-/// falling back to texture center when no override is set.
+/// Optical center for the warp, in **texture (sampled) UV space**, derived
+/// from the display-path FOV (layer override wins, else render-path
+/// override), falling back to texture center when no override is set.
 ///
-/// Horizontal is unambiguous (`u=0` left `-tanL`, `u=1` right `+tanR`):
-/// `cx = tanL/(tanL+tanR)`. Vertical assumes `v=0` top (`+up`) so
-/// `cy = tanU/(tanU+tanD)`, mirroring `end_frame`'s flip handling by
-/// inverting when `bounds` are flipped. Symmetric FOVs give `(0.5, 0.5)`.
+/// The frustum maps linearly to the submitted sub-rect: output-left shows
+/// `uMin`, so the zero-angle point `q = tanL/(tanL+tanR)` sits at
+/// `uMin + q*(uMax-uMin)` — NOT at `q` itself. Returning `q` directly is only
+/// correct for full-width bounds; e.g. X-Plane's left-eye half
+/// (`uMin=0,uMax=0.5`) needs `~0.31`, not `~0.62`. Same rule vertically
+/// (`v=0` top for Vulkan sampling, so `q = tanU/(tanU+tanD)` from the `vMin`
+/// corner), mirroring `end_frame`'s flip handling by inverting `q` when
+/// `bounds` are flipped. Symmetric full-texture FOVs give `(0.5, 0.5)`.
 pub(crate) fn warp_center_for_eye(right: bool, bounds: vr::VRTextureBounds_t) -> (f32, f32) {
     let fov = fov_layer_for_eye(right).or_else(|| fov_override_for_eye(right));
     let Some(o) = fov else {
-        return (0.5, 0.5);
+        // No override: middle of the submitted sub-rect (NOT texture middle;
+        // X-Plane's left eye spans u 0->0.5, so its middle is u 0.25).
+        return (
+            (bounds.uMin + bounds.uMax) / 2.0,
+            (bounds.vMin + bounds.vMax) / 2.0,
+        );
     };
     let tan_l = o.left_deg.to_radians().tan();
     let tan_r = o.right_deg.to_radians().tan();
     let tan_u = o.up_deg.to_radians().tan();
     let tan_d = o.down_deg.to_radians().tan();
-    let mut cx = if tan_l + tan_r > 0.0 {
+    let mut qx = if tan_l + tan_r > 0.0 {
         tan_l / (tan_l + tan_r)
     } else {
         0.5
     };
-    let mut cy = if tan_u + tan_d > 0.0 {
+    let mut qy = if tan_u + tan_d > 0.0 {
         tan_u / (tan_u + tan_d)
     } else {
         0.5
     };
     // Mirror end_frame flip handling: flipped bounds invert the axis.
     if bounds.uMin > bounds.uMax {
-        cx = 1.0 - cx;
+        qx = 1.0 - qx;
     }
     if bounds.vMin > bounds.vMax {
-        cy = 1.0 - cy;
+        qy = 1.0 - qy;
     }
+    // Map the output-space zero point into the sampled sub-rect. The vertex
+    // stage maps quad corners to the raw bounds corners, so this is exact
+    // for full, flipped, and sub-rect bounds alike.
+    let cx = bounds.uMin + qx * (bounds.uMax - bounds.uMin);
+    let cy = bounds.vMin + qy * (bounds.vMax - bounds.vMin);
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| {
         log::info!("xrizer-debug: warp center from display FOV: cx={cx:.4} cy={cy:.4}");
@@ -537,39 +551,49 @@ pub(crate) fn warp_center_for_eye(right: bool, bounds: vr::VRTextureBounds_t) ->
     (cx, cy)
 }
 
-/// OpenGL-convention variant of [`warp_center_for_eye`].
+/// OpenGL-convention variant of [`warp_center_for_eye`], likewise returned
+/// in **texture (sampled) UV space**.
 ///
 /// GL samples with `v=0` at the bottom row (opposite of Vulkan's top-row
 /// `v=0`), and the GL warp shader maps framebuffer-bottom to the minimum-V
-/// row exactly like `CopyImageSubData` does. So the base vertical convention
-/// is `s=0` (bottom) `<->` `-down`, giving `cy = tanD/(tanD+tanU)`, mirrored
-/// when `bounds` are flipped. Horizontal matches Vulkan (`u=0` left).
-/// Symmetric FOVs give `(0.5, 0.5)` under either convention.
+/// row exactly like `CopyImageSubData` does, so the base vertical zero point
+/// (from the bottom) is `q = tanD/(tanD+tanU)`, mapped into the shader's
+/// `(min,max)` ranges below. Horizontal matches Vulkan (`u=0` left).
+/// Symmetric full-texture FOVs give `(0.5, 0.5)`.
 pub(crate) fn warp_center_for_eye_gl(right: bool, bounds: vr::VRTextureBounds_t) -> (f32, f32) {
     let fov = fov_layer_for_eye(right).or_else(|| fov_override_for_eye(right));
+    let (u0, u1) = (bounds.uMin.min(bounds.uMax), bounds.uMin.max(bounds.uMax));
+    let (v0, v1) = (bounds.vMin.min(bounds.vMax), bounds.vMin.max(bounds.vMax));
     let Some(o) = fov else {
-        return (0.5, 0.5);
+        // No override: middle of the submitted sub-rect in the shader's
+        // (min,max) space.
+        return ((u0 + u1) / 2.0, (v0 + v1) / 2.0);
     };
     let tan_l = o.left_deg.to_radians().tan();
     let tan_r = o.right_deg.to_radians().tan();
     let tan_u = o.up_deg.to_radians().tan();
     let tan_d = o.down_deg.to_radians().tan();
-    let mut cx = if tan_l + tan_r > 0.0 {
+    let mut qx = if tan_l + tan_r > 0.0 {
         tan_l / (tan_l + tan_r)
     } else {
         0.5
     };
-    let mut cy = if tan_u + tan_d > 0.0 {
+    let mut qy = if tan_u + tan_d > 0.0 {
         tan_d / (tan_u + tan_d)
     } else {
         0.5
     };
     if bounds.uMin > bounds.uMax {
-        cx = 1.0 - cx;
+        qx = 1.0 - qx;
     }
     if bounds.vMin > bounds.vMax {
-        cy = 1.0 - cy;
+        qy = 1.0 - qy;
     }
+    // Map the output-space zero point into the sampled (min,max) ranges the
+    // shader uses, so sub-rect submits (e.g. X-Plane's u 0->0.5 left eye)
+    // pivot around the sub-rect middle, not the texture middle.
+    let cx = u0 + qx * (u1 - u0);
+    let cy = v0 + qy * (v1 - v0);
     static LOGGED_GL: std::sync::Once = std::sync::Once::new();
     LOGGED_GL.call_once(|| {
         log::info!("xrizer-debug: warp center (GL) from display FOV: cx={cx:.4} cy={cy:.4}");

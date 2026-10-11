@@ -568,8 +568,23 @@ impl VulkanData {
         let dy = cy.max(1.0 - cy);
         let edge = zoom * (1.0 + k * dx * dx);
         let corner = zoom * (1.0 + k * (dx * dx + dy * dy));
+        // Pivot self-check: optical center in output pixels from the
+        // top-left, so an exaggerated ±k screenshot can verify it against the
+        // unmoving grid point. Inverts the sub-rect mapping above.
+        let span_u = bounds.uMax - bounds.uMin;
+        let span_v = bounds.vMax - bounds.vMin;
+        let piv_x = if span_u != 0.0 {
+            (cx - bounds.uMin) / span_u * extent.width as f32
+        } else {
+            extent.width as f32 / 2.0
+        };
+        let piv_y = if span_v != 0.0 {
+            (cy - bounds.vMin) / span_v * extent.height as f32
+        } else {
+            extent.height as f32 / 2.0
+        };
         log::trace!(
-            "xrizer-debug: warp submit eye={eye:?} k={k:.4} zoom={zoom:.4} cx={cx:.4} cy={cy:.4} edge x{edge:.4} corner x{corner:.4}"
+            "xrizer-debug: warp submit eye={eye:?} k={k:.4} zoom={zoom:.4} cx={cx:.4} cy={cy:.4} edge x{edge:.4} corner x{corner:.4} pivot {piv_x:.0}x{piv_y:.0}px(TL)"
         );
 
         // Lazily create (or recreate on swapchain format change) the pipeline.
