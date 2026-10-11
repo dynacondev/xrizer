@@ -1288,10 +1288,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         };
 
         trace!(
-            "submitted {eye:?} extent={:?} flip={} warp_k={}",
+            "submitted {eye:?} extent={:?} flip={} warp_k={} zoom={}",
             self.eyes_submitted[eye as usize].map(|e| e.extent),
             bounds.vertically_flipped(),
             crate::system::warp_strength(),
+            crate::system::zoom_factor(),
         );
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) {
             let mut swapchain_data = self.swapchain_data.as_mut();

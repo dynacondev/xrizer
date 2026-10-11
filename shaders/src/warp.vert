@@ -1,6 +1,6 @@
 #version 450
 // Fullscreen quad for the xrizer warp experiment. Identical mapping to
-// overlay.vert, but declares the full 8-float push-constant block so both
+// overlay.vert, but declares the full 9-float push-constant block so both
 // stages agree on layout (see warp.frag).
 layout(location = 0) out vec2 outTexCoord;
 layout(push_constant, std430) uniform pc {
@@ -8,6 +8,7 @@ layout(push_constant, std430) uniform pc {
 	vec2 center;    // optical center (fragment use)
 	float k;        // strength (fragment use)
 	float aspect;   // width/height (fragment use)
+	float zoom;     // uniform scale (fragment use)
 };
 
 vec2 positions[4] = vec2[](

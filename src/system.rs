@@ -431,12 +431,13 @@ fn render_target_override() -> Option<(u32, u32)> {
 }
 
 /// Inverse-radial warp strength (pincushion) from CLI `--xrizer-warp=...`
-/// (wins) or env `XRIZER_WARP`. Single float `k` in `r' = r*(1 + k*r^2)`
-/// with `r` in aspect-corrected centered UV units:
+/// (wins) or env `XRIZER_WARP`. Single float `k` in `r' = s*r*(1 + k*r^2)`
+/// with `r` in aspect-corrected centered UV units (`s` is [`zoom_factor`]):
 /// - `k > 0` = pincushion (edges magnify; samples outward),
 /// - `k < 0` = barrel (edges shrink; samples inward),
-/// - `k == 0` / unset / malformed = off (fast straight-copy path).
-/// Vulkan eye-submit path only for this experiment; GL ignores it.
+/// - `k == 0` = no curvature (warp pass still runs when zoom != 1).
+/// Applied on eye submit (Vulkan) and in the GL blit path; see
+/// [`warp_center_for_eye`] / [`warp_center_for_eye_gl`] for the centers.
 pub(crate) fn warp_strength() -> f32 {
     static PARSED: std::sync::OnceLock<(f32, &'static str)> = std::sync::OnceLock::new();
     let (k, src) = PARSED.get_or_init(|| {
@@ -460,6 +461,39 @@ pub(crate) fn warp_strength() -> f32 {
         }
     });
     *k
+}
+
+/// Uniform (linear) zoom for the warp experiment, from CLI `--xrizer-zoom=...`
+/// (wins) or env `XRIZER_ZOOM`. Single float `s`, applied center-anchored
+/// *before* the cubic term: `r' = s*r*(1 + k*r^2)` (see [`warp_strength`]):
+/// - `s < 1` = minify (pull content toward the optical center),
+/// - `s > 1` = magnify,
+/// - `s == 1` / unset / malformed = identity (warp is pure curvature).
+/// This is the knob for uniform scale errors (e.g. content rendered for one
+/// FOV but displayed at another); `k` only bends, it cannot zoom.
+pub(crate) fn zoom_factor() -> f32 {
+    static PARSED: std::sync::OnceLock<(f32, &'static str)> = std::sync::OnceLock::new();
+    let (s, src) = PARSED.get_or_init(|| {
+        if let Some(a) = std::env::args()
+            .skip(1)
+            .find_map(|a| a.strip_prefix("--xrizer-zoom=").map(str::to_owned))
+        {
+            return (a.trim().parse().unwrap_or(1.0), "cli --xrizer-zoom");
+        }
+        match std::env::var("XRIZER_ZOOM") {
+            Ok(v) => (v.trim().parse().unwrap_or(1.0), "env XRIZER_ZOOM"),
+            Err(_) => (1.0, ""),
+        }
+    });
+    static LOGGED_ZOOM: std::sync::Once = std::sync::Once::new();
+    LOGGED_ZOOM.call_once(|| {
+        if *s != 1.0 {
+            log::info!("xrizer-debug: warp zoom active s={s:.4} from {src} (s<1 minify, s>1 magnify)");
+        } else if !src.is_empty() {
+            log::warn!("xrizer-debug: ignoring malformed zoom override from {src}; want single float like \"0.82\"");
+        }
+    });
+    *s
 }
 
 /// Optical center for the warp in `0-1` UV (texCoord) space, derived from

@@ -197,15 +197,22 @@ impl GraphicsBackend for VulkanData {
         log::trace!("{eye:?} extent: {extent:?} | bounds: {bounds:?}");
 
         // XRIZER_WARP experiment: inverse-radial post-process instead of the
-        // straight resolve/copy/blit below. k == 0 keeps the original path.
-        // MSAA sources fall back (see copy_texture_warped) since multisampled
-        // images can't be sampled directly.
+        // straight resolve/copy/blit below. k == 0 and zoom == 1 keep the
+        // original path. MSAA sources fall back (see copy_texture_warped)
+        // since multisampled images can't be sampled directly.
         let warp_k = crate::system::warp_strength();
-        if warp_k != 0.0 {
+        let zoom = crate::system::zoom_factor();
+        if warp_k != 0.0 || zoom != 1.0 {
             let game_layer = array_data.map(|d| d.m_unArrayIndex).unwrap_or(0);
-            if let Some(warped) =
-                self.copy_texture_warped(eye, texture, game_layer, bounds, image_index, warp_k)
-            {
+            if let Some(warped) = self.copy_texture_warped(
+                eye,
+                texture,
+                game_layer,
+                bounds,
+                image_index,
+                warp_k,
+                zoom,
+            ) {
                 return warped;
             }
         }
@@ -516,12 +523,13 @@ impl VulkanData {
         }
     }
 
-    /// Warp submit path for the `XRIZER_WARP` experiment: fullscreen
-    /// post-process sampling the game image with inverse-radial distortion
-    /// (`warp.frag`) into the swapchain eye layer.
+    /// Warp submit path for the `XRIZER_WARP`/`XRIZER_ZOOM` experiment:
+    /// fullscreen post-process sampling the game image with uniform zoom plus
+    /// inverse-radial distortion (`warp.frag`) into the swapchain eye layer.
     ///
-    /// Caller guarantees `k != 0`. Returns `None` when warp isn't applicable
-    /// (e.g. MSAA source) so the caller falls through to the straight copy.
+    /// Caller guarantees `k != 0` or `zoom != 1`. Returns `None` when warp
+    /// isn't applicable (e.g. MSAA source) so the caller falls through to
+    /// the straight copy.
     fn copy_texture_warped(
         &self,
         eye: vr::EVREye,
@@ -530,6 +538,7 @@ impl VulkanData {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
         k: f32,
+        zoom: f32,
     ) -> Option<xr::Extent2Di> {
         if texture.m_nSampleCount != 1 {
             static WARNED: std::sync::Once = std::sync::Once::new();
@@ -552,7 +561,16 @@ impl VulkanData {
         }
         let (cx, cy) = crate::system::warp_center_for_eye((eye as usize) == 1, bounds);
         let aspect = extent.width as f32 / extent.height as f32;
-        log::trace!("xrizer-debug: warp submit eye={eye:?} k={k:.4} cx={cx:.4} cy={cy:.4}");
+        // Effective sampling scale at the farthest edge-midpoint and corner,
+        // so a fitted (k, zoom) pair reads as portable percentages instead of
+        // raw UV-space coefficients.
+        let dx = cx.max(1.0 - cx) * aspect;
+        let dy = cy.max(1.0 - cy);
+        let edge = zoom * (1.0 + k * dx * dx);
+        let corner = zoom * (1.0 + k * (dx * dx + dy * dy));
+        log::trace!(
+            "xrizer-debug: warp submit eye={eye:?} k={k:.4} zoom={zoom:.4} cx={cx:.4} cy={cy:.4} edge x{edge:.4} corner x{corner:.4}"
+        );
 
         // Lazily create (or recreate on swapchain format change) the pipeline.
         // Hold the guard for the whole submit so the pipeline can't be
@@ -656,7 +674,7 @@ impl VulkanData {
                 height: extent.height,
             },
         };
-        // Must match warp.frag's push-constant block (8 floats).
+        // Must match warp.frag's push-constant block (9 floats).
         let pc = [
             bounds.uMin,
             bounds.uMax,
@@ -666,6 +684,7 @@ impl VulkanData {
             cy,
             k,
             aspect,
+            zoom,
         ];
 
         self.record_commands(buf, || unsafe {
@@ -1100,10 +1119,10 @@ struct WarpPipelineData {
 }
 
 impl WarpPipelineData {
-    /// 8 push-constant floats: `[uMin, uMax, vMin, vMax, cx, cy, k, aspect]`.
-    /// First 4 are consumed by the reused `vert_overlay` stage; the fragment
-    /// stage (`warp.frag`) reads all 8.
-    const PC_LEN: usize = 8;
+    /// 9 push-constant floats: `[uMin, uMax, vMin, vMax, cx, cy, k, aspect,
+    /// zoom]`. First 4 are consumed by the `warp.vert` stage; the fragment
+    /// stage (`warp.frag`) reads all 9.
+    const PC_LEN: usize = 9;
 
     fn new(device: &ash::Device, target_format: vk::Format) -> Self {
         // Single color attachment: the swapchain eye layer.
@@ -1155,7 +1174,7 @@ impl WarpPipelineData {
         };
 
         // Warp-specific fullscreen quad (same mapping as overlay.vert, but
-        // with the full 8-float push-constant block both stages agree on).
+        // with the full 9-float push-constant block both stages agree on).
         let (_vert_module, vert_stage) = load_module(
             vk::ShaderStageFlags::VERTEX,
             &include_bytes!(concat!(env!("OUT_DIR"), "/vert_warp.spv"))[..],

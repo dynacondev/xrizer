@@ -332,18 +332,19 @@ impl GraphicsBackend for GlData {
         _submit_flags: vr::EVRSubmitFlags,
     ) -> xr::Extent2Di {
         // XRIZER_WARP experiment: inverse-radial post-process instead of the
-        // straight CopyImageSubData/BlitFramebuffer below. k == 0 keeps the
-        // original paths.
+        // straight CopyImageSubData/BlitFramebuffer below. k == 0 and
+        // zoom == 1 keep the original paths.
         let warp_k = crate::system::warp_strength();
-        if warp_k != 0.0 {
+        let zoom = crate::system::zoom_factor();
+        if warp_k != 0.0 || zoom != 1.0 {
             static LOGGED_GL_WARP: std::sync::Once = std::sync::Once::new();
             LOGGED_GL_WARP.call_once(|| {
                 log::info!(
-                    "xrizer-debug: warp active on OpenGL backend k={warp_k:.4} (k>0 pincushion, k<0 barrel)"
+                    "xrizer-debug: warp active on OpenGL backend k={warp_k:.4} zoom={zoom:.4} (k>0 pincushion, k<0 barrel; zoom<1 minify, zoom>1 magnify)"
                 );
             });
             if let Some(extent) =
-                self.copy_texture_warped(eye, texture, bounds, image_index, warp_k)
+                self.copy_texture_warped(eye, texture, bounds, image_index, warp_k, zoom)
             {
                 return extent;
             }
@@ -466,10 +467,11 @@ uniform sampler2D src;
 uniform vec2 center; // optical center in baseUV space
 uniform float k;     // >0 pincushion, <0 barrel, 0 off
 uniform float aspect; // extent.width / extent.height
+uniform float zoom;  // uniform scale: <1 minify, >1 magnify, 1 identity
 void main() {
     vec2 p = vec2((baseUV.x - center.x) * aspect, baseUV.y - center.y);
     float r2 = dot(p, p);
-    vec2 pw = p * (1.0 + k * r2);
+    vec2 pw = p * zoom * (1.0 + k * r2);
     vec2 uv = vec2(pw.x / aspect + center.x, pw.y + center.y);
     color = texture(src, uv);
 }
@@ -563,7 +565,8 @@ void main() {
     }
 
     /// Warp submit path; `None` means "fall back to the straight copy"
-    /// (program failed to compile/link). Caller guarantees `k != 0`.
+    /// (program failed to compile/link). Caller guarantees `k != 0` or
+    /// `zoom != 1`.
     fn copy_texture_warped(
         &self,
         eye: vr::EVREye,
@@ -571,6 +574,7 @@ void main() {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
         k: f32,
+        zoom: f32,
     ) -> Option<xr::Extent2Di> {
         // Lazily compile the program; remember failure so we pay for the
         // attempt only once and fall back quietly afterwards.
@@ -601,7 +605,15 @@ void main() {
         // row, exactly like CopyImageSubData does (center math above matches).
         let (u0, u1) = (bounds.uMin.min(bounds.uMax), bounds.uMin.max(bounds.uMax));
         let (v0, v1) = (bounds.vMin.min(bounds.vMax), bounds.vMin.max(bounds.vMax));
-        log::trace!("xrizer-debug: warp GL submit eye={eye:?} k={k:.4} cx={cx:.4} cy={cy:.4}");
+        // Effective sampling scale at the farthest edge-midpoint and corner,
+        // mirroring the Vulkan path so fitted values read as percentages.
+        let dx = cx.max(1.0 - cx) * aspect;
+        let dy = cy.max(1.0 - cy);
+        let edge = zoom * (1.0 + k * dx * dx);
+        let corner = zoom * (1.0 + k * (dx * dx + dy * dy));
+        log::trace!(
+            "xrizer-debug: warp GL submit eye={eye:?} k={k:.4} zoom={zoom:.4} cx={cx:.4} cy={cy:.4} edge x{edge:.4} corner x{corner:.4}"
+        );
 
         let swapchain_texture = self.images[image_index];
 
@@ -660,6 +672,7 @@ void main() {
             set2(c"center", cx, cy);
             set1(c"k", k);
             set1(c"aspect", aspect);
+            set1(c"zoom", zoom);
             let src_loc = Self::uniform(prog.program, c"src");
             if src_loc >= 0 {
                 gl::Uniform1i(src_loc, 0);
