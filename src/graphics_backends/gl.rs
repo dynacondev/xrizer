@@ -9,7 +9,7 @@ use log::warn;
 use openvr as vr;
 use openxr as xr;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::{Arc, LazyLock, Once};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 
 static GLX: LazyLock<Library> = LazyLock::new(|| Library::new(c"libGLX.so.0"));
 
@@ -19,6 +19,122 @@ pub struct GlData {
     format: u32,
     read_fbo: u32,
     draw_fbo: u32,
+    // Cached inverse-radial warp program for the XRIZER_WARP experiment.
+    // Interior mutability so `copy_texture_to_swapchain(&self)` can lazily
+    // compile it without changing the `GraphicsBackend` trait.
+    warp: Mutex<GlWarpCache>,
+}
+
+#[derive(Default)]
+struct GlWarpCache {
+    prog: Option<GlWarpProg>,
+    failed: bool,
+}
+
+struct GlWarpProg {
+    program: gl::types::GLuint,
+    vao: gl::types::GLuint,
+    vbo: gl::types::GLuint,
+    sampler: gl::types::GLuint,
+}
+
+/// Snapshot of the app's GL state touched by the warp pass, so Submit never
+/// visibly disturbs the app's own context state.
+struct SavedGlState {
+    program: i32,
+    vao: i32,
+    array_buf: i32,
+    active: i32,
+    tex2d: i32,
+    sampler: i32,
+    viewport: [i32; 4],
+    scissor_box: [i32; 4],
+    read_fbo: i32,
+    draw_fbo: i32,
+    blend: u8,
+    depth: u8,
+    stencil: u8,
+    scissor: u8,
+    cull: u8,
+}
+
+impl SavedGlState {
+    unsafe fn save() -> Self {
+        let mut s = Self {
+            program: 0,
+            vao: 0,
+            array_buf: 0,
+            active: 0,
+            tex2d: 0,
+            sampler: 0,
+            viewport: [0; 4],
+            scissor_box: [0; 4],
+            read_fbo: 0,
+            draw_fbo: 0,
+            blend: 0,
+            depth: 0,
+            stencil: 0,
+            scissor: 0,
+            cull: 0,
+        };
+        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut s.program);
+        gl::GetIntegerv(gl::VERTEX_ARRAY_BINDING, &mut s.vao);
+        gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut s.array_buf);
+        gl::GetIntegerv(gl::ACTIVE_TEXTURE, &mut s.active);
+        // Unit-0 bindings must be read with unit 0 active; the app may
+        // have left any other unit selected.
+        gl::ActiveTexture(gl::TEXTURE0);
+        gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut s.tex2d);
+        gl::GetIntegerv(gl::SAMPLER_BINDING, &mut s.sampler);
+        gl::GetIntegerv(gl::VIEWPORT, s.viewport.as_mut_ptr());
+        gl::GetIntegerv(gl::SCISSOR_BOX, s.scissor_box.as_mut_ptr());
+        gl::GetIntegerv(gl::READ_FRAMEBUFFER_BINDING, &mut s.read_fbo);
+        gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut s.draw_fbo);
+        s.blend = gl::IsEnabled(gl::BLEND);
+        s.depth = gl::IsEnabled(gl::DEPTH_TEST);
+        s.stencil = gl::IsEnabled(gl::STENCIL_TEST);
+        s.scissor = gl::IsEnabled(gl::SCISSOR_TEST);
+        s.cull = gl::IsEnabled(gl::CULL_FACE);
+        s
+    }
+
+    unsafe fn restore(&self) {
+        gl::BindSampler(0, self.sampler as u32);
+        gl::BindTexture(gl::TEXTURE_2D, self.tex2d as u32);
+        gl::ActiveTexture(self.active as u32);
+        gl::BindVertexArray(self.vao as u32);
+        gl::BindBuffer(gl::ARRAY_BUFFER, self.array_buf as u32);
+        gl::UseProgram(self.program as u32);
+        gl::Viewport(
+            self.viewport[0],
+            self.viewport[1],
+            self.viewport[2],
+            self.viewport[3],
+        );
+        if self.scissor != 0 {
+            gl::Enable(gl::SCISSOR_TEST);
+        }
+        gl::Scissor(
+            self.scissor_box[0],
+            self.scissor_box[1],
+            self.scissor_box[2],
+            self.scissor_box[3],
+        );
+        if self.blend != 0 {
+            gl::Enable(gl::BLEND);
+        }
+        if self.depth != 0 {
+            gl::Enable(gl::DEPTH_TEST);
+        }
+        if self.stencil != 0 {
+            gl::Enable(gl::STENCIL_TEST);
+        }
+        if self.cull != 0 {
+            gl::Enable(gl::CULL_FACE);
+        }
+        gl::BindFramebuffer(gl::READ_FRAMEBUFFER, self.read_fbo as u32);
+        gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.draw_fbo as u32);
+    }
 }
 
 #[derive(Deref)]
@@ -135,6 +251,7 @@ impl GlData {
             format: 0,
             read_fbo: fbos[0],
             draw_fbo: fbos[1],
+            warp: Mutex::default(),
         })
     }
 }
@@ -214,16 +331,23 @@ impl GraphicsBackend for GlData {
         image_index: usize,
         _submit_flags: vr::EVRSubmitFlags,
     ) -> xr::Extent2Di {
-        // XRIZER_WARP experiment is Vulkan-only; make that visible instead of
-        // silently doing a straight copy here.
+        // XRIZER_WARP experiment: inverse-radial post-process instead of the
+        // straight CopyImageSubData/BlitFramebuffer below. k == 0 keeps the
+        // original paths.
         let warp_k = crate::system::warp_strength();
         if warp_k != 0.0 {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                log::warn!(
-                    "xrizer-debug: XRIZER_WARP={warp_k:.4} ignored on OpenGL backend (Vulkan-only experiment)"
+            static LOGGED_GL_WARP: std::sync::Once = std::sync::Once::new();
+            LOGGED_GL_WARP.call_once(|| {
+                log::info!(
+                    "xrizer-debug: warp active on OpenGL backend k={warp_k:.4} (k>0 pincushion, k<0 barrel)"
                 );
             });
+            if let Some(extent) =
+                self.copy_texture_warped(eye, texture, bounds, image_index, warp_k)
+            {
+                return extent;
+            }
+            // Program compile/link failure falls through to the straight copy.
         }
 
         let swapchain_texture = self.images[image_index];
@@ -311,6 +435,243 @@ impl GraphicsBackend for GlData {
             image_index,
             vr::EVRSubmitFlags::Default,
         )
+    }
+}
+
+// Inverse-radial warp (XRIZER_WARP) for the OpenGL backend.
+//
+// The app's GL context is current on this thread during Submit, so this is
+// all immediate-mode GL: attach the swapchain eye layer to our draw FBO and
+// render a fullscreen quad sampling the game texture with
+// `r' = r*(1 + k*r^2)` around the FOV-derived center. All touched GL state
+// (program, VAO, textures, viewport, framebuffers, blend/depth/scissor/cull)
+// is saved and restored so the app never observes us.
+impl GlData {
+    const WARP_VERT_SRC: &'static str = r#"#version 330 core
+layout(location = 0) in vec2 pos;
+out vec2 baseUV;
+uniform vec2 uRange; // min,max source U of the submitted sub-rect
+uniform vec2 vRange; // min,max source V of the submitted sub-rect
+void main() {
+    gl_Position = vec4(pos, 0.0, 1.0);
+    vec2 px = pos * 0.5 + 0.5;
+    baseUV = vec2(mix(uRange.x, uRange.y, px.x), mix(vRange.x, vRange.y, px.y));
+}
+"#;
+
+    const WARP_FRAG_SRC: &'static str = r#"#version 330 core
+in vec2 baseUV;
+out vec4 color;
+uniform sampler2D src;
+uniform vec2 center; // optical center in baseUV space
+uniform float k;     // >0 pincushion, <0 barrel, 0 off
+uniform float aspect; // extent.width / extent.height
+void main() {
+    vec2 p = vec2((baseUV.x - center.x) * aspect, baseUV.y - center.y);
+    float r2 = dot(p, p);
+    vec2 pw = p * (1.0 + k * r2);
+    vec2 uv = vec2(pw.x / aspect + center.x, pw.y + center.y);
+    color = texture(src, uv);
+}
+"#;
+
+    fn compile_warp_program() -> Option<GlWarpProg> {
+        unsafe fn info_log(line: impl FnOnce(*mut i32, *mut c_char)) -> String {
+            let mut len = 0;
+            let mut buf = [0 as c_char; 1024];
+            line(&mut len, buf.as_mut_ptr());
+            let len = (len as usize).min(buf.len() - 1);
+            String::from_utf8_lossy(std::slice::from_raw_parts(buf.as_ptr().cast(), len))
+                .into_owned()
+        }
+
+        unsafe fn compile_stage(ty: gl::types::GLenum, src: &str) -> Option<gl::types::GLuint> {
+            let sh = gl::CreateShader(ty);
+            let csrc = CString::new(src).ok()?;
+            gl::ShaderSource(sh, 1, &csrc.as_ptr(), std::ptr::null());
+            gl::CompileShader(sh);
+            let mut ok = 0;
+            gl::GetShaderiv(sh, gl::COMPILE_STATUS, &mut ok);
+            if ok == 0 {
+                let log = info_log(|len, buf| {
+                    gl::GetShaderInfoLog(sh, 1024, len, buf);
+                });
+                log::warn!("xrizer-debug: warp GL shader compile failed: {log}");
+                gl::DeleteShader(sh);
+                return None;
+            }
+            Some(sh)
+        }
+
+        unsafe {
+            let vs = compile_stage(gl::VERTEX_SHADER, Self::WARP_VERT_SRC)?;
+            let fs = compile_stage(gl::FRAGMENT_SHADER, Self::WARP_FRAG_SRC)?;
+            let program = gl::CreateProgram();
+            gl::AttachShader(program, vs);
+            gl::AttachShader(program, fs);
+            gl::LinkProgram(program);
+            gl::DeleteShader(vs);
+            gl::DeleteShader(fs);
+            let mut ok = 0;
+            gl::GetProgramiv(program, gl::LINK_STATUS, &mut ok);
+            if ok == 0 {
+                let log = info_log(|len, buf| {
+                    gl::GetProgramInfoLog(program, 1024, len, buf);
+                });
+                log::warn!("xrizer-debug: warp GL program link failed: {log}");
+                gl::DeleteProgram(program);
+                return None;
+            }
+
+            let mut vao = 0;
+            gl::GenVertexArrays(1, &mut vao);
+            gl::BindVertexArray(vao);
+            let mut vbo = 0;
+            gl::GenBuffers(1, &mut vbo);
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            // Fullscreen TRIANGLE_STRIP quad in NDC.
+            let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                std::mem::size_of_val(&verts) as isize,
+                verts.as_ptr().cast(),
+                gl::STATIC_DRAW,
+            );
+            gl::VertexAttribPointer(0, 2, gl::FLOAT, gl::FALSE, 0, std::ptr::null());
+            gl::EnableVertexAttribArray(0);
+            gl::BindVertexArray(0);
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+
+            let mut sampler = 0;
+            gl::GenSamplers(1, &mut sampler);
+            gl::SamplerParameteri(sampler, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::SamplerParameteri(sampler, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+            gl::SamplerParameteri(sampler, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+
+            Some(GlWarpProg {
+                program,
+                vao,
+                vbo,
+                sampler,
+            })
+        }
+    }
+
+    fn uniform(program: gl::types::GLuint, name: &CStr) -> gl::types::GLint {
+        unsafe { gl::GetUniformLocation(program, name.as_ptr().cast()) }
+    }
+
+    /// Warp submit path; `None` means "fall back to the straight copy"
+    /// (program failed to compile/link). Caller guarantees `k != 0`.
+    fn copy_texture_warped(
+        &self,
+        eye: vr::EVREye,
+        texture: gl::types::GLuint,
+        bounds: vr::VRTextureBounds_t,
+        image_index: usize,
+        k: f32,
+    ) -> Option<xr::Extent2Di> {
+        // Lazily compile the program; remember failure so we pay for the
+        // attempt only once and fall back quietly afterwards.
+        {
+            let mut cache = self.warp.lock().unwrap();
+            if cache.prog.is_none() && !cache.failed {
+                match Self::compile_warp_program() {
+                    Some(prog) => cache.prog = Some(prog),
+                    None => {
+                        cache.failed = true;
+                        return None;
+                    }
+                }
+            } else if cache.prog.is_none() {
+                return None;
+            }
+        }
+        let cache = self.warp.lock().unwrap();
+        let prog = cache.prog.as_ref()?;
+
+        let xr::Rect2Di { extent, .. } = texture_rect_from_bounds(texture, bounds);
+        if extent.width == 0 || extent.height == 0 {
+            return None;
+        }
+        let (cx, cy) = crate::system::warp_center_for_eye_gl((eye as usize) == 1, bounds);
+        let aspect = extent.width as f32 / extent.height as f32;
+        // Ranges in min,max order so framebuffer-bottom maps to the minimum-V
+        // row, exactly like CopyImageSubData does (center math above matches).
+        let (u0, u1) = (bounds.uMin.min(bounds.uMax), bounds.uMin.max(bounds.uMax));
+        let (v0, v1) = (bounds.vMin.min(bounds.vMax), bounds.vMin.max(bounds.vMax));
+        log::trace!("xrizer-debug: warp GL submit eye={eye:?} k={k:.4} cx={cx:.4} cy={cy:.4}");
+
+        let swapchain_texture = self.images[image_index];
+
+        unsafe {
+            let saved = SavedGlState::save();
+
+            let restore_and_out = |saved: &SavedGlState| {
+                saved.restore();
+                None
+            };
+
+            // ---- render warp quad into the swapchain eye layer ----
+            gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER, self.draw_fbo);
+            gl::FramebufferTextureLayer(
+                gl::DRAW_FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                swapchain_texture,
+                0,
+                eye as i32,
+            );
+            gl::DrawBuffer(gl::COLOR_ATTACHMENT0);
+            if gl::CheckFramebufferStatus(gl::DRAW_FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+                log::warn!(
+                    "xrizer-debug: warp GL framebuffer incomplete, falling back to straight copy"
+                );
+                return restore_and_out(&saved);
+            }
+            gl::Viewport(0, 0, extent.width, extent.height);
+
+            gl::Disable(gl::BLEND);
+            gl::Disable(gl::DEPTH_TEST);
+            gl::Disable(gl::STENCIL_TEST);
+            gl::Disable(gl::SCISSOR_TEST);
+            gl::Disable(gl::CULL_FACE);
+
+            gl::UseProgram(prog.program);
+            gl::BindVertexArray(prog.vao);
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, texture);
+            gl::BindSampler(0, prog.sampler);
+
+            let set2 = |name: &CStr, x: f32, y: f32| {
+                let loc = Self::uniform(prog.program, name);
+                if loc >= 0 {
+                    gl::Uniform2f(loc, x, y);
+                }
+            };
+            let set1 = |name: &CStr, x: f32| {
+                let loc = Self::uniform(prog.program, name);
+                if loc >= 0 {
+                    gl::Uniform1f(loc, x);
+                }
+            };
+            set2(c"uRange", u0, u1);
+            set2(c"vRange", v0, v1);
+            set2(c"center", cx, cy);
+            set1(c"k", k);
+            set1(c"aspect", aspect);
+            let src_loc = Self::uniform(prog.program, c"src");
+            if src_loc >= 0 {
+                gl::Uniform1i(src_loc, 0);
+            }
+
+            gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+
+            // ---- restore app GL state ----
+            saved.restore();
+        }
+
+        Some(extent)
     }
 }
 

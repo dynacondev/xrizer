@@ -503,6 +503,46 @@ pub(crate) fn warp_center_for_eye(right: bool, bounds: vr::VRTextureBounds_t) ->
     (cx, cy)
 }
 
+/// OpenGL-convention variant of [`warp_center_for_eye`].
+///
+/// GL samples with `v=0` at the bottom row (opposite of Vulkan's top-row
+/// `v=0`), and the GL warp shader maps framebuffer-bottom to the minimum-V
+/// row exactly like `CopyImageSubData` does. So the base vertical convention
+/// is `s=0` (bottom) `<->` `-down`, giving `cy = tanD/(tanD+tanU)`, mirrored
+/// when `bounds` are flipped. Horizontal matches Vulkan (`u=0` left).
+/// Symmetric FOVs give `(0.5, 0.5)` under either convention.
+pub(crate) fn warp_center_for_eye_gl(right: bool, bounds: vr::VRTextureBounds_t) -> (f32, f32) {
+    let fov = fov_layer_for_eye(right).or_else(|| fov_override_for_eye(right));
+    let Some(o) = fov else {
+        return (0.5, 0.5);
+    };
+    let tan_l = o.left_deg.to_radians().tan();
+    let tan_r = o.right_deg.to_radians().tan();
+    let tan_u = o.up_deg.to_radians().tan();
+    let tan_d = o.down_deg.to_radians().tan();
+    let mut cx = if tan_l + tan_r > 0.0 {
+        tan_l / (tan_l + tan_r)
+    } else {
+        0.5
+    };
+    let mut cy = if tan_u + tan_d > 0.0 {
+        tan_d / (tan_u + tan_d)
+    } else {
+        0.5
+    };
+    if bounds.uMin > bounds.uMax {
+        cx = 1.0 - cx;
+    }
+    if bounds.vMin > bounds.vMax {
+        cy = 1.0 - cy;
+    }
+    static LOGGED_GL: std::sync::Once = std::sync::Once::new();
+    LOGGED_GL.call_once(|| {
+        log::info!("xrizer-debug: warp center (GL) from display FOV: cx={cx:.4} cy={cy:.4}");
+    });
+    (cx, cy)
+}
+
 #[derive(macros::InterfaceImpl)]
 #[interface = "IVRSystem"]
 #[versions(026, 023, 022, 021, 020, 019, 017, 016, 015, 014, 012, 011, 009)]

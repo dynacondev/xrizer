@@ -167,6 +167,15 @@ impl Compositor {
         where
             AnyTempBackendData: From<TempBackendData<G>>,
         {
+            // Backend-validation log: proves which graphics path the app's
+            // submitted texture selected (Vulkan vs OpenGL). Fires once per
+            // session restart, i.e. when the app first submits.
+            info!(
+                "xrizer-debug: app texture backend={} eType={:?} colorSpace={:?} bounds={bounds:?}",
+                std::any::type_name::<G>(),
+                texture.eType,
+                texture.eColorSpace,
+            );
             let b_texture =
                 G::get_texture(texture).ok_or(vr::EVRCompositorError::InvalidTexture)?;
             let info = backend.swapchain_info_for_texture(b_texture, bounds, texture.eColorSpace);
@@ -748,6 +757,15 @@ impl vr::IVRCompositor029_Interface for Compositor {
             return vr::EVRCompositorError::InvalidTexture;
         };
 
+        // Backend-validation log: per-submit texture identity. With
+        // RUST_LOG=debug this shows every Submit's eye + texture type, so a
+        // Vulkan-claiming app submitting OpenGL textures is immediately
+        // visible (xrizer follows texture.eType, it cannot force Vulkan).
+        debug!(
+            "xrizer-debug: Submit eye={eye:?} eType={:?} colorSpace={:?} bounds={bounds:?} flags={submit_flags:?}",
+            texture.eType, texture.eColorSpace,
+        );
+
         if !self.focused.is_completed() {
             return vr::EVRCompositorError::DoNotHaveFocus;
         }
@@ -1269,7 +1287,12 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Default::default())
         };
 
-        trace!("submitted {eye:?}");
+        trace!(
+            "submitted {eye:?} extent={:?} flip={} warp_k={}",
+            self.eyes_submitted[eye as usize].map(|e| e.extent),
+            bounds.vertically_flipped(),
+            crate::system::warp_strength(),
+        );
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) {
             let mut swapchain_data = self.swapchain_data.as_mut();
             if let Some(data) = &mut swapchain_data {
