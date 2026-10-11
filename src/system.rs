@@ -169,6 +169,76 @@ impl ViewCache {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct FovOverride {
+    pub left_deg: f32,
+    pub right_deg: f32,
+    pub top_deg: f32,
+    pub bottom_deg: f32,
+}
+
+fn parse_fov_override(s: &str) -> Option<FovOverride> {
+    let v: Option<Vec<f32>> = s.split(',').map(|p| p.trim().parse().ok()).collect();
+    let v = v?;
+    match v.len() {
+        // "h,v": total degrees, split symmetric
+        2 => Some(FovOverride {
+            left_deg: v[0] / 2.0,
+            right_deg: v[0] / 2.0,
+            top_deg: v[1] / 2.0,
+            bottom_deg: v[1] / 2.0,
+        }),
+        // "l,r,t,b": half-angle degrees
+        4 => Some(FovOverride {
+            left_deg: v[0],
+            right_deg: v[1],
+            top_deg: v[2],
+            bottom_deg: v[3],
+        }),
+        _ => None,
+    }
+}
+
+/// FOV override in half-angle degrees, from CLI `--xrizer-fov=...` (wins) or
+/// env `XRIZER_FOV`. Applied to GetProjectionRaw AND the submitted
+/// projection-layer FOV (see end_frame) so render and display stay
+/// consistent. X-Plane reads Raw once at startup and builds its own
+/// matrices, so the Raw path is the load-bearing one for it.
+pub(crate) fn fov_override() -> Option<FovOverride> {
+    static PARSED: std::sync::OnceLock<(Option<FovOverride>, &'static str)> =
+        std::sync::OnceLock::new();
+    let (ov, src) = PARSED.get_or_init(|| {
+        if let Some(a) = std::env::args()
+            .skip(1)
+            .find_map(|a| a.strip_prefix("--xrizer-fov=").map(str::to_owned))
+        {
+            return (parse_fov_override(&a), "cli --xrizer-fov");
+        }
+        match std::env::var("XRIZER_FOV") {
+            Ok(s) => (parse_fov_override(&s), "env XRIZER_FOV"),
+            Err(_) => (None, ""),
+        }
+    });
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| match ov {
+        Some(o) => log::info!(
+            "xrizer-debug: FOV override from {src}: l={:.2} r={:.2} t={:.2} b={:.2} deg halves",
+            o.left_deg,
+            o.right_deg,
+            o.top_deg,
+            o.bottom_deg,
+        ),
+        None => {
+            if !src.is_empty() {
+                log::warn!(
+                    "xrizer-debug: ignoring malformed FOV override from {src}; want \"l,r,t,b\" half-deg or \"h,v\" total-deg"
+                );
+            }
+        }
+    });
+    *ov
+}
+
 #[derive(macros::InterfaceImpl)]
 #[interface = "IVRSystem"]
 #[versions(026, 023, 022, 021, 020, 019, 017, 016, 015, 014, 012, 011, 009)]
@@ -263,12 +333,43 @@ impl vr::IVRSystem026_Interface for System {
         top: *mut f32,
         bottom: *mut f32,
     ) {
+        // FOV override path (see fov_override): replaces served tangents.
+        // NOTE: deliberately unflipped mapping (top=up, bottom=down), unlike
+        // the default path below which swaps them for historical reasons.
+        if let Some(o) = fov_override() {
+            unsafe {
+                *left = o.left_deg.to_radians().tan();
+                *right = o.right_deg.to_radians().tan();
+                *top = o.top_deg.to_radians().tan();
+                *bottom = o.bottom_deg.to_radians().tan();
+            }
+            return;
+        }
         let ty = self
             .openxr
             .session_data
             .get()
             .current_origin_as_reference_space();
         let view = self.get_views(ty).views[eye as usize];
+
+        // FOV audit logging: raw XrFovf vs served tangents, once per eye.
+        static LOGGED_PROJ: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+        if (eye as usize) < LOGGED_PROJ.len() {
+            LOGGED_PROJ[eye as usize].call_once(|| {
+                let f = &view.fov;
+                log::info!(
+                    "xrizer-debug: served projection eye={eye:?} raw deg L/R/U/D=({:.2},{:.2},{:.2},{:.2}) tans=({:.4},{:.4},{:.4},{:.4})",
+                    f.angle_left.to_degrees(),
+                    f.angle_right.to_degrees(),
+                    f.angle_up.to_degrees(),
+                    f.angle_down.to_degrees(),
+                    f.angle_left.tan(),
+                    f.angle_right.tan(),
+                    f.angle_up.tan(),
+                    f.angle_down.tan(),
+                );
+            });
+        }
 
         // Top and bottom are flipped, for some reason
         unsafe {

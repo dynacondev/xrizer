@@ -1305,6 +1305,9 @@ impl<G: GraphicsBackend> FrameController<G> {
 
             let crate::system::ViewData { flags, views } =
                 system.get_views(session_data.current_origin_as_reference_space());
+            // FOV override: keep the submitted layer consistent with what
+            // GetProjectionRaw served the app (see fov_override).
+            let fov_ov = crate::system::fov_override();
             proj_layer_views = views
                 .into_iter()
                 .enumerate()
@@ -1328,6 +1331,14 @@ impl<G: GraphicsBackend> FrameController<G> {
                     } = self.eyes_submitted[eye_index]
                         .unwrap_or_else(|| panic!("Eye {eye_index} has not been submitted!"));
                     let mut fov = view.fov;
+                    if let Some(o) = fov_ov {
+                        fov = xr::Fovf {
+                            angle_left: o.left_deg.to_radians(),
+                            angle_right: o.right_deg.to_radians(),
+                            angle_up: o.top_deg.to_radians(),
+                            angle_down: o.bottom_deg.to_radians(),
+                        };
+                    }
                     if flip_vertically {
                         std::mem::swap(&mut fov.angle_up, &mut fov.angle_down);
                     }
