@@ -244,6 +244,43 @@ pub(crate) fn fov_override() -> Option<FovOverride> {
     *ov
 }
 
+fn parse_render_target(s: &str) -> Option<(u32, u32)> {
+    let mut it = s.split(',');
+    let w: u32 = it.next()?.trim().parse().ok()?;
+    let h: u32 = it.next()?.trim().parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+/// Render-target-size override in pixels ("w,h") from env XRIZER_RENDER_TARGET.
+/// X-Plane sizes its viewport from this; if its camera math couples target
+/// size and projection inconsistently, this moves the camera where FOV
+/// tangents could not. Unset/malformed = runtime recommended values.
+fn render_target_override() -> Option<(u32, u32)> {
+    static PARSED: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    let ov = PARSED.get_or_init(|| match std::env::var("XRIZER_RENDER_TARGET") {
+        Ok(s) => parse_render_target(&s),
+        Err(_) => None,
+    });
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| match ov {
+        Some((w, h)) => log::info!("xrizer-debug: render target override {w}x{h}"),
+        None => {
+            if std::env::var("XRIZER_RENDER_TARGET").is_ok() {
+                log::warn!(
+                    "xrizer-debug: ignoring malformed XRIZER_RENDER_TARGET; want \"w,h\" pixels"
+                );
+            }
+        }
+    });
+    *ov
+}
+
 #[derive(macros::InterfaceImpl)]
 #[interface = "IVRSystem"]
 #[versions(026, 023, 022, 021, 020, 019, 017, 016, 015, 014, 012, 011, 009)]
@@ -302,12 +339,32 @@ impl vr::IVRSystem026_Interface for System {
             )
             .unwrap();
 
+        let (mut w, mut h) = (
+            views[0].recommended_image_rect_width,
+            views[0].recommended_image_rect_height,
+        );
+        let ov = render_target_override();
+
+        // Audit log: runtime values vs served values, once.
+        static LOGGED_RT: std::sync::Once = std::sync::Once::new();
+        LOGGED_RT.call_once(|| match ov {
+            Some((ow, oh)) => log::info!(
+                "xrizer-debug: render target served {ow}x{oh} (override; runtime {w}x{h})"
+            ),
+            None => log::info!("xrizer-debug: render target served {w}x{h} (runtime)"),
+        });
+
+        if let Some((ow, oh)) = ov {
+            w = ow;
+            h = oh;
+        }
+
         if !width.is_null() {
-            unsafe { *width = views[0].recommended_image_rect_width };
+            unsafe { *width = w };
         }
 
         if !height.is_null() {
-            unsafe { *height = views[0].recommended_image_rect_height };
+            unsafe { *height = h };
         }
     }
     fn GetProjectionMatrix(&self, eye: vr::EVREye, near_z: f32, far_z: f32) -> vr::HmdMatrix44_t {
