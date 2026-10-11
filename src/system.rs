@@ -292,7 +292,7 @@ pub(crate) fn fov_override_right() -> Option<FovOverride> {
             }
         }
     });
-    (*ov).unwrap_or_else(fov_override)
+    (*ov).or_else(fov_override)
 }
 
 /// Override for one eye: left uses the shared fov_override(), right uses
@@ -302,6 +302,94 @@ pub(crate) fn fov_override_for_eye(right: bool) -> Option<FovOverride> {
         fov_override_right()
     } else {
         fov_override()
+    }
+}
+
+/// Display-path FOV override (CLI `--xrizer-fov-layer=...`, else env
+/// `XRIZER_FOV_LAYER`, same formats). When set, xrizer runs DECOUPLED: the
+/// app renders per the render-path override (XRIZER_FOV*) while the
+/// submitted layer declares these angles instead:
+/// - layer narrower than render => runtime crops the center (tests whether
+///   the textures always contained wide content).
+/// - layer wider than render   => content minified with surround (tests
+///   stretch-vs-1:1 runtime mapping).
+/// Unset = coupled (the layer follows the render-path override, or runtime
+/// views when nothing is overridden).
+pub(crate) fn fov_layer_override() -> Option<FovOverride> {
+    static PARSED: std::sync::OnceLock<(Option<FovOverride>, &'static str)> =
+        std::sync::OnceLock::new();
+    let (ov, src) = PARSED.get_or_init(|| {
+        parse_fov_from(
+            "--xrizer-fov-layer=",
+            "XRIZER_FOV_LAYER",
+            "cli --xrizer-fov-layer",
+            "env XRIZER_FOV_LAYER",
+        )
+    });
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| match ov {
+        Some(o) => log::info!(
+            "xrizer-debug: FOV layer override from {src}: l={:.2} r={:.2} u={:.2} d={:.2} deg halves (DECOUPLED display path)",
+            o.left_deg,
+            o.right_deg,
+            o.up_deg,
+            o.down_deg,
+        ),
+        None => {
+            if !src.is_empty() {
+                log::warn!(
+                    "xrizer-debug: ignoring malformed FOV layer override from {src}; want \"l,r,u,d\" half-deg or \"h,v\" total-deg"
+                );
+            }
+        }
+    });
+    *ov
+}
+
+/// Right-eye display-path override (CLI `--xrizer-fov-layer-right=...`,
+/// else env `XRIZER_FOV_LAYER_RIGHT`). Falls back to the shared layer
+/// override when unset (NOT to the render-path override; that fallback
+/// happens explicitly at the call site to preserve coupled behavior).
+pub(crate) fn fov_layer_override_right() -> Option<FovOverride> {
+    static PARSED: std::sync::OnceLock<(Option<FovOverride>, &'static str)> =
+        std::sync::OnceLock::new();
+    let (ov, src) = PARSED.get_or_init(|| {
+        parse_fov_from(
+            "--xrizer-fov-layer-right=",
+            "XRIZER_FOV_LAYER_RIGHT",
+            "cli --xrizer-fov-layer-right",
+            "env XRIZER_FOV_LAYER_RIGHT",
+        )
+    });
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| match ov {
+        Some(o) => log::info!(
+            "xrizer-debug: FOV layer override (right eye) from {src}: l={:.2} r={:.2} u={:.2} d={:.2} deg halves (DECOUPLED display path)",
+            o.left_deg,
+            o.right_deg,
+            o.up_deg,
+            o.down_deg,
+        ),
+        None => {
+            if !src.is_empty() {
+                log::warn!(
+                    "xrizer-debug: ignoring malformed FOV layer override (right eye) from {src}; want \"l,r,u,d\" half-deg or \"h,v\" total-deg"
+                );
+            }
+        }
+    });
+    (*ov).or_else(fov_layer_override)
+}
+
+/// Display-path override for one eye: right uses the right-specific layer
+/// value when set, else the shared layer value. Returns None when no layer
+/// override is set at all (callers then fall back to the render-path
+/// override to preserve coupled behavior).
+pub(crate) fn fov_layer_for_eye(right: bool) -> Option<FovOverride> {
+    if right {
+        fov_layer_override_right()
+    } else {
+        fov_layer_override()
     }
 }
 

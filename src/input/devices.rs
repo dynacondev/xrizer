@@ -167,7 +167,6 @@ fn get_hmd_pose(
             vr::ETrackingUniverseOrigin::Seated => "Seated",
             vr::ETrackingUniverseOrigin::Standing => "Standing",
             vr::ETrackingUniverseOrigin::RawAndUncalibrated => "RawAndUncalibrated",
-            _ => "Unknown",
         };
         let write_header = !std::path::Path::new(&path).exists();
         if let Ok(mut file) = std::fs::OpenOptions::new()

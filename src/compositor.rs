@@ -1308,6 +1308,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             // FOV override: keep the submitted layer consistent with what
             // GetProjectionRaw served the app (see fov_override). Per-eye:
             // right uses XRIZER_FOV_RIGHT when set, else the shared one.
+            // Decoupled mode: XRIZER_FOV_LAYER* wins when set, so the layer
+            // can declare different angles than the app rendered with.
             proj_layer_views = views
                 .into_iter()
                 .enumerate()
@@ -1331,7 +1333,12 @@ impl<G: GraphicsBackend> FrameController<G> {
                     } = self.eyes_submitted[eye_index]
                         .unwrap_or_else(|| panic!("Eye {eye_index} has not been submitted!"));
                     let mut fov = view.fov;
-                    if let Some(o) = crate::system::fov_override_for_eye(eye_index == 1) {
+                    // Display path: layer-specific override wins (decoupled
+                    // mode); otherwise follow the render-path override so a
+                    // shared XRIZER_FOV* keeps render and display consistent.
+                    let layer_ov = crate::system::fov_layer_for_eye(eye_index == 1)
+                        .or_else(|| crate::system::fov_override_for_eye(eye_index == 1));
+                    if let Some(o) = layer_ov {
                         // Mirror the runtime convention: up positive, down
                         // negative. (A positive angle_down is invalid and
                         // gets the layer rejected -> black feed.)
