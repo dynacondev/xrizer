@@ -1332,11 +1332,14 @@ impl<G: GraphicsBackend> FrameController<G> {
                         .unwrap_or_else(|| panic!("Eye {eye_index} has not been submitted!"));
                     let mut fov = view.fov;
                     if let Some(o) = fov_ov {
+                        // Mirror the runtime convention: up positive, down
+                        // negative. (A positive angle_down is invalid and
+                        // gets the layer rejected -> black feed.)
                         fov = xr::Fovf {
-                            angle_left: o.left_deg.to_radians(),
+                            angle_left: -o.left_deg.to_radians(),
                             angle_right: o.right_deg.to_radians(),
-                            angle_up: o.top_deg.to_radians(),
-                            angle_down: o.bottom_deg.to_radians(),
+                            angle_up: o.up_deg.to_radians(),
+                            angle_down: -o.down_deg.to_radians(),
                         };
                     }
                     if flip_vertically {

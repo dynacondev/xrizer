@@ -169,12 +169,17 @@ impl ViewCache {
     }
 }
 
+/// FOV override halves in degrees: left, right, up, down (all positive
+/// magnitudes). Served mapping mirrors the default path *exactly*,
+/// including its historical top/bottom flip: served left=-tan(l),
+/// right=+tan(r), top=-tan(down), bottom=+tan(up). The OpenXR layer FOV
+/// uses angle_up=+up, angle_down=-down (down MUST stay negative).
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct FovOverride {
     pub left_deg: f32,
     pub right_deg: f32,
-    pub top_deg: f32,
-    pub bottom_deg: f32,
+    pub up_deg: f32,
+    pub down_deg: f32,
 }
 
 fn parse_fov_override(s: &str) -> Option<FovOverride> {
@@ -185,15 +190,15 @@ fn parse_fov_override(s: &str) -> Option<FovOverride> {
         2 => Some(FovOverride {
             left_deg: v[0] / 2.0,
             right_deg: v[0] / 2.0,
-            top_deg: v[1] / 2.0,
-            bottom_deg: v[1] / 2.0,
+            up_deg: v[1] / 2.0,
+            down_deg: v[1] / 2.0,
         }),
-        // "l,r,t,b": half-angle degrees
+        // "l,r,u,d": half-angle degrees (magnitudes)
         4 => Some(FovOverride {
             left_deg: v[0],
             right_deg: v[1],
-            top_deg: v[2],
-            bottom_deg: v[3],
+            up_deg: v[2],
+            down_deg: v[3],
         }),
         _ => None,
     }
@@ -222,16 +227,16 @@ pub(crate) fn fov_override() -> Option<FovOverride> {
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| match ov {
         Some(o) => log::info!(
-            "xrizer-debug: FOV override from {src}: l={:.2} r={:.2} t={:.2} b={:.2} deg halves",
+            "xrizer-debug: FOV override from {src}: l={:.2} r={:.2} u={:.2} d={:.2} deg halves",
             o.left_deg,
             o.right_deg,
-            o.top_deg,
-            o.bottom_deg,
+            o.up_deg,
+            o.down_deg,
         ),
         None => {
             if !src.is_empty() {
                 log::warn!(
-                    "xrizer-debug: ignoring malformed FOV override from {src}; want \"l,r,t,b\" half-deg or \"h,v\" total-deg"
+                    "xrizer-debug: ignoring malformed FOV override from {src}; want \"l,r,u,d\" half-deg or \"h,v\" total-deg"
                 );
             }
         }
@@ -333,15 +338,24 @@ impl vr::IVRSystem026_Interface for System {
         top: *mut f32,
         bottom: *mut f32,
     ) {
-        // FOV override path (see fov_override): replaces served tangents.
-        // NOTE: deliberately unflipped mapping (top=up, bottom=down), unlike
-        // the default path below which swaps them for historical reasons.
+        // FOV override path (see fov_override): replaces served tangents,
+        // mirroring the default path's convention exactly, flip included:
+        // served (left,right,top,bottom) = (-tan l, +tan r, -tan d, +tan u).
         if let Some(o) = fov_override() {
+            let (l, r, t, b) = (
+                -o.left_deg.to_radians().tan(),
+                o.right_deg.to_radians().tan(),
+                -o.down_deg.to_radians().tan(),
+                o.up_deg.to_radians().tan(),
+            );
+            log::debug!(
+                "xrizer-debug: GetProjectionRaw eye={eye:?} OVERRIDDEN tans=({l:.4},{r:.4},{t:.4},{b:.4})"
+            );
             unsafe {
-                *left = o.left_deg.to_radians().tan();
-                *right = o.right_deg.to_radians().tan();
-                *top = o.top_deg.to_radians().tan();
-                *bottom = o.bottom_deg.to_radians().tan();
+                *left = l;
+                *right = r;
+                *top = t;
+                *bottom = b;
             }
             return;
         }
