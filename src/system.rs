@@ -74,7 +74,7 @@ impl ViewCache {
             )
             .expect("Couldn't locate views");
 
-        let original_orientations = views
+        let original_orientations: [Quat; 2] = views
             .iter_mut()
             .map(
                 |xr::View {
@@ -89,6 +89,28 @@ impl ViewCache {
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
+
+        // Pivot-debug logging (suspect ii: eye-to-head rotation content).
+        // Records the raw VIEW-space eye orientations/positions *before* the
+        // cant-strip above, so we can tell whether forcing them to identity
+        // discards real data. Logged once; positions double as an IPD check.
+        static LOG_RAW_VIEWS_ONCE: std::sync::Once = std::sync::Once::new();
+        LOG_RAW_VIEWS_ONCE.call_once(|| {
+            for (eye, view) in views.iter().enumerate() {
+                let q = &view.pose.orientation;
+                let angle_deg = 2.0 * q.w.clamp(-1.0, 1.0).acos().to_degrees();
+                log::info!(
+                    "xrizer-debug: raw VIEW-space view[{eye}]: pos=({:.6},{:.6},{:.6}) quat=({:.6},{:.6},{:.6},{:.6}) |angle|={angle_deg:.3}deg",
+                    view.pose.position.x,
+                    view.pose.position.y,
+                    view.pose.position.z,
+                    q.x,
+                    q.y,
+                    q.z,
+                    q.w,
+                );
+            }
+        });
 
         ViewDataViewSpace {
             data: ViewData {
@@ -283,7 +305,7 @@ impl vr::IVRSystem026_Interface for System {
         let view = views[eye as usize];
         let view_rot = view.pose.orientation;
 
-        {
+        let result = {
             tracy_span!("conversion");
             let rot = Mat3::from_quat(Quat::from_xyzw(
                 view_rot.x, view_rot.y, view_rot.z, view_rot.w,
@@ -300,7 +322,27 @@ impl vr::IVRSystem026_Interface for System {
                     gen_array(view.pose.position.z, rot.z_axis),
                 ],
             }
+        };
+
+        // Pivot-debug logging (suspect ii): what eye-to-head transform the app
+        // actually receives. Per-call at debug level; first call per eye also
+        // at info level so it shows without RUST_LOG changes. Healthy looks
+        // like translation ~= +/-IPD/2 on X with a ~=identity rotation.
+        log::debug!(
+            "xrizer-debug: GetEyeToHeadTransform eye={eye:?} m={:?}",
+            result.m,
+        );
+        static LOGGED_E2H: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
+        if (eye as usize) < LOGGED_E2H.len() {
+            LOGGED_E2H[eye as usize].call_once(|| {
+                log::info!(
+                    "xrizer-debug: GetEyeToHeadTransform eye={eye:?} m={:?}",
+                    result.m,
+                );
+            });
         }
+
+        result
     }
     fn GetTimeSinceLastVsync(&self, _: *mut f32, _: *mut u64) -> bool {
         crate::warn_unimplemented!("GetTimeSinceLastVsync");

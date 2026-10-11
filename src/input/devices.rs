@@ -99,6 +99,56 @@ fn get_hmd_pose(
             .ok()?
     };
 
+    // T4 pivot logging: per-frame HMD pose CSV, enabled via
+    // XRIZER_LOG_HMD=<path>. One row per pose query (i.e. per WaitGetPoses).
+    // Columns: display_time_ns,origin,pos.x,pos.y,pos.z,
+    //          quat.x,quat.y,quat.z,quat.w,
+    //          lin_vel.x,lin_vel.y,lin_vel.z,ang_vel.x,ang_vel.y,ang_vel.z
+    if let Ok(path) = std::env::var("XRIZER_LOG_HMD") {
+        let origin_name = match origin {
+            vr::ETrackingUniverseOrigin::Seated => "Seated",
+            vr::ETrackingUniverseOrigin::Standing => "Standing",
+            vr::ETrackingUniverseOrigin::RawAndUncalibrated => "RawAndUncalibrated",
+            _ => "Unknown",
+        };
+        let write_header = !std::path::Path::new(&path).exists();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            if write_header {
+                let _ = writeln!(
+                    file,
+                    "display_time_ns,origin,pos.x,pos.y,pos.z,quat.x,quat.y,quat.z,quat.w,lin.x,lin.y,lin.z,ang.x,ang.y,ang.z"
+                );
+            }
+            let p = &location.pose.position;
+            let q = &location.pose.orientation;
+            let l = &velocity.linear_velocity;
+            let a = &velocity.angular_velocity;
+            let _ = writeln!(
+                file,
+                "{},{origin_name},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                xr_data.display_time.get().as_nanos(),
+                p.x,
+                p.y,
+                p.z,
+                q.x,
+                q.y,
+                q.z,
+                q.w,
+                l.x,
+                l.y,
+                l.z,
+                a.x,
+                a.y,
+                a.z,
+            );
+        }
+    }
+
     Some(vr::space_relation_to_openvr_pose(location, velocity))
 }
 
