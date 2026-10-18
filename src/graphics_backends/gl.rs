@@ -6,7 +6,7 @@ use glutin_glx_sys::{
     glx::{self, Glx},
 };
 use libc::{dlerror, dlopen, dlsym};
-use log::{info, warn};
+use log::{debug, info, warn};
 use openvr as vr;
 use openxr as xr;
 use std::collections::HashSet;
@@ -62,6 +62,11 @@ const FD_IMPORT_EXTS: [&str; 4] = [
 
 /// Opaque-fd handle type for memory/semaphore imports.
 const HANDLE_TYPE_OPAQUE_FD: u32 = 0x9586;
+
+/// Texture parameter: the memory object is dedicated to this texture.
+/// Our dma-buf allocations are dedicated by construction; NVIDIA's
+/// opaque-FD path can refuse non-dedicated imports.
+const DEDICATED_MEMORY_OBJECT_EXT: u32 = 0x9581;
 
 type PfCreateMemoryObjects = unsafe extern "system" fn(gl::types::GLsizei, *mut gl::types::GLuint);
 type PfDeleteMemoryObjects =
@@ -514,13 +519,34 @@ impl GraphicsBackend for GlData {
             return inert();
         }
         let dst = self.depth_images[req.depth_image_index];
-        // Reimport on epoch/segment/dims/format change (old GL objects first).
-        let key = (req.setup_epoch, req.seg_len, req.w, req.h, req.vk_format);
+        // Reimport on epoch/dims/format change (old GL objects first).
+        // Segment size is deliberately NOT part of the identity:
+        // PIXELS<->FD size churn must not force reimports of still-valid FDs.
+        let key = (req.setup_epoch, req.w, req.h, req.vk_format);
         let cached_key = self
             .depth_fd
             .as_ref()
-            .map(|c| (c.epoch, c.seg_len, c.w, c.h, c.vk_format));
+            .map(|c| (c.epoch, c.w, c.h, c.vk_format));
         if cached_key != Some(key) {
+            match self.depth_fd.as_ref() {
+                Some(c) => debug!(
+                    "depth FD reimport: epoch {}→{}, dims {}x{}→{}x{}, format {}→{}, seg {}→{}",
+                    c.epoch,
+                    req.setup_epoch,
+                    c.w,
+                    c.h,
+                    req.w,
+                    req.h,
+                    c.vk_format,
+                    req.vk_format,
+                    c.seg_len,
+                    req.seg_len,
+                ),
+                None => debug!(
+                    "depth FD import: epoch {}, dims {}x{}, format {}, seg {}",
+                    req.setup_epoch, req.w, req.h, req.vk_format, req.seg_len,
+                ),
+            }
             self.drop_depth_imports();
             match Self::import_fd_slots(req, bpp, internal) {
                 Some(slots) => {
@@ -774,7 +800,13 @@ impl GlData {
                 create_mem(1, &mut mem);
                 import_mem(mem, size, HANDLE_TYPE_OPAQUE_FD, req.mem_fds[i]);
                 gl::GenTextures(1, &mut tex);
+                // Dedicated by construction (see above); must be declared
+                // before storage is specified from the memory object.
+                gl::BindTexture(gl::TEXTURE_2D, tex);
+                let dedicated: gl::types::GLint = 1;
+                gl::TexParameteriv(gl::TEXTURE_2D, DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
                 tex_storage(tex, 1, internal, req.w as i32, req.h as i32, mem, 0);
+                gl::BindTexture(gl::TEXTURE_2D, 0);
                 gen_sem(1, &mut sem);
                 import_sem(sem, HANDLE_TYPE_OPAQUE_FD, req.sem_fds[i]);
                 gl::GetError() == gl::NO_ERROR && mem != 0 && tex != 0 && sem != 0
