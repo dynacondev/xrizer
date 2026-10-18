@@ -279,6 +279,36 @@ pub fn now_mono_ns() -> u64 {
 }
 
 #[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+
+/// Serializes tests that mutate process-global env vars (shared by this
+/// module's tests and the compositor gate tests).
+#[cfg(test)]
+static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn env_guard() -> MutexGuard<'static, ()> {
+    ENV_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test-only env mutation. Callers must hold [`env_guard`].
+#[cfg(test)]
+pub(crate) fn set_env_for_tests(key: &str, val: &str) {
+    // SAFETY: all test env mutation is serialized through env_guard(),
+    // and no other thread in this binary mutates the environment.
+    unsafe { std::env::set_var(key, val) }
+}
+
+/// Test-only env mutation. Callers must hold [`env_guard`].
+#[cfg(test)]
+pub(crate) fn del_env_for_tests(key: &str) {
+    // SAFETY: see set_env_for_tests.
+    unsafe { std::env::remove_var(key) }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::CString;
@@ -298,6 +328,17 @@ mod tests {
     }
 
     fn make_seg(name: &str, w: u32, h: u32, present_no: u64, time_ns: u64) -> TestSeg {
+        make_seg_with(name, w, h, present_no, time_ns, |_| {})
+    }
+
+    fn make_seg_with(
+        name: &str,
+        w: u32,
+        h: u32,
+        present_no: u64,
+        time_ns: u64,
+        tweak: impl FnOnce(&mut XdShmHeader),
+    ) -> TestSeg {
         let cname = CString::new(name).unwrap();
         unsafe { libc::shm_unlink(cname.as_ptr()) };
         let len = HEADER_SIZE + w as usize * h as usize * 4;
@@ -323,7 +364,7 @@ mod tests {
         assert_ne!(ptr, libc::MAP_FAILED);
         unsafe { libc::close(fd) };
         // Writer protocol: seq odd -> header+pixels -> seq even.
-        let hdr = XdShmHeader {
+        let mut hdr = XdShmHeader {
             magic: SHM_MAGIC,
             version: SHM_VERSION,
             seq: 1,
@@ -337,19 +378,33 @@ mod tests {
             max_depth: 0.5,
             reserved: [0, 0],
         };
-        unsafe {
-            (ptr as *mut XdShmHeader).write_unaligned(hdr);
-            let px = (ptr as *mut u8).add(HEADER_SIZE) as *mut f32;
-            for i in 0..(w as usize * h as usize) {
-                px.add(i).write((i as f32) / 1000.0);
-            }
-            // publish
-            (ptr as *mut u32).add(2).write_volatile(2);
-        }
+        tweak(&mut hdr);
+        let pixels: Vec<f32> = (0..w as usize * h as usize)
+            .map(|i| i as f32 / 1000.0)
+            .collect();
+        publish(ptr, &mut hdr, &pixels);
         TestSeg {
             name: cname,
             ptr,
             len,
+        }
+    }
+
+    /// Mirror of the producer publish sequence (odd -> copy -> even).
+    fn publish(ptr: *mut libc::c_void, hdr: &mut XdShmHeader, pixels: &[f32]) {
+        assert_eq!(pixels.len(), hdr.w as usize * hdr.h as usize);
+        hdr.seq = 1;
+        unsafe {
+            (ptr as *mut XdShmHeader).write_unaligned(*hdr);
+            if !pixels.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    pixels.as_ptr(),
+                    (ptr as *mut u8).add(HEADER_SIZE) as *mut f32,
+                    pixels.len(),
+                );
+            }
+            // publish
+            (ptr as *mut u32).add(2).write_volatile(2);
         }
     }
 
@@ -403,5 +458,174 @@ mod tests {
     fn absent_returns_none() {
         let feed = DepthFeed::open_for_test("/xrizer-depth-test-definitely-absent");
         assert!(feed.latest_for(now_mono_ns(), 100).is_none());
+    }
+
+    #[test]
+    fn bad_version_format_layout_rejected() {
+        let now = now_mono_ns();
+        let pid = std::process::id();
+        let cases: [(u32, fn(&mut XdShmHeader)); 3] = [
+            (5, |h: &mut XdShmHeader| h.version = 2),
+            (6, |h: &mut XdShmHeader| h.format = 96),
+            (7, |h: &mut XdShmHeader| h.eye_layout = 0),
+        ];
+        for (suffix, tweak) in cases {
+            let name = format!("/xrizer-depth-test-{pid}-{suffix}");
+            let _seg = make_seg_with(&name, 4, 2, 1, now, tweak);
+            let feed = DepthFeed::open_for_test(&name);
+            assert!(
+                feed.latest_for(now + 1_000_000, 100).is_none(),
+                "segment {suffix} must miss"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_dims_rejected() {
+        let now = now_mono_ns();
+        let pid = std::process::id();
+        // Odd width and zero height both fail the plausibility gate.
+        for (suffix, w, h) in [(8u32, 5u32, 2u32), (9, 0, 2)] {
+            let name = format!("/xrizer-depth-test-{pid}-{suffix}");
+            let _seg = make_seg(&name, w, h, 1, now);
+            let feed = DepthFeed::open_for_test(&name);
+            assert!(
+                feed.latest_for(now + 1_000_000, 100).is_none(),
+                "dims {w}x{h} must miss"
+            );
+        }
+    }
+
+    #[test]
+    fn header_plausible_unit() {
+        let base = XdShmHeader {
+            magic: SHM_MAGIC,
+            version: SHM_VERSION,
+            seq: 2,
+            w: 8,
+            h: 2,
+            format: FORMAT_D32F,
+            eye_layout: EYE_SIDEBYSIDE,
+            present_no: 0,
+            time_mono_ns: 0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+            reserved: [0, 0],
+        };
+        let exact = HEADER_SIZE + 8 * 2 * 4;
+        assert!(header_plausible(&base, exact));
+        assert!(!header_plausible(&base, exact + 4), "size mismatch");
+        assert!(!header_plausible(&XdShmHeader { w: 7, ..base }, exact));
+        assert!(!header_plausible(&XdShmHeader { w: 0, ..base }, exact));
+        assert!(!header_plausible(
+            &XdShmHeader { h: 0, ..base },
+            HEADER_SIZE
+        ));
+        assert!(!header_plausible(
+            &XdShmHeader { w: 16385, ..base },
+            HEADER_SIZE + 16385 * 2 * 4
+        ));
+    }
+
+    #[test]
+    fn stuck_odd_seqlock_returns_none() {
+        let name = format!("/xrizer-depth-test-{}-10", std::process::id());
+        let now = now_mono_ns();
+        let seg = make_seg(&name, 4, 2, 1, now);
+        // Writer torn mid-publish: seq stuck odd. Must miss (bounded), not hang.
+        unsafe {
+            (seg.ptr as *mut u32).add(2).write_volatile(3);
+        }
+        let feed = DepthFeed::open_for_test(&name);
+        assert!(feed.latest_for(now + 1_000_000, 100).is_none());
+    }
+
+    #[test]
+    fn republish_newest_wins() {
+        let name = format!("/xrizer-depth-test-{}-11", std::process::id());
+        let now = now_mono_ns();
+        let seg = make_seg(&name, 4, 2, 1, now);
+        let feed = DepthFeed::open_for_test(&name);
+        let first = feed.latest_for(now + 1_000_000, 100).expect("first hit");
+        assert_eq!(first.present_no, 1);
+        // Second publish overwrites the slot; the reader must see it.
+        let mut hdr = XdShmHeader {
+            magic: SHM_MAGIC,
+            version: SHM_VERSION,
+            seq: 1,
+            w: 4,
+            h: 2,
+            format: FORMAT_D32F,
+            eye_layout: EYE_SIDEBYSIDE,
+            present_no: 2,
+            time_mono_ns: now,
+            min_depth: 0.0,
+            max_depth: 0.25,
+            reserved: [0, 0],
+        };
+        let pixels = vec![0.5f32; 8];
+        publish(seg.ptr, &mut hdr, &pixels);
+        let second = feed.latest_for(now + 1_000_000, 100).expect("second hit");
+        assert_eq!(second.present_no, 2);
+        assert!(
+            second
+                .pixels
+                .iter()
+                .all(|&p| (p - 0.5).abs() < f32::EPSILON)
+        );
+    }
+
+    #[test]
+    fn env_parsing() {
+        let _lock = env_guard();
+        let save = |key: &str| std::env::var(key).ok();
+        let orig_master = save("XRIZER_DEPTH_SHM");
+        let orig_name = save("XP_DEPTH_SHM_NAME");
+        let orig_age = save("XRIZER_DEPTH_MAX_AGE_MS");
+        let orig_near = save("XRIZER_DEPTH_NEAR");
+        let orig_far = save("XRIZER_DEPTH_FAR");
+        let restore = |key: &str, val: Option<String>| match val {
+            Some(v) => set_env_for_tests(key, &v),
+            None => del_env_for_tests(key),
+        };
+
+        del_env_for_tests("XRIZER_DEPTH_SHM");
+        assert!(!depth_master_enabled());
+        set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+        assert!(depth_master_enabled());
+        set_env_for_tests("XRIZER_DEPTH_SHM", "0");
+        assert!(!depth_master_enabled());
+        set_env_for_tests("XRIZER_DEPTH_SHM", "yes");
+        assert!(!depth_master_enabled());
+
+        del_env_for_tests("XP_DEPTH_SHM_NAME");
+        assert_eq!(shm_name(), DEFAULT_SHM_NAME);
+        set_env_for_tests("XP_DEPTH_SHM_NAME", "/custom-depth");
+        assert_eq!(shm_name(), "/custom-depth");
+
+        del_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS");
+        assert_eq!(max_age_ms(), 100);
+        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "250");
+        assert_eq!(max_age_ms(), 250);
+        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "abc");
+        assert_eq!(max_age_ms(), 100);
+
+        del_env_for_tests("XRIZER_DEPTH_NEAR");
+        del_env_for_tests("XRIZER_DEPTH_FAR");
+        let (near, far) = near_far();
+        assert!((near - 1.0).abs() < f32::EPSILON && (far - 30000.0).abs() < 1.0);
+        set_env_for_tests("XRIZER_DEPTH_NEAR", "0.5");
+        set_env_for_tests("XRIZER_DEPTH_FAR", "1000.0");
+        let (near, far) = near_far();
+        assert!((near - 0.5).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
+        set_env_for_tests("XRIZER_DEPTH_NEAR", "bogus");
+        let (near, far) = near_far();
+        assert!((near - 1.0).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
+
+        restore("XRIZER_DEPTH_SHM", orig_master);
+        restore("XP_DEPTH_SHM_NAME", orig_name);
+        restore("XRIZER_DEPTH_MAX_AGE_MS", orig_age);
+        restore("XRIZER_DEPTH_NEAR", orig_near);
+        restore("XRIZER_DEPTH_FAR", orig_far);
     }
 }
