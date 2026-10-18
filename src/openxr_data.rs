@@ -135,6 +135,11 @@ impl<C: Compositor> OpenXrData<C> {
         exts.khr_composition_layer_equirect2 = supported_exts.khr_composition_layer_equirect2;
         exts.khr_composition_layer_color_scale_bias =
             supported_exts.khr_composition_layer_color_scale_bias;
+        exts.khr_composition_layer_depth = supported_exts.khr_composition_layer_depth;
+        info!(
+            "khr_composition_layer_depth supported: {}",
+            supported_exts.khr_composition_layer_depth
+        );
         exts.htc_vive_focus3_controller_interaction =
             supported_exts.htc_vive_focus3_controller_interaction;
         exts.meta_touch_controller_plus = supported_exts.meta_touch_controller_plus;
@@ -629,6 +634,19 @@ impl SessionData {
             );
             info.format = new_format;
         }
+    }
+
+    pub fn swapchain_formats<G: GraphicsBackend>(
+        &self,
+    ) -> Option<Vec<<G::Api as xr::Graphics>::Format>>
+    where
+        for<'a> &'a GraphicalSession: TryInto<&'a Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: Clone,
+    {
+        (&self.session_graphics)
+            .try_into()
+            .map(|s: &Session<G::Api>| s.swapchain_formats.clone())
+            .ok()
     }
 
     pub fn tracking_space(&self) -> &xr::Space {
