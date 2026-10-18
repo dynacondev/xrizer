@@ -1430,12 +1430,12 @@ impl<G: GraphicsBackend> FrameController<G> {
             return false;
         }
         let color_info = match self.swapchain_data.as_ref() {
-            Some(c) => c.info,
+            Some(c) => &c.info,
             None => return false,
         };
         let mut info = match self
             .backend
-            .depth_swapchain_create_info(&color_info, want_fmt.clone())
+            .depth_swapchain_create_info(color_info, want_fmt.clone())
         {
             Some(i) => i,
             None => return false,
