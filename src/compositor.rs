@@ -2402,4 +2402,51 @@ mod tests {
         f.comp.PostPresentHandoff();
         f.check_frame_state(fakexr::FrameState::Ended);
     }
+
+    #[test]
+    fn depth_inert_with_unsupported_backend() {
+        // Master switch on, but the Fake backend has no depth support:
+        // frames must go through plain views with no depth state armed.
+        let _lock = crate::depth_feed::env_guard();
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+        crate::depth_feed::set_env_for_tests(
+            "XP_DEPTH_SHM_NAME",
+            "/xrizer-depth-test-absent-tier2",
+        );
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        // Force the render path: fakexr never reports should_render.
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = true;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
+
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert!(ctrl.depth_swapchain.is_none());
+            assert!(ctrl.depth_feed.is_none());
+            assert!(!ctrl.depth_ready_this_frame);
+        }
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+        crate::depth_feed::del_env_for_tests("XP_DEPTH_SHM_NAME");
+    }
 }
