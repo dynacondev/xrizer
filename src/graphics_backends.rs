@@ -48,6 +48,49 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
     ) -> xr::Extent2Di;
+
+    /// Depth handoff (GL session only). Defaults keep other backends
+    /// compiling untouched and color-only.
+    fn depth_swapchain_create_info(
+        &self,
+        color_info: &xr::SwapchainCreateInfo<Self::Api>,
+        depth_format: <Self::Api as xr::Graphics>::Format,
+    ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+        let _ = (color_info, depth_format);
+        None
+    }
+
+    fn store_depth_swapchain_images(
+        &mut self,
+        images: Vec<<Self::Api as xr::Graphics>::SwapchainImage>,
+        format: <Self::Api as xr::Graphics>::Format,
+    ) {
+        let _ = (images, format);
+    }
+
+    /// Upload both eye halves from a wide side-by-side float buffer.
+    /// Returns false when unsupported (default) or on dims mismatch.
+    fn upload_depth_images(
+        &self,
+        depth_image_index: usize,
+        frame: &crate::depth_feed::DepthFrame,
+        eye_w: u32,
+        eye_h: u32,
+    ) -> bool {
+        let _ = (depth_image_index, frame, eye_w, eye_h);
+        false
+    }
+
+    /// Whether this backend can carry depth at all. Used to skip SHM work.
+    fn supports_depth() -> bool {
+        false
+    }
+
+    /// Preferred depth swapchain format, if any. Checked against the session's
+    /// enumerated formats; depth stays off when absent.
+    fn preferred_depth_format() -> Option<<Self::Api as xr::Graphics>::Format> {
+        None
+    }
 }
 
 #[derive(macros::Backends, TryInto, From)]

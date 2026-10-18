@@ -19,6 +19,8 @@ pub struct GlData {
     format: u32,
     read_fbo: u32,
     draw_fbo: u32,
+    depth_images: Vec<u32>,
+    depth_format: u32,
 }
 
 #[derive(Deref)]
@@ -135,6 +137,8 @@ impl GlData {
             format: 0,
             read_fbo: fbos[0],
             draw_fbo: fbos[1],
+            depth_images: Default::default(),
+            depth_format: 0,
         })
     }
 }
@@ -299,6 +303,96 @@ impl GraphicsBackend for GlData {
             image_index,
             vr::EVRSubmitFlags::Default,
         )
+    }
+
+    fn supports_depth() -> bool {
+        true
+    }
+
+    fn preferred_depth_format() -> Option<<Self::Api as xr::Graphics>::Format> {
+        Some(crate::depth_feed::GL_DEPTH_COMPONENT32F)
+    }
+
+    fn depth_swapchain_create_info(
+        &self,
+        color_info: &xr::SwapchainCreateInfo<Self::Api>,
+        depth_format: <Self::Api as xr::Graphics>::Format,
+    ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+        if color_info.width == 0 || color_info.height == 0 {
+            return None;
+        }
+        Some(xr::SwapchainCreateInfo {
+            create_flags: xr::SwapchainCreateFlags::EMPTY,
+            usage_flags: xr::SwapchainUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                | xr::SwapchainUsageFlags::TRANSFER_DST,
+            format: depth_format,
+            sample_count: 1,
+            width: color_info.width,
+            height: color_info.height,
+            face_count: 1,
+            array_size: 2,
+            mip_count: 1,
+        })
+    }
+
+    fn store_depth_swapchain_images(
+        &mut self,
+        images: Vec<<Self::Api as xr::Graphics>::SwapchainImage>,
+        format: u32,
+    ) {
+        self.depth_images = images;
+        self.depth_format = format;
+    }
+
+    fn upload_depth_images(
+        &self,
+        depth_image_index: usize,
+        frame: &crate::depth_feed::DepthFrame,
+        eye_w: u32,
+        eye_h: u32,
+    ) -> bool {
+        if self.depth_images.is_empty() || depth_image_index >= self.depth_images.len() {
+            return false;
+        }
+        if eye_w == 0 || eye_h == 0 {
+            return false;
+        }
+        if frame.w != eye_w * 2 || frame.h != eye_h {
+            return false;
+        }
+        if frame.pixels.len() != frame.w as usize * frame.h as usize {
+            return false;
+        }
+        let tex = self.depth_images[depth_image_index];
+        let full_w = frame.w;
+        unsafe {
+            gl::BindTexture(gl::TEXTURE_2D_ARRAY, tex);
+            gl::PixelStorei(gl::UNPACK_ALIGNMENT, 1);
+            gl::PixelStorei(gl::UNPACK_ROW_LENGTH, full_w as i32);
+            for eye in 0..2u32 {
+                let src = frame
+                    .pixels
+                    .as_ptr()
+                    .add(eye as usize * eye_w as usize)
+                    .cast::<std::ffi::c_void>();
+                gl::TexSubImage3D(
+                    gl::TEXTURE_2D_ARRAY,
+                    0,
+                    0,
+                    0,
+                    eye as i32,
+                    eye_w as i32,
+                    eye_h as i32,
+                    1,
+                    gl::DEPTH_COMPONENT,
+                    gl::FLOAT,
+                    src,
+                );
+            }
+            gl::PixelStorei(gl::UNPACK_ROW_LENGTH, 0);
+            gl::BindTexture(gl::TEXTURE_2D_ARRAY, 0);
+        }
+        true
     }
 }
 
