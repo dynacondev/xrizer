@@ -45,9 +45,11 @@ struct DepthFdCache {
     /// (epoch, generation) of the last semaphore wait. Survives session restarts
     /// (same GL context) so a restart can never double-wait one signal.
     last_waited: Option<(u32, u64)>,
-    /// Copies in flight: (fence, generation). Acked on completion, never before —
-    /// the producer may reuse a slot as soon as it sees the ack.
-    pending: Vec<(gl::types::GLsync, u64)>,
+    /// Copies in flight: (fence address bits, generation). Integers keep the
+    /// cache Send + Sync; cast back to GLsync at the use site. Acked on
+    /// completion, never before — the producer may reuse a slot as soon as
+    /// it sees the ack.
+    pending: Vec<(u64, u64)>,
 }
 
 /// Required GL extensions for the FD import path.
@@ -57,6 +59,96 @@ const FD_IMPORT_EXTS: [&str; 4] = [
     "GL_EXT_semaphore",
     "GL_EXT_semaphore_fd",
 ];
+
+/// Opaque-fd handle type for memory/semaphore imports.
+const HANDLE_TYPE_OPAQUE_FD: u32 = 0x9586;
+
+type PfCreateMemoryObjects = unsafe extern "system" fn(gl::types::GLsizei, *mut gl::types::GLuint);
+type PfDeleteMemoryObjects =
+    unsafe extern "system" fn(gl::types::GLsizei, *const gl::types::GLuint);
+type PfTextureStorageMem2D = unsafe extern "system" fn(
+    gl::types::GLuint,
+    gl::types::GLsizei,
+    gl::types::GLenum,
+    gl::types::GLsizei,
+    gl::types::GLsizei,
+    gl::types::GLuint,
+    gl::types::GLuint64,
+);
+type PfImportMemoryFd = unsafe extern "system" fn(
+    gl::types::GLuint,
+    gl::types::GLuint64,
+    gl::types::GLenum,
+    gl::types::GLint,
+);
+type PfGenSemaphores = unsafe extern "system" fn(gl::types::GLsizei, *mut gl::types::GLuint);
+type PfDeleteSemaphores = unsafe extern "system" fn(gl::types::GLsizei, *const gl::types::GLuint);
+type PfImportSemaphoreFd =
+    unsafe extern "system" fn(gl::types::GLuint, gl::types::GLenum, gl::types::GLint);
+type PfWaitSemaphore = unsafe extern "system" fn(
+    gl::types::GLuint,
+    gl::types::GLuint,
+    *const gl::types::GLuint,
+    gl::types::GLuint,
+    *const gl::types::GLuint,
+    *const gl::types::GLenum,
+);
+
+/// EXT_memory_object(_fd) + EXT_semaphore(_fd) entry points. The `gl` crate
+/// has no bindings for these, so they are loaded via `GetProcAddress` like
+/// the core entry points above. Every call site checks `Some`.
+struct DepthExtFns {
+    create_memory_objects: Option<PfCreateMemoryObjects>,
+    delete_memory_objects: Option<PfDeleteMemoryObjects>,
+    texture_storage_mem_2d: Option<PfTextureStorageMem2D>,
+    import_memory_fd: Option<PfImportMemoryFd>,
+    gen_semaphores: Option<PfGenSemaphores>,
+    delete_semaphores: Option<PfDeleteSemaphores>,
+    import_semaphore_fd: Option<PfImportSemaphoreFd>,
+    wait_semaphore: Option<PfWaitSemaphore>,
+}
+
+impl DepthExtFns {
+    fn ready(&self) -> bool {
+        self.create_memory_objects.is_some()
+            && self.delete_memory_objects.is_some()
+            && self.texture_storage_mem_2d.is_some()
+            && self.import_memory_fd.is_some()
+            && self.gen_semaphores.is_some()
+            && self.delete_semaphores.is_some()
+            && self.import_semaphore_fd.is_some()
+            && self.wait_semaphore.is_some()
+    }
+}
+
+static DEPTH_EXT: LazyLock<DepthExtFns> = LazyLock::new(|| {
+    let glx = Glx::load_with(|func| {
+        let name = unsafe { CString::from_vec_unchecked(func.as_bytes().to_vec()) };
+        GLX.get(&name)
+    });
+    unsafe fn proc<F>(glx: &Glx, name: &'static CStr) -> Option<F> {
+        let p = glx.GetProcAddress(name.as_ptr().cast::<u8>()) as *const c_void;
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: signatures match the Khronos registry; call sites check Some.
+            Some(std::mem::transmute_copy::<*const c_void, F>(&p))
+        }
+    }
+    // SAFETY: as above; loading addresses performs no GL work.
+    unsafe {
+        DepthExtFns {
+            create_memory_objects: proc(&glx, c"glCreateMemoryObjectsEXT"),
+            delete_memory_objects: proc(&glx, c"glDeleteMemoryObjectsEXT"),
+            texture_storage_mem_2d: proc(&glx, c"glTextureStorageMem2DEXT"),
+            import_memory_fd: proc(&glx, c"glImportMemoryFdEXT"),
+            gen_semaphores: proc(&glx, c"glGenSemaphoresEXT"),
+            delete_semaphores: proc(&glx, c"glDeleteSemaphoresEXT"),
+            import_semaphore_fd: proc(&glx, c"glImportSemaphoreFdEXT"),
+            wait_semaphore: proc(&glx, c"glWaitSemaphoreEXT"),
+        }
+    }
+});
 
 /// Query the current context's extension set (GL 3.0+ enumeration with a
 /// pre-3.0 fallback). Call only with a context current.
@@ -391,7 +483,9 @@ impl GraphicsBackend for GlData {
     }
 
     fn depth_fd_import_viable(&self) -> bool {
-        self.fd_import_viable
+        // Extension string probe (logged at session init) plus the loaded
+        // entry points themselves; both must hold to attempt imports.
+        self.fd_import_viable && DEPTH_EXT.ready()
     }
 
     fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
@@ -450,7 +544,8 @@ impl GraphicsBackend for GlData {
         if let Some(cache) = self.depth_fd.as_mut() {
             let mut i = 0;
             while i < cache.pending.len() {
-                let (sync, g) = cache.pending[i];
+                let (bits, g) = cache.pending[i];
+                let sync = bits as gl::types::GLsync;
                 let status = unsafe { gl::ClientWaitSync(sync, 0, 0) };
                 if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
                     unsafe { gl::DeleteSync(sync) };
@@ -473,8 +568,14 @@ impl GraphicsBackend for GlData {
         // Wait once per generation (binary semaphores; skip on re-copy).
         let slot = (req.generation % 3) as usize;
         if cache.last_waited != Some((req.setup_epoch, req.generation)) {
+            let Some(wait) = DEPTH_EXT.wait_semaphore else {
+                return DepthFdResult {
+                    copied: false,
+                    ack_gen: ack,
+                };
+            };
             unsafe {
-                gl::WaitSemaphoreEXT(
+                wait(
                     cache.slots[slot].sem,
                     0,
                     std::ptr::null(),
@@ -515,7 +616,7 @@ impl GraphicsBackend for GlData {
         }
         let sync = unsafe { gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) };
         if !sync.is_null() {
-            cache.pending.push((sync, req.generation));
+            cache.pending.push((sync as u64, req.generation));
             unsafe { gl::Flush() };
         }
         DepthFdResult {
@@ -527,13 +628,17 @@ impl GraphicsBackend for GlData {
     fn drop_depth_imports(&mut self) {
         if let Some(cache) = self.depth_fd.take() {
             unsafe {
-                for (sync, _) in cache.pending {
-                    gl::DeleteSync(sync);
+                for (bits, _) in cache.pending {
+                    gl::DeleteSync(bits as gl::types::GLsync);
                 }
                 for s in &cache.slots {
-                    gl::DeleteSemaphoresEXT(1, &s.sem);
+                    if let Some(f) = DEPTH_EXT.delete_semaphores {
+                        f(1, &s.sem);
+                    }
                     gl::DeleteTextures(1, &s.tex);
-                    gl::DeleteMemoryObjectsEXT(1, &s.mem);
+                    if let Some(f) = DEPTH_EXT.delete_memory_objects {
+                        f(1, &s.mem);
+                    }
                 }
             }
         }
@@ -647,16 +752,31 @@ impl GlData {
     /// same process, producer-held, valid for the segment lifetime.
     fn import_fd_slots(req: &DepthFdRequest, bpp: u64, internal: u32) -> Option<[DepthFdSlot; 3]> {
         let size = req.w as u64 * req.h as u64 * bpp;
+        let Some(create_mem) = DEPTH_EXT.create_memory_objects else {
+            return None;
+        };
+        let Some(import_mem) = DEPTH_EXT.import_memory_fd else {
+            return None;
+        };
+        let Some(tex_storage) = DEPTH_EXT.texture_storage_mem_2d else {
+            return None;
+        };
+        let Some(gen_sem) = DEPTH_EXT.gen_semaphores else {
+            return None;
+        };
+        let Some(import_sem) = DEPTH_EXT.import_semaphore_fd else {
+            return None;
+        };
         let mut slots = [DepthFdSlot::default(); 3];
         for i in 0..3 {
             let (mut mem, mut tex, mut sem) = (0, 0, 0);
             let ok = unsafe {
-                gl::CreateMemoryObjectsEXT(1, &mut mem);
-                gl::ImportMemoryFdEXT(mem, size, gl::HANDLE_TYPE_OPAQUE_FD_EXT, req.mem_fds[i]);
+                create_mem(1, &mut mem);
+                import_mem(mem, size, HANDLE_TYPE_OPAQUE_FD, req.mem_fds[i]);
                 gl::GenTextures(1, &mut tex);
-                gl::TextureStorageMem2DEXT(tex, 1, internal, req.w as i32, req.h as i32, mem, 0);
-                gl::GenSemaphoresEXT(1, &mut sem);
-                gl::ImportSemaphoreFdEXT(sem, gl::HANDLE_TYPE_OPAQUE_FD_EXT, req.sem_fds[i]);
+                tex_storage(tex, 1, internal, req.w as i32, req.h as i32, mem, 0);
+                gen_sem(1, &mut sem);
+                import_sem(sem, HANDLE_TYPE_OPAQUE_FD, req.sem_fds[i]);
                 gl::GetError() == gl::NO_ERROR && mem != 0 && tex != 0 && sem != 0
             };
             if !ok {
@@ -676,13 +796,17 @@ impl GlData {
     unsafe fn delete_fd_slot(s: &DepthFdSlot) {
         unsafe {
             if s.sem != 0 {
-                gl::DeleteSemaphoresEXT(1, &s.sem);
+                if let Some(f) = DEPTH_EXT.delete_semaphores {
+                    f(1, &s.sem);
+                }
             }
             if s.tex != 0 {
                 gl::DeleteTextures(1, &s.tex);
             }
             if s.mem != 0 {
-                gl::DeleteMemoryObjectsEXT(1, &s.mem);
+                if let Some(f) = DEPTH_EXT.delete_memory_objects {
+                    f(1, &s.mem);
+                }
             }
         }
     }
