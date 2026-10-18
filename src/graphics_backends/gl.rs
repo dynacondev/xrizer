@@ -1,13 +1,15 @@
-use super::GraphicsBackend;
+use super::{DepthFdRequest, DepthFdResult, GraphicsBackend};
+use crate::depth_feed;
 use derive_more::Deref;
 use glutin_glx_sys::{
     Success,
     glx::{self, Glx},
 };
 use libc::{dlerror, dlopen, dlsym};
-use log::warn;
+use log::{info, warn};
 use openvr as vr;
 use openxr as xr;
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, LazyLock, Once};
 
@@ -21,6 +23,68 @@ pub struct GlData {
     draw_fbo: u32,
     depth_images: Vec<u32>,
     depth_format: u32,
+    /// GL_EXT_memory_object(_fd) + GL_EXT_semaphore(_fd) all present.
+    fd_import_viable: bool,
+    depth_fd: Option<DepthFdCache>,
+}
+
+#[derive(Copy, Clone, Default)]
+struct DepthFdSlot {
+    mem: u32,
+    tex: u32,
+    sem: u32,
+}
+
+struct DepthFdCache {
+    epoch: u32,
+    seg_len: usize,
+    w: u32,
+    h: u32,
+    vk_format: i32,
+    slots: [DepthFdSlot; 3],
+    /// (epoch, generation) of the last semaphore wait. Survives session restarts
+    /// (same GL context) so a restart can never double-wait one signal.
+    last_waited: Option<(u32, u64)>,
+    /// Copies in flight: (fence, generation). Acked on completion, never before —
+    /// the producer may reuse a slot as soon as it sees the ack.
+    pending: Vec<(gl::types::GLsync, u64)>,
+}
+
+/// Required GL extensions for the FD import path.
+const FD_IMPORT_EXTS: [&str; 4] = [
+    "GL_EXT_memory_object",
+    "GL_EXT_memory_object_fd",
+    "GL_EXT_semaphore",
+    "GL_EXT_semaphore_fd",
+];
+
+/// Query the current context's extension set (GL 3.0+ enumeration with a
+/// pre-3.0 fallback). Call only with a context current.
+fn gl_extension_set() -> HashSet<String> {
+    let mut set = HashSet::new();
+    unsafe {
+        if gl::GetStringi::is_loaded() {
+            let mut n = 0;
+            gl::GetIntegerv(gl::NUM_EXTENSIONS, &mut n);
+            for i in 0..n {
+                let s = gl::GetStringi(gl::EXTENSIONS, i as u32);
+                if !s.is_null() {
+                    set.insert(
+                        CStr::from_ptr(s as *const c_char)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        } else if gl::GetString::is_loaded() {
+            let s = gl::GetString(gl::EXTENSIONS);
+            if !s.is_null() {
+                let all = CStr::from_ptr(s as *const c_char).to_string_lossy();
+                set.extend(all.split_whitespace().map(str::to_owned));
+            }
+        }
+    }
+    set
 }
 
 #[derive(Deref)]
@@ -131,6 +195,17 @@ impl GlData {
             gl::GenFramebuffers(fbos.len() as i32, fbos.as_mut_ptr());
         }
 
+        // FD import viability probe: the mirror of the khr depth probe.
+        // Logged once per process; decides whether MODE_FD can run.
+        let exts = gl_extension_set();
+        let mut fd_viable = true;
+        for e in FD_IMPORT_EXTS {
+            let present = exts.contains(e);
+            info!("depth FD import ext {e}: {present}");
+            fd_viable &= present;
+        }
+        info!("depth FD import viable: {fd_viable}");
+
         Some(GlData {
             session_data: Arc::new(SessionCreateInfo(session_info)),
             images: Default::default(),
@@ -139,6 +214,8 @@ impl GlData {
             draw_fbo: fbos[1],
             depth_images: Default::default(),
             depth_format: 0,
+            fd_import_viable: fd_viable,
+            depth_fd: None,
         })
     }
 }
@@ -309,8 +386,157 @@ impl GraphicsBackend for GlData {
         true
     }
 
-    fn preferred_depth_format() -> Option<<Self::Api as xr::Graphics>::Format> {
-        Some(crate::depth_feed::GL_DEPTH_COMPONENT32F)
+    fn depth_format_for_header(vk_format: i32) -> Option<<Self::Api as xr::Graphics>::Format> {
+        depth_gl_format(vk_format)
+    }
+
+    fn depth_fd_import_viable(&self) -> bool {
+        self.fd_import_viable
+    }
+
+    fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
+        let inert = || DepthFdResult {
+            copied: false,
+            ack_gen: None,
+        };
+        if !self.fd_import_viable {
+            return inert();
+        }
+        // 130 needs 8 bytes/texel (D+S + padding); 126 needs 4.
+        // (Producer-confirmed for 126; 130 assumed symmetric — field check.)
+        let Some(bpp) = depth_texel_bytes(req.vk_format) else {
+            return inert();
+        };
+        let Some(internal) = depth_gl_format(req.vk_format) else {
+            return inert();
+        };
+        if req.generation == 0 || req.eye_w == 0 || req.eye_h == 0 {
+            return inert();
+        }
+        if req.mem_fds.iter().any(|&f| f < 0) || req.sem_fds.iter().any(|&f| f < 0) {
+            return inert();
+        }
+        if self.depth_images.is_empty() || req.depth_image_index >= self.depth_images.len() {
+            return inert();
+        }
+        let dst = self.depth_images[req.depth_image_index];
+        // Reimport on epoch/segment/dims/format change (old GL objects first).
+        let key = (req.setup_epoch, req.seg_len, req.w, req.h, req.vk_format);
+        let cached_key = self
+            .depth_fd
+            .as_ref()
+            .map(|c| (c.epoch, c.seg_len, c.w, c.h, c.vk_format));
+        if cached_key != Some(key) {
+            self.drop_depth_imports();
+            match Self::import_fd_slots(req, bpp, internal) {
+                Some(slots) => {
+                    self.depth_fd = Some(DepthFdCache {
+                        epoch: req.setup_epoch,
+                        seg_len: req.seg_len,
+                        w: req.w,
+                        h: req.h,
+                        vk_format: req.vk_format,
+                        slots,
+                        last_waited: None,
+                        pending: Vec::new(),
+                    });
+                }
+                None => return inert(),
+            }
+        }
+        // Drain completed copies; ack only fully-copied generations so the
+        // producer never reuses a slot whose copy is still in flight.
+        let mut ack = None;
+        if let Some(cache) = self.depth_fd.as_mut() {
+            let mut i = 0;
+            while i < cache.pending.len() {
+                let (sync, g) = cache.pending[i];
+                let status = unsafe { gl::ClientWaitSync(sync, 0, 0) };
+                if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
+                    unsafe { gl::DeleteSync(sync) };
+                    cache.pending.swap_remove(i);
+                    ack = Some(ack.map_or(g, |a: u64| a.max(g)));
+                } else if status == gl::WAIT_FAILED {
+                    unsafe { gl::DeleteSync(sync) };
+                    cache.pending.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        let Some(cache) = self.depth_fd.as_mut() else {
+            return DepthFdResult {
+                copied: false,
+                ack_gen: ack,
+            };
+        };
+        // Wait once per generation (binary semaphores; skip on re-copy).
+        let slot = (req.generation % 3) as usize;
+        if cache.last_waited != Some((req.setup_epoch, req.generation)) {
+            unsafe {
+                gl::WaitSemaphoreEXT(
+                    cache.slots[slot].sem,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+            }
+            cache.last_waited = Some((req.setup_epoch, req.generation));
+        }
+        let ok = unsafe {
+            for eye in 0..2u32 {
+                gl::CopyImageSubData(
+                    cache.slots[slot].tex,
+                    gl::TEXTURE_2D,
+                    0,
+                    (eye * req.eye_w) as i32,
+                    0,
+                    0,
+                    dst,
+                    gl::TEXTURE_2D_ARRAY,
+                    0,
+                    0,
+                    0,
+                    eye as i32,
+                    req.eye_w as i32,
+                    req.eye_h as i32,
+                    1,
+                );
+            }
+            gl::GetError() == gl::NO_ERROR
+        };
+        if !ok {
+            return DepthFdResult {
+                copied: false,
+                ack_gen: ack,
+            };
+        }
+        let sync = unsafe { gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) };
+        if !sync.is_null() {
+            cache.pending.push((sync, req.generation));
+            unsafe { gl::Flush() };
+        }
+        DepthFdResult {
+            copied: true,
+            ack_gen: ack,
+        }
+    }
+
+    fn drop_depth_imports(&mut self) {
+        if let Some(cache) = self.depth_fd.take() {
+            unsafe {
+                for (sync, _) in cache.pending {
+                    gl::DeleteSync(sync);
+                }
+                for s in &cache.slots {
+                    gl::DeleteSemaphoresEXT(1, &s.sem);
+                    gl::DeleteTextures(1, &s.tex);
+                    gl::DeleteMemoryObjectsEXT(1, &s.mem);
+                }
+            }
+        }
     }
 
     fn depth_swapchain_create_info(
@@ -393,6 +619,72 @@ impl GraphicsBackend for GlData {
             gl::BindTexture(gl::TEXTURE_2D_ARRAY, 0);
         }
         true
+    }
+}
+
+/// Texel footprint for a SHM Vulkan depth format: 126 = D32F (4 bytes),
+/// 130 = D32S8 (4 depth + 1 stencil + 3 padding = 8).
+fn depth_texel_bytes(vk_format: i32) -> Option<u64> {
+    match vk_format {
+        depth_feed::FORMAT_D32F => Some(4),
+        depth_feed::FORMAT_D32S8 => Some(8),
+        _ => None,
+    }
+}
+
+/// GL internal format for a SHM Vulkan depth format.
+fn depth_gl_format(vk_format: i32) -> Option<u32> {
+    match vk_format {
+        depth_feed::FORMAT_D32F => Some(depth_feed::GL_DEPTH_COMPONENT32F),
+        depth_feed::FORMAT_D32S8 => Some(depth_feed::GL_DEPTH32F_STENCIL8),
+        _ => None,
+    }
+}
+
+impl GlData {
+    /// Import all 3 ring slots (memory object + texture storage + binary
+    /// semaphore each). The FDs are borrowed, never closed or duplicated:
+    /// same process, producer-held, valid for the segment lifetime.
+    fn import_fd_slots(req: &DepthFdRequest, bpp: u64, internal: u32) -> Option<[DepthFdSlot; 3]> {
+        let size = req.w as u64 * req.h as u64 * bpp;
+        let mut slots = [DepthFdSlot::default(); 3];
+        for i in 0..3 {
+            let (mut mem, mut tex, mut sem) = (0, 0, 0);
+            let ok = unsafe {
+                gl::CreateMemoryObjectsEXT(1, &mut mem);
+                gl::ImportMemoryFdEXT(mem, size, gl::HANDLE_TYPE_OPAQUE_FD_EXT, req.mem_fds[i]);
+                gl::GenTextures(1, &mut tex);
+                gl::TextureStorageMem2DEXT(tex, 1, internal, req.w as i32, req.h as i32, mem, 0);
+                gl::GenSemaphoresEXT(1, &mut sem);
+                gl::ImportSemaphoreFdEXT(sem, gl::HANDLE_TYPE_OPAQUE_FD_EXT, req.sem_fds[i]);
+                gl::GetError() == gl::NO_ERROR && mem != 0 && tex != 0 && sem != 0
+            };
+            if !ok {
+                unsafe {
+                    Self::delete_fd_slot(&DepthFdSlot { mem, tex, sem });
+                    for s in slots.iter().take(i) {
+                        Self::delete_fd_slot(s);
+                    }
+                }
+                return None;
+            }
+            slots[i] = DepthFdSlot { mem, tex, sem };
+        }
+        Some(slots)
+    }
+
+    unsafe fn delete_fd_slot(s: &DepthFdSlot) {
+        unsafe {
+            if s.sem != 0 {
+                gl::DeleteSemaphoresEXT(1, &s.sem);
+            }
+            if s.tex != 0 {
+                gl::DeleteTextures(1, &s.tex);
+            }
+            if s.mem != 0 {
+                gl::DeleteMemoryObjectsEXT(1, &s.mem);
+            }
+        }
     }
 }
 
@@ -490,5 +782,23 @@ impl Library {
             }
         }
         symbol
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{depth_gl_format, depth_texel_bytes};
+    use crate::depth_feed::{
+        FORMAT_D32F, FORMAT_D32S8, GL_DEPTH_COMPONENT32F, GL_DEPTH32F_STENCIL8,
+    };
+
+    #[test]
+    fn depth_format_maps() {
+        assert_eq!(depth_texel_bytes(FORMAT_D32F), Some(4));
+        assert_eq!(depth_texel_bytes(FORMAT_D32S8), Some(8));
+        assert_eq!(depth_texel_bytes(96), None);
+        assert_eq!(depth_gl_format(FORMAT_D32F), Some(GL_DEPTH_COMPONENT32F));
+        assert_eq!(depth_gl_format(FORMAT_D32S8), Some(GL_DEPTH32F_STENCIL8));
+        assert_eq!(depth_gl_format(96), None);
     }
 }

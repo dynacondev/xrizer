@@ -86,11 +86,57 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         false
     }
 
-    /// Preferred depth swapchain format, if any. Checked against the session's
-    /// enumerated formats; depth stays off when absent.
-    fn preferred_depth_format() -> Option<<Self::Api as xr::Graphics>::Format> {
+    /// GL swapchain format for a SHM Vulkan depth format (126 = D32F,
+    /// 130 = D32S8). Checked against the session's enumerated formats;
+    /// depth stays off when absent.
+    fn depth_format_for_header(vk_format: i32) -> Option<<Self::Api as xr::Graphics>::Format> {
+        let _ = vk_format;
         None
     }
+
+    /// Whether this backend can import dma-buf FDs (GL extension probe).
+    fn depth_fd_import_viable(&self) -> bool {
+        false
+    }
+
+    /// Ensure FD imports for (epoch, segment, dims, format); GPU-copy both
+    /// halves of `generation` into `depth_image_index` (waiting first unless this
+    /// exact generation was already waited); drain completed copies and
+    /// report the highest fully-copied generation for the ack store.
+    /// Default: unsupported (keeps other backends compiling untouched).
+    fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
+        let _ = req;
+        DepthFdResult {
+            copied: false,
+            ack_gen: None,
+        }
+    }
+
+    /// Delete FD import GL objects (reimport path / teardown).
+    fn drop_depth_imports(&mut self) {}
+}
+
+/// One FD-mode frame for [`GraphicsBackend::import_and_copy_depth_fd`].
+pub struct DepthFdRequest {
+    pub setup_epoch: u32,
+    pub seg_len: usize,
+    pub w: u32,
+    pub h: u32,
+    pub vk_format: i32,
+    pub mem_fds: [i32; 3],
+    pub sem_fds: [i32; 3],
+    pub generation: u64,
+    pub depth_image_index: usize,
+    pub eye_w: u32,
+    pub eye_h: u32,
+}
+
+/// Outcome of [`GraphicsBackend::import_and_copy_depth_fd`].
+pub struct DepthFdResult {
+    /// Both halves copied (or re-copied) this submit; end_frame may chain.
+    pub copied: bool,
+    /// Highest fully-copied generation: store to `consumed_gen`.
+    pub ack_gen: Option<u64>,
 }
 
 #[derive(macros::Backends, TryInto, From)]
