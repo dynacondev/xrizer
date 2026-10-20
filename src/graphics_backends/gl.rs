@@ -317,6 +317,28 @@ impl GlData {
         }
         info!("depth FD import viable: {fd_viable}");
 
+        // Identify the actual GL driver once: on PRIME laptops the context
+        // can land on a different GPU than the Vulkan device, in which case
+        // cross-API FD imports fail no matter what flags we use.
+        unsafe {
+            let vendor = gl::GetString(gl::VENDOR);
+            let renderer = gl::GetString(gl::RENDERER);
+            let version = gl::GetString(gl::VERSION);
+            let cstr = |p: *const gl::types::GLubyte| {
+                if p.is_null() {
+                    "<unknown>".to_string()
+                } else {
+                    CStr::from_ptr(p as *const c_char).to_string_lossy().into_owned()
+                }
+            };
+            info!(
+                "GL driver: vendor={} renderer={} version={}",
+                cstr(vendor),
+                cstr(renderer),
+                cstr(version),
+            );
+        }
+
         Some(GlData {
             session_data: Arc::new(SessionCreateInfo(session_info)),
             images: Default::default(),
@@ -858,6 +880,15 @@ impl GlData {
         unsafe {
             while gl::GetError() != gl::NO_ERROR {}
         }
+        // Whether to declare imported textures dedicated. The Vulkan mirror
+        // allocations ARE dedicated, but some drivers (notably NVIDIA under
+        // PRIME offload) reject the declaration with INVALID_ENUM while
+        // accepting the import itself — observed live. Default off (skip
+        // the flag); set XRIZER_DEPTH_DEDICATED=1 to re-test declaring it.
+        let dedicated_flag: bool = std::env::var("XRIZER_DEPTH_DEDICATED")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        debug!("depth FD dedicated flag: {dedicated_flag}");
         let mut slots = [DepthFdSlot::default(); 3];
         for i in 0..3 {
             let (mut mem, mut tex, mut sem) = (0, 0, 0);
@@ -873,17 +904,22 @@ impl GlData {
                     } else {
                         gl::GenTextures(1, &mut tex);
                         gl::BindTexture(gl::TEXTURE_2D, tex);
-                        // Dedicated by construction (see above); must be declared
-                        // before storage is specified from the memory object.
-                        let dedicated: gl::types::GLint = 1;
-                        gl::TexParameteriv(
-                            gl::TEXTURE_2D,
-                            DEDICATED_MEMORY_OBJECT_EXT,
-                            &dedicated,
-                        );
-                        if !Self::gl_ok() || tex == 0 {
-                            failed_at = Some("glTexParameteriv(DEDICATED)");
-                        } else {
+                        // Dedicated by construction on the Vulkan side; must
+                        // be declared before storage is specified from the
+                        // memory object — unless the driver rejects the
+                        // declaration (see above).
+                        if dedicated_flag {
+                            let dedicated: gl::types::GLint = 1;
+                            gl::TexParameteriv(
+                                gl::TEXTURE_2D,
+                                DEDICATED_MEMORY_OBJECT_EXT,
+                                &dedicated,
+                            );
+                            if !Self::gl_ok() || tex == 0 {
+                                failed_at = Some("glTexParameteriv(DEDICATED)");
+                            }
+                        }
+                        if failed_at.is_none() {
                             tex_storage(
                                 tex, 1, internal, req.w as i32, req.h as i32, mem, 0,
                             );
