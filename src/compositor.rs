@@ -1401,7 +1401,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 {
                     self.try_upload_depth_fd(session_data, &ctl);
                 }
-                _ => self.try_upload_depth(session_data),
+                other => self.try_upload_depth(session_data, other.as_ref()),
             }
         }
 
@@ -1427,7 +1427,12 @@ impl<G: GraphicsBackend> FrameController<G> {
     /// Called from `submit_impl` where the app GL context is current.
     /// Uploads both halves atomically; arms `depth_ready_this_frame` only
     /// on full success so end_frame chains both eyes or neither.
-    fn try_upload_depth(&mut self, session_data: &SessionData)
+    ///
+    /// `ctl` is the already-read control header (PIXELS mode or no FD
+    /// viability). When it carries the generation already resident in the
+    /// acquired slot, the 51 MB SHM pixel copy is skipped: acquire/release
+    /// still runs to satisfy the runtime and depth still arms.
+    fn try_upload_depth(&mut self, session_data: &SessionData, ctl: Option<&DepthControl>)
     where
         for<'a> &'a openxr_data::GraphicalSession:
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
@@ -1435,6 +1440,49 @@ impl<G: GraphicsBackend> FrameController<G> {
     {
         if self.depth_feed.is_none() {
             self.depth_feed = DepthFeed::open();
+        }
+        // Re-check SHM w/h every read: the producer recreates the segment
+        // mid-run on frame-graph rebuilds; skip frames on mismatch.
+        let (cw, ch) = match self.swapchain_data.as_ref() {
+            Some(c) => (c.info.width, c.info.height),
+            None => return,
+        };
+        if cw == 0 {
+            return;
+        }
+        // Fast path: the control header alone proves the resident data is
+        // current — no SHM pixel-plane copy needed. Dims and format still
+        // gate on the header so a rebuild that changes geometry can never
+        // arm stale depth. On a slot miss the image is released back and
+        // the full path below re-acquires cleanly.
+        if let Some(ctl) = ctl
+            && ctl.mode == depth_feed::MODE_PIXELS
+            && ctl.generation != 0
+            && ctl.eye_layout == depth_feed::EYE_SIDEBYSIDE
+            && ctl.w == cw * 2
+            && ctl.h == ch
+            && self.ensure_depth_swapchain(session_data, ctl.w / 2, ctl.h, ctl.format)
+        {
+            let acquired: Option<usize> = (|| {
+                let data = self.depth_swapchain.as_mut()?;
+                let idx = data.swapchain.acquire_image().ok()? as usize;
+                data.swapchain.wait_image(xr::Duration::INFINITE).ok()?;
+                Some(idx)
+            })();
+            if let Some(idx) = acquired {
+                if self.depth_slot_gen.get(idx) == Some(&ctl.generation) {
+                    if let Some(data) = self.depth_swapchain.as_mut() {
+                        let _ = data.swapchain.release_image();
+                    }
+                    self.depth_near_far =
+                        Some(depth_feed::resolve_near_far(ctl.near_z, ctl.far_z));
+                    self.depth_ready_this_frame = true;
+                    return;
+                }
+                if let Some(data) = self.depth_swapchain.as_mut() {
+                    let _ = data.swapchain.release_image();
+                }
+            }
         }
         let frame: DepthFrame = match (|| {
             let feed = self.depth_feed.as_ref()?;
