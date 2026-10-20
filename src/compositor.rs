@@ -1057,6 +1057,14 @@ struct FrameController<G: GraphicsBackend> {
     /// Resolved (near, far) for the armed depth upload (header wins, env
     /// fallback). Set alongside `depth_ready_this_frame`.
     depth_near_far: Option<(f32, f32)>,
+    /// Per depth-swapchain-image generation already resident (PIXELS path
+    /// only). The SHM feed updates at dump-tick rate while submits run per
+    /// frame: re-uploading the same 51 MB every submit costs ~12 ms on the
+    /// app thread. A slot holding this generation is still valid (we are
+    /// the only writer; the runtime only reads), so skip the TexSubImage
+    /// and just acquire/release to satisfy the runtime. Resized/reset
+    /// whenever the depth swapchain is (re)created.
+    depth_slot_gen: Vec<u64>,
     frame_seq: u64,
     frame_start_mono_ns: u64,
     depth_extension_enabled: bool,
@@ -1165,6 +1173,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_feed: None,
             depth_ready_this_frame: false,
             depth_near_far: None,
+            depth_slot_gen: Vec::new(),
             frame_seq: 0,
             frame_start_mono_ns: 0,
             depth_extension_enabled: false,
@@ -1204,6 +1213,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         // Depth dims derive from color dims; drop it so end_frame recreates
         // at the new size (GL session only; other backends never create it).
         self.depth_swapchain = None;
+        self.depth_slot_gen = Vec::new();
         self.depth_ready_this_frame = false;
         self.depth_near_far = None;
         self.acquire_swapchain_image();
@@ -1465,6 +1475,18 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(i) => i,
             None => return,
         };
+        // Same generation already resident in this slot (we are the only
+        // writer): skip the ~12 ms TexSubImage, just release + arm. The
+        // runtime samples whatever we last released, so every frame still
+        // chains valid depth.
+        if self.depth_slot_gen.get(idx) == Some(&frame.present_no) {
+            if let Some(data) = self.depth_swapchain.as_mut() {
+                let _ = data.swapchain.release_image();
+            }
+            self.depth_near_far = Some(depth_feed::resolve_near_far(frame.near_z, frame.far_z));
+            self.depth_ready_this_frame = true;
+            return;
+        }
         let t0 = Instant::now();
         let ok = self.backend.upload_depth_images(idx, &frame, eye_w, eye_h);
         debug!(
@@ -1480,6 +1502,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             let _ = data.swapchain.release_image();
         }
         if ok {
+            if let Some(g) = self.depth_slot_gen.get_mut(idx) {
+                *g = frame.present_no;
+            }
             self.depth_near_far = Some(depth_feed::resolve_near_far(frame.near_z, frame.far_z));
             self.depth_ready_this_frame = true;
         }
@@ -1629,6 +1654,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                         return false;
                     }
                 };
+                self.depth_slot_gen = vec![0; images.len()];
                 self.backend
                     .store_depth_swapchain_images(images, info.format);
                 debug!(
@@ -1658,6 +1684,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                                 return false;
                             }
                         };
+                        self.depth_slot_gen = vec![0; images.len()];
                         self.backend
                             .store_depth_swapchain_images(images, info.format);
                         info!(
