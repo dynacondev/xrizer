@@ -12,6 +12,7 @@ use openxr as xr;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, LazyLock, Once};
+use std::time::{Duration, Instant};
 
 static GLX: LazyLock<Library> = LazyLock::new(|| Library::new(c"libGLX.so.0"));
 
@@ -26,7 +27,16 @@ pub struct GlData {
     /// GL_EXT_memory_object(_fd) + GL_EXT_semaphore(_fd) all present.
     fd_import_viable: bool,
     depth_fd: Option<DepthFdCache>,
+    /// Last FD key whose import failed + earliest retry time. A failed
+    /// import for an epoch never succeeds later (FDs are fixed per epoch),
+    /// so retrying every submit just burns ~20 ms/frame on blocking GL
+    /// errors. Skip until the key changes or the cooldown elapses.
+    fd_failed_key: Option<(u32, u32, u32, i32)>,
+    fd_next_retry: Option<Instant>,
 }
+
+/// Cooldown between import retries for the same failing key.
+const FD_IMPORT_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 
 #[derive(Copy, Clone, Default)]
 struct DepthFdSlot {
@@ -317,6 +327,8 @@ impl GlData {
             depth_format: 0,
             fd_import_viable: fd_viable,
             depth_fd: None,
+            fd_failed_key: None,
+            fd_next_retry: None,
         })
     }
 }
@@ -532,6 +544,18 @@ impl GraphicsBackend for GlData {
             .as_ref()
             .map(|c| (c.epoch, c.w, c.h, c.vk_format));
         if cached_key != Some(key) {
+            // Failed imports never heal for this key (FDs are fixed per
+            // epoch): skip the ~20 ms of blocking GL errors until the key
+            // changes or the cooldown elapses. Without this a broken FD
+            // path halves the framerate retrying every submit.
+            if self.fd_failed_key == Some(key) {
+                let retry_ok = self
+                    .fd_next_retry
+                    .is_none_or(|t| Instant::now() >= t);
+                if !retry_ok {
+                    return inert();
+                }
+            }
             match self.depth_fd.as_ref() {
                 Some(c) => debug!(
                     "depth FD reimport: epoch {}→{}, dims {}x{}→{}x{}, format {}→{}, seg {}→{}, alloc {}→{}",
@@ -568,8 +592,19 @@ impl GraphicsBackend for GlData {
                         last_waited: None,
                         pending: Vec::new(),
                     });
+                    // Healed (or first success): clear any failure record.
+                    self.fd_failed_key = None;
+                    self.fd_next_retry = None;
                 }
-                None => return inert(),
+                None => {
+                    // Remember the failure so subsequent submits for this key
+                    // skip the import until the cooldown elapses. The warn
+                    // inside import_fd_slots already named the failing step.
+                    self.fd_failed_key = Some(key);
+                    self.fd_next_retry =
+                        Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
+                    return inert();
+                }
             }
         }
         // Drain completed copies; ack only fully-copied generations so the
@@ -781,6 +816,14 @@ fn depth_gl_format(vk_format: i32) -> Option<u32> {
 }
 
 impl GlData {
+    /// Check + drain the GL error flag. Returns true when clean.
+    /// Call sites check Some, so a logged string here is the exact
+    /// attribution for async debug-callback spam like the
+    /// OUT_OF_MEMORY/INVALID_ENUM storm on PRIME laptops.
+    unsafe fn gl_ok() -> bool {
+        unsafe { gl::GetError() == gl::NO_ERROR }
+    }
+
     /// Import all 3 ring slots (memory object + texture storage + binary
     /// semaphore each). The FDs are borrowed, never closed or duplicated:
     /// same process, producer-held, valid for the segment lifetime.
@@ -809,25 +852,75 @@ impl GlData {
         let Some(import_sem) = DEPTH_EXT.import_semaphore_fd else {
             return None;
         };
+        // Drain pre-existing errors so the first failure below attributes
+        // exactly (debug callbacks are async; without this the blame lands
+        // on whatever call happens to poll GetError next).
+        unsafe {
+            while gl::GetError() != gl::NO_ERROR {}
+        }
         let mut slots = [DepthFdSlot::default(); 3];
         for i in 0..3 {
             let (mut mem, mut tex, mut sem) = (0, 0, 0);
-            let ok = unsafe {
+            let mut failed_at: Option<&'static str> = None;
+            unsafe {
                 create_mem(1, &mut mem);
-                import_mem(mem, size, HANDLE_TYPE_OPAQUE_FD, req.mem_fds[i]);
-                gl::GenTextures(1, &mut tex);
-                // Dedicated by construction (see above); must be declared
-                // before storage is specified from the memory object.
-                gl::BindTexture(gl::TEXTURE_2D, tex);
-                let dedicated: gl::types::GLint = 1;
-                gl::TexParameteriv(gl::TEXTURE_2D, DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
-                tex_storage(tex, 1, internal, req.w as i32, req.h as i32, mem, 0);
-                gl::BindTexture(gl::TEXTURE_2D, 0);
-                gen_sem(1, &mut sem);
-                import_sem(sem, HANDLE_TYPE_OPAQUE_FD, req.sem_fds[i]);
-                gl::GetError() == gl::NO_ERROR && mem != 0 && tex != 0 && sem != 0
-            };
-            if !ok {
+                if !Self::gl_ok() || mem == 0 {
+                    failed_at = Some("glCreateMemoryObjectsEXT");
+                } else {
+                    import_mem(mem, size, HANDLE_TYPE_OPAQUE_FD, req.mem_fds[i]);
+                    if !Self::gl_ok() {
+                        failed_at = Some("glImportMemoryFdEXT");
+                    } else {
+                        gl::GenTextures(1, &mut tex);
+                        gl::BindTexture(gl::TEXTURE_2D, tex);
+                        // Dedicated by construction (see above); must be declared
+                        // before storage is specified from the memory object.
+                        let dedicated: gl::types::GLint = 1;
+                        gl::TexParameteriv(
+                            gl::TEXTURE_2D,
+                            DEDICATED_MEMORY_OBJECT_EXT,
+                            &dedicated,
+                        );
+                        if !Self::gl_ok() || tex == 0 {
+                            failed_at = Some("glTexParameteriv(DEDICATED)");
+                        } else {
+                            tex_storage(
+                                tex, 1, internal, req.w as i32, req.h as i32, mem, 0,
+                            );
+                            if !Self::gl_ok() {
+                                failed_at = Some("glTextureStorageMem2DEXT");
+                            } else {
+                                gl::BindTexture(gl::TEXTURE_2D, 0);
+                                gen_sem(1, &mut sem);
+                                if !Self::gl_ok() || sem == 0 {
+                                    failed_at = Some("glGenSemaphoresEXT");
+                                } else {
+                                    import_sem(sem, HANDLE_TYPE_OPAQUE_FD, req.sem_fds[i]);
+                                    if !Self::gl_ok() {
+                                        failed_at = Some("glImportSemaphoreFdEXT");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Final sweep: catches errors the per-call polls missed
+                // (async delivery) while attribution above names the step.
+                if failed_at.is_none() && !Self::gl_ok() {
+                    failed_at = Some("trailing (async)");
+                }
+            }
+            if let Some(step) = failed_at {
+                warn!(
+                    "depth FD import failed at {step} (slot {i}/3, epoch {}, {}x{} fmt {} memfd {} semfd {} size {})",
+                    req.setup_epoch,
+                    req.w,
+                    req.h,
+                    req.vk_format,
+                    req.mem_fds[i],
+                    req.sem_fds[i],
+                    size,
+                );
                 unsafe {
                     Self::delete_fd_slot(&DepthFdSlot { mem, tex, sem });
                     for s in slots.iter().take(i) {
