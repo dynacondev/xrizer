@@ -1065,11 +1065,14 @@ struct FrameController<G: GraphicsBackend> {
 supported_backends_enum!(enum DynFrameController: FrameController);
 
 impl<G: GraphicsBackend> FrameController<G> {
+    /// Creates the color swapchain, or `None` (with a warning) when the
+    /// runtime refuses — e.g. a lost session. Callers keep the previous
+    /// swapchain and degrade to dropped frames instead of aborting.
     fn init_swapchain(
         session_data: &SessionData,
         create_info: &mut xr::SwapchainCreateInfo<G::Api>,
         backend: &mut G,
-    ) -> (xr::Swapchain<G::Api>, <G::Api as xr::Graphics>::Format)
+    ) -> Option<(xr::Swapchain<G::Api>, <G::Api as xr::Graphics>::Format)>
     where
         for<'a> &'a openxr_data::GraphicalSession:
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
@@ -1085,10 +1088,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         let initial_format = create_info.format;
         session_data.check_format::<G>(create_info);
 
-        let swapchain = session_data
-            .create_swapchain(create_info)
-            .unwrap_or_else(|err| {
-                panic!(
+        let swapchain = match session_data.create_swapchain(create_info) {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(
                     "Failed to create swapchain: {err} (info: {:#?})",
                     [
                         ("create_flags", format!("{:?}", create_info.create_flags)),
@@ -1096,12 +1099,18 @@ impl<G: GraphicsBackend> FrameController<G> {
                         ("height", create_info.height.to_string()),
                         ("sample_count", create_info.sample_count.to_string())
                     ]
-                )
-            });
+                );
+                return None;
+            }
+        };
 
-        let images = swapchain
-            .enumerate_images()
-            .expect("Failed to enumerate swapchain images");
+        let images = match swapchain.enumerate_images() {
+            Ok(images) => images,
+            Err(e) => {
+                warn!("Failed to enumerate swapchain images ({e})");
+                return None;
+            }
+        };
 
         backend.store_swapchain_images(images, create_info.format);
         debug!(
@@ -1109,7 +1118,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             create_info.width, create_info.height, create_info.format
         );
 
-        (swapchain, initial_format)
+        Some((swapchain, initial_format))
     }
 
     fn new(
@@ -1125,15 +1134,17 @@ impl<G: GraphicsBackend> FrameController<G> {
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
         let swapchain_data = if let Some(mut info) = create_info {
-            is_valid_swapchain_info(&info).then(|| {
-                let (swapchain, initial_format) =
-                    Self::init_swapchain(session_data, &mut info, &mut backend);
-                SwapchainData {
-                    swapchain,
-                    info,
-                    initial_format,
-                }
-            })
+            is_valid_swapchain_info(&info)
+                .then(|| {
+                    Self::init_swapchain(session_data, &mut info, &mut backend).map(
+                        |(swapchain, initial_format)| SwapchainData {
+                            swapchain,
+                            info,
+                            initial_format,
+                        },
+                    )
+                })
+                .flatten()
         } else {
             None
         };
@@ -1165,17 +1176,25 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_extension_enabled = enabled;
     }
 
+    /// Recreate on dims/format change. Returns whether a usable swapchain
+    /// is now present. On failure the previous swapchain is kept and the
+    /// frame degrades (stale image / failed end) instead of aborting the
+    /// app.
     fn recreate_swapchain(
         &mut self,
         session_data: &SessionData,
         mut create_info: xr::SwapchainCreateInfo<G::Api>,
-    ) where
+    ) -> bool
+    where
         for<'a> &'a openxr_data::GraphicalSession:
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
     {
-        let (swapchain, initial_format) =
-            Self::init_swapchain(session_data, &mut create_info, &mut self.backend);
+        let Some((swapchain, initial_format)) =
+            Self::init_swapchain(session_data, &mut create_info, &mut self.backend)
+        else {
+            return false;
+        };
 
         self.swapchain_data = Some(SwapchainData {
             swapchain,
@@ -1189,34 +1208,55 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_near_far = None;
         self.acquire_swapchain_image();
         self.eyes_submitted = Default::default();
+        true
     }
 
-    fn acquire_swapchain_image(&mut self) {
+    /// Acquire + wait a color swapchain image. Returns false (leaving
+    /// `image_acquired` unset) when the runtime is gone: callers degrade to
+    /// dropped frames instead of aborting the app process.
+    fn acquire_swapchain_image(&mut self) -> bool {
         let swapchain = &mut self
             .swapchain_data
             .as_mut()
             .expect("Can't acquire swapchain image with no swapchain!")
             .swapchain;
 
-        self.image_index = swapchain
-            .acquire_image()
-            .expect("Failed to acquire swapchain image") as usize;
+        let idx = match swapchain.acquire_image() {
+            Ok(i) => i as usize,
+            Err(e) => {
+                warn!("failed to acquire swapchain image ({e}); dropping frame");
+                return false;
+            }
+        };
+        self.image_index = idx;
 
         trace!("waiting image");
         {
             tracy_span!("wait swapchain image");
-            swapchain
-                .wait_image(xr::Duration::INFINITE)
-                .expect("Failed to wait for swapchain image");
+            if let Err(e) = swapchain.wait_image(xr::Duration::INFINITE) {
+                warn!("failed to wait for swapchain image ({e}); dropping frame");
+                return false;
+            }
         }
 
         self.image_acquired = true;
+        true
     }
 
     fn wait_frame(&mut self) -> (xr::Time, i64) {
         let frame_state = {
             tracy_span!("wait frame");
-            self.waiter.wait().unwrap()
+            match self.waiter.wait() {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("xrWaitFrame failed ({e}); pausing rendering");
+                    self.should_render = false;
+                    // Dead session: report a dummy tick; the runtime is
+                    // gone and every downstream OpenXR call will fail
+                    // gracefully from here.
+                    return (xr::Time::from_nanos(0), 11_111_111);
+                }
+            }
         };
         self.should_render = frame_state.should_render && !self.app_suspend_render;
         (
@@ -1228,12 +1268,15 @@ impl<G: GraphicsBackend> FrameController<G> {
     fn begin_frame(&mut self) {
         if self.image_acquired {
             tracy_span!("release old swapchain image");
-            self.swapchain_data
+            if let Err(e) = self
+                .swapchain_data
                 .as_mut()
                 .expect("Image is acquired, yet we have no swapchain?")
                 .swapchain
                 .release_image()
-                .unwrap();
+            {
+                warn!("failed to release old swapchain image ({e})");
+            }
         }
 
         if self.swapchain_data.is_some() {
@@ -1242,7 +1285,11 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         {
             tracy_span!("begin frame");
-            self.stream.begin().expect("Couldn't begin frame");
+            if let Err(e) = self.stream.begin() {
+                warn!("failed to begin frame ({e}); skipping frame start");
+                self.should_render = false;
+                return;
+            }
         }
         self.eyes_submitted = [None; 2];
         self.submitting_null = false;
@@ -1280,19 +1327,27 @@ impl<G: GraphicsBackend> FrameController<G> {
 
             is_valid_swapchain_info(&new_info)
                 .then(|| {
+                    if !self.swapchain_data.as_ref().is_some_and(|data| {
+                        is_usable_swapchain(&data.info, data.initial_format, &new_info)
+                    }) {
+                        info!("recreating swapchain (for {eye:?})");
+                        // Recreate can fail on a lost session: fall back to
+                        // a null submit for this eye rather than indexing
+                        // into a missing/stale swapchain image list.
+                        // Checked before the mix assert so both eyes can
+                        // degrade together.
+                        if !self.recreate_swapchain(session_data, new_info) {
+                            warn!("no usable swapchain (for {eye:?}); null-submitting");
+                            return None;
+                        }
+                    }
+
                     assert!(
                         !self.submitting_null,
                         "App submitted a null texture and a normal texture in the same frame"
                     );
 
-                    if !self.swapchain_data.as_ref().is_some_and(|data| {
-                        is_usable_swapchain(&data.info, data.initial_format, &new_info)
-                    }) {
-                        info!("recreating swapchain (for {eye:?})");
-                        self.recreate_swapchain(session_data, new_info);
-                    }
-
-                    SubmittedEye {
+                    Some(SubmittedEye {
                         extent: self.backend.copy_texture_to_swapchain(
                             eye,
                             texture,
@@ -1302,8 +1357,9 @@ impl<G: GraphicsBackend> FrameController<G> {
                             submit_flags,
                         ),
                         flip_vertically: bounds.vertically_flipped(),
-                    }
+                    })
                 })
+                .flatten()
                 .or_else(|| {
                     trace!("submitting null this frame");
                     self.submitting_null = true;
@@ -1346,7 +1402,10 @@ impl<G: GraphicsBackend> FrameController<G> {
                 && let Some(data) = self.swapchain_data.as_mut()
             {
                 trace!("releasing image");
-                data.swapchain.release_image().unwrap();
+                // A lost session surfaces here; never abort the app for it.
+                if let Err(e) = data.swapchain.release_image() {
+                    warn!("failed to release swapchain image ({e})");
+                }
             }
             self.image_acquired = false;
         }
@@ -1563,9 +1622,13 @@ impl<G: GraphicsBackend> FrameController<G> {
         let usage_full = info.usage_flags;
         match session_data.create_swapchain(&info) {
             Ok(swapchain) => {
-                let images = swapchain
-                    .enumerate_images()
-                    .expect("Failed to enumerate depth swapchain images");
+                let images = match swapchain.enumerate_images() {
+                    Ok(images) => images,
+                    Err(e) => {
+                        warn!("failed to enumerate depth swapchain images ({e})");
+                        return false;
+                    }
+                };
                 self.backend
                     .store_depth_swapchain_images(images, info.format);
                 debug!(
@@ -1586,9 +1649,15 @@ impl<G: GraphicsBackend> FrameController<G> {
                 info.usage_flags = xr::SwapchainUsageFlags::DEPTH_STENCIL_ATTACHMENT;
                 match session_data.create_swapchain(&info) {
                     Ok(swapchain) => {
-                        let images = swapchain
-                            .enumerate_images()
-                            .expect("Failed to enumerate depth swapchain images");
+                        let images = match swapchain.enumerate_images() {
+                            Ok(images) => images,
+                            Err(e) => {
+                                warn!(
+                                    "failed to enumerate depth swapchain images ({e})"
+                                );
+                                return false;
+                            }
+                        };
                         self.backend
                             .store_depth_swapchain_images(images, info.format);
                         info!(
@@ -1880,7 +1949,8 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         self.stream
             .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
-            .unwrap();
+            .inspect_err(|e| warn!("frame end failed ({e}); frame dropped"))
+            .ok();
 
         trace!("frame submitted");
     }
