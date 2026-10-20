@@ -1067,6 +1067,11 @@ struct FrameController<G: GraphicsBackend> {
     depth_slot_gen: Vec<u64>,
     frame_seq: u64,
     frame_start_mono_ns: u64,
+    /// Submit-rate heartbeat state: frames submitted since the last log
+    /// line + window start. Answers "how fast is the app submitting?"
+    /// end to end (server heartbeats cover the receive side). Throttled.
+    submit_log_count: u64,
+    submit_log_start_mono_ns: u64,
     depth_extension_enabled: bool,
     depth_off_logged: bool,
     /// One-shot stall warning: depth enabled but no fresh frame could be
@@ -1180,6 +1185,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_slot_gen: Vec::new(),
             frame_seq: 0,
             frame_start_mono_ns: 0,
+            submit_log_count: 0,
+            submit_log_start_mono_ns: 0,
             depth_extension_enabled: false,
             depth_off_logged: false,
             depth_stall_warned: false,
@@ -1961,6 +1968,25 @@ impl<G: GraphicsBackend> FrameController<G> {
         <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
     {
         self.frame_seq = self.frame_seq.wrapping_add(1);
+
+        // Submit-rate heartbeat (logging only): frames submitted per
+        // second end to end. Throttled; the submit path is untouched.
+        {
+            self.submit_log_count += 1;
+            let now = depth_feed::now_mono_ns();
+            if self.submit_log_start_mono_ns == 0 {
+                self.submit_log_start_mono_ns = now;
+            } else if now - self.submit_log_start_mono_ns > 5_000_000_000 {
+                let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
+                info!(
+                    "submits {:.1}/s ({} frames)",
+                    self.submit_log_count as f64 / dt,
+                    self.submit_log_count
+                );
+                self.submit_log_count = 0;
+                self.submit_log_start_mono_ns = now;
+            }
+        }
 
         // Depth path first; any gate failure falls through to the plain path.
         if self.try_end_frame_with_depth(session_data, system, display_time, overlays) {
