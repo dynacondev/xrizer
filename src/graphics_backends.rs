@@ -129,6 +129,10 @@ pub struct DepthFdRequest {
     pub depth_image_index: usize,
     pub eye_w: u32,
     pub eye_h: u32,
+    /// Driver-reported allocation size from the SHM header (+112). The GL
+    /// import size must cover this; w*h*bpp can undershoot under driver
+    /// padding. 0 = unknown, use w*h*bpp.
+    pub alloc_bytes: u32,
 }
 
 /// Outcome of [`GraphicsBackend::import_and_copy_depth_fd`].

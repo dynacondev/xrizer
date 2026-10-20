@@ -41,6 +41,7 @@ struct DepthFdCache {
     w: u32,
     h: u32,
     vk_format: i32,
+    alloc_bytes: u32,
     slots: [DepthFdSlot; 3],
     /// (epoch, generation) of the last semaphore wait. Survives session restarts
     /// (same GL context) so a restart can never double-wait one signal.
@@ -132,12 +133,15 @@ static DEPTH_EXT: LazyLock<DepthExtFns> = LazyLock::new(|| {
         GLX.get(&name)
     });
     unsafe fn proc<F>(glx: &Glx, name: &'static CStr) -> Option<F> {
-        let p = glx.GetProcAddress(name.as_ptr().cast::<u8>()) as *const c_void;
-        if p.is_null() {
-            None
-        } else {
-            // SAFETY: signatures match the Khronos registry; call sites check Some.
-            Some(std::mem::transmute_copy::<*const c_void, F>(&p))
+        // SAFETY: GetProcAddress with a static name performs no GL work;
+        // transmute matches the Khronos registry, call sites check Some.
+        unsafe {
+            let p = glx.GetProcAddress(name.as_ptr().cast::<u8>()) as *const c_void;
+            if p.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute_copy::<*const c_void, F>(&p))
+            }
         }
     }
     // SAFETY: as above; loading addresses performs no GL work.
@@ -530,7 +534,7 @@ impl GraphicsBackend for GlData {
         if cached_key != Some(key) {
             match self.depth_fd.as_ref() {
                 Some(c) => debug!(
-                    "depth FD reimport: epoch {}→{}, dims {}x{}→{}x{}, format {}→{}, seg {}→{}",
+                    "depth FD reimport: epoch {}→{}, dims {}x{}→{}x{}, format {}→{}, seg {}→{}, alloc {}→{}",
                     c.epoch,
                     req.setup_epoch,
                     c.w,
@@ -541,10 +545,13 @@ impl GraphicsBackend for GlData {
                     req.vk_format,
                     c.seg_len,
                     req.seg_len,
+                    c.alloc_bytes,
+                    req.alloc_bytes,
                 ),
                 None => debug!(
-                    "depth FD import: epoch {}, dims {}x{}, format {}, seg {}",
+                    "depth FD import: epoch {}, dims {}x{}, format {}, seg {}, alloc {}",
                     req.setup_epoch, req.w, req.h, req.vk_format, req.seg_len,
+                    req.alloc_bytes,
                 ),
             }
             self.drop_depth_imports();
@@ -556,6 +563,7 @@ impl GraphicsBackend for GlData {
                         w: req.w,
                         h: req.h,
                         vk_format: req.vk_format,
+                        alloc_bytes: req.alloc_bytes,
                         slots,
                         last_waited: None,
                         pending: Vec::new(),
@@ -777,7 +785,15 @@ impl GlData {
     /// semaphore each). The FDs are borrowed, never closed or duplicated:
     /// same process, producer-held, valid for the segment lifetime.
     fn import_fd_slots(req: &DepthFdRequest, bpp: u64, internal: u32) -> Option<[DepthFdSlot; 3]> {
-        let size = req.w as u64 * req.h as u64 * bpp;
+        // Driver allocation can pad past w*h*bpp (alignment). Import the
+        // full allocation so glImportMemoryFdEXT never sees a truncated
+        // object (OUT_OF_MEMORY on some drivers). alloc_bytes==0 means the
+        // producer predates the header field.
+        let want = req.w as u64 * req.h as u64 * bpp;
+        let size = want.max(req.alloc_bytes as u64);
+        if size == 0 {
+            return None;
+        }
         let Some(create_mem) = DEPTH_EXT.create_memory_objects else {
             return None;
         };

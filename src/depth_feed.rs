@@ -151,6 +151,10 @@ pub struct DepthControl {
     /// Highest fully-copied generation, as last observed.
     pub consumed_gen: u64,
     pub seg_len: usize,
+    /// Driver-reported mirror allocation size (FD mode, +112). Import size
+    /// must cover this; w*h*bpp can be smaller under driver padding.
+    /// 0 = unknown, fall back to w*h*bpp.
+    pub alloc_bytes: u32,
 }
 
 /// Reader handle. Stateless across frames (open/mmap per read) so producer
@@ -389,6 +393,7 @@ impl DepthFeed {
                         far_z: 0.0,
                         consumed_gen: 0,
                         seg_len: map_len,
+                        alloc_bytes: 0,
                     }
                 }
                 SHM_VERSION_V2 => {
@@ -412,6 +417,7 @@ impl DepthFeed {
                         far_z: h.far_z,
                         consumed_gen: h.consumed_gen,
                         seg_len: map_len,
+                        alloc_bytes: unsafe { read_u32(ptr, 112) },
                     }
                 }
                 _ => return None,
@@ -520,7 +526,7 @@ pub fn near_far() -> (f32, f32) {
     let near = std::env::var("XRIZER_DEPTH_NEAR")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0);
+        .unwrap_or(0.1);
     let far = std::env::var("XRIZER_DEPTH_FAR")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1004,7 +1010,7 @@ mod tests {
         assert!((a_near - b_near).abs() < f32::EPSILON && (a_far - b_far).abs() < 1.0);
         del_env_for_tests("XRIZER_DEPTH_NEAR");
         del_env_for_tests("XRIZER_DEPTH_FAR");
-        assert_eq!(resolve_near_far(0.0, 100.0), (1.0, 30000.0));
+        assert_eq!(resolve_near_far(0.0, 100.0), (0.1, 30000.0));
     }
 
     #[test]
@@ -1045,14 +1051,14 @@ mod tests {
         del_env_for_tests("XRIZER_DEPTH_NEAR");
         del_env_for_tests("XRIZER_DEPTH_FAR");
         let (near, far) = near_far();
-        assert!((near - 1.0).abs() < f32::EPSILON && (far - 30000.0).abs() < 1.0);
+        assert!((near - 0.1).abs() < f32::EPSILON && (far - 30000.0).abs() < 1.0);
         set_env_for_tests("XRIZER_DEPTH_NEAR", "0.5");
         set_env_for_tests("XRIZER_DEPTH_FAR", "1000.0");
         let (near, far) = near_far();
         assert!((near - 0.5).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
         set_env_for_tests("XRIZER_DEPTH_NEAR", "bogus");
         let (near, far) = near_far();
-        assert!((near - 1.0).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
+        assert!((near - 0.1).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
 
         restore("XRIZER_DEPTH_SHM", orig_master);
         restore("XP_DEPTH_SHM_NAME", orig_name);

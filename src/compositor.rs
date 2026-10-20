@@ -1486,6 +1486,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_image_index: idx,
             eye_w,
             eye_h,
+            alloc_bytes: ctl.alloc_bytes,
         });
         debug!(
             "depth FD copy {:.2} ms ({}x{}x2, frame {}, generation {})",
@@ -1500,12 +1501,13 @@ impl<G: GraphicsBackend> FrameController<G> {
             let _ = data.swapchain.release_image();
         }
         // Ack only fully-copied generations (fence-drained in the backend).
-        if self
-            .depth_feed
-            .as_ref()
-            .is_some_and(|feed| res.ack_gen.is_some_and(|ack| feed.store_consumed(ack)))
+        // Skip the SHM write when the producer already observed it.
+        if let Some(ack) = res.ack_gen
+            && ack != ctl.consumed_gen
+            && let Some(feed) = self.depth_feed.as_ref()
+            && feed.store_consumed(ack)
         {
-            debug!("depth acked generation {}", res.ack_gen.unwrap_or(0));
+            debug!("depth acked generation {ack} (was {})", ctl.consumed_gen);
         }
         if res.copied {
             self.depth_near_far = Some(depth_feed::resolve_near_far(ctl.near_z, ctl.far_z));
