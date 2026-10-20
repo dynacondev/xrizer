@@ -1069,6 +1069,10 @@ struct FrameController<G: GraphicsBackend> {
     frame_start_mono_ns: u64,
     depth_extension_enabled: bool,
     depth_off_logged: bool,
+    /// One-shot stall warning: depth enabled but no fresh frame could be
+    /// armed (SHM stale/dead, FD import failing, ...). Reset on every
+    /// successful arm so flaps re-log instead of spamming.
+    depth_stall_warned: bool,
 }
 supported_backends_enum!(enum DynFrameController: FrameController);
 
@@ -1178,6 +1182,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             frame_start_mono_ns: 0,
             depth_extension_enabled: false,
             depth_off_logged: false,
+            depth_stall_warned: false,
         }
     }
 
@@ -1477,6 +1482,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.depth_near_far =
                         Some(depth_feed::resolve_near_far(ctl.near_z, ctl.far_z));
                     self.depth_ready_this_frame = true;
+                    self.depth_stall_warned = false;
                     return;
                 }
                 if let Some(data) = self.depth_swapchain.as_mut() {
@@ -1494,7 +1500,16 @@ impl<G: GraphicsBackend> FrameController<G> {
             feed.latest_for(now, depth_feed::max_age_ms())
         })() {
             Some(f) => f,
-            None => return,
+            None => {
+                // Feed enabled but nothing fresh: producer stopped,
+                // SHM dead/stale, or frames arriving older than max age.
+                // Warn once per episode (reset on every successful arm).
+                if self.depth_feed.is_some() && !self.depth_stall_warned {
+                    self.depth_stall_warned = true;
+                    warn!("depth enabled but no fresh frame (SHM stale, dead, or producer stopped?)");
+                }
+                return;
+            }
         };
         // Re-check SHM w/h every read: the producer recreates the segment
         // mid-run on frame-graph rebuilds; skip frames on mismatch.
@@ -1533,6 +1548,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             self.depth_near_far = Some(depth_feed::resolve_near_far(frame.near_z, frame.far_z));
             self.depth_ready_this_frame = true;
+            self.depth_stall_warned = false;
             return;
         }
         let t0 = Instant::now();
@@ -1555,6 +1571,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             self.depth_near_far = Some(depth_feed::resolve_near_far(frame.near_z, frame.far_z));
             self.depth_ready_this_frame = true;
+            self.depth_stall_warned = false;
         }
     }
 
@@ -1644,6 +1661,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         if res.copied {
             self.depth_near_far = Some(depth_feed::resolve_near_far(ctl.near_z, ctl.far_z));
             self.depth_ready_this_frame = true;
+            self.depth_stall_warned = false;
+        } else if !self.depth_stall_warned {
+            self.depth_stall_warned = true;
+            warn!("depth FD copy failed (generation {})", ctl.generation);
         }
     }
 
