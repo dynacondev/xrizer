@@ -523,14 +523,17 @@ pub fn max_age_ms() -> u64 {
 }
 
 pub fn near_far() -> (f32, f32) {
+    // X-Plane VR clip (render_holodeck out-params, rodata DAT_02f4d85c/868):
+    // kept in sync with XD_VR_NEAR/FAR_DEFAULT in the layer. Header wins
+    // when valid; these are the fallback.
     let near = std::env::var("XRIZER_DEPTH_NEAR")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0.1);
+        .unwrap_or(0.01);
     let far = std::env::var("XRIZER_DEPTH_FAR")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(30000.0);
+        .unwrap_or(200.0);
     (near, far)
 }
 
@@ -1010,7 +1013,7 @@ mod tests {
         assert!((a_near - b_near).abs() < f32::EPSILON && (a_far - b_far).abs() < 1.0);
         del_env_for_tests("XRIZER_DEPTH_NEAR");
         del_env_for_tests("XRIZER_DEPTH_FAR");
-        assert_eq!(resolve_near_far(0.0, 100.0), (0.1, 30000.0));
+        assert_eq!(resolve_near_far(0.0, 100.0), (0.01, 200.0));
     }
 
     #[test]
@@ -1051,14 +1054,14 @@ mod tests {
         del_env_for_tests("XRIZER_DEPTH_NEAR");
         del_env_for_tests("XRIZER_DEPTH_FAR");
         let (near, far) = near_far();
-        assert!((near - 0.1).abs() < f32::EPSILON && (far - 30000.0).abs() < 1.0);
+        assert!((near - 0.01).abs() < f32::EPSILON && (far - 200.0).abs() < 1.0);
         set_env_for_tests("XRIZER_DEPTH_NEAR", "0.5");
         set_env_for_tests("XRIZER_DEPTH_FAR", "1000.0");
         let (near, far) = near_far();
         assert!((near - 0.5).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
         set_env_for_tests("XRIZER_DEPTH_NEAR", "bogus");
         let (near, far) = near_far();
-        assert!((near - 0.1).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
+        assert!((near - 0.01).abs() < f32::EPSILON && (far - 1000.0).abs() < f32::EPSILON);
 
         restore("XRIZER_DEPTH_SHM", orig_master);
         restore("XP_DEPTH_SHM_NAME", orig_name);
