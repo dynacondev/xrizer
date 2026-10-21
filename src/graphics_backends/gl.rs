@@ -684,9 +684,15 @@ impl GraphicsBackend for GlData {
                 );
                 gl::GetError() == gl::NO_ERROR
             };
-            if waited_ok {
-                cache.last_waited = Some((req.setup_epoch, req.generation));
+            if !waited_ok {
+                // Unsynchronized copy would risk tearing: skip the copy,
+                // keep the drained ack. Next submit re-waits properly.
+                return DepthFdResult {
+                    copied: false,
+                    ack_gen: ack,
+                };
             }
+            cache.last_waited = Some((req.setup_epoch, req.generation));
         }
         let ok = unsafe {
             for eye in 0..2u32 {

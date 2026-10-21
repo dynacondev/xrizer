@@ -1484,9 +1484,17 @@ impl<G: GraphicsBackend> FrameController<G> {
             let data = self.depth_swapchain.as_mut()?;
             let idx = data.swapchain.acquire_image().ok()? as usize;
             // Bounded: never stall the app thread on a wedged swapchain.
-            data.swapchain
+            // A timed-out wait must release the image — otherwise each
+            // event permanently consumes one swapchain image and depth
+            // latches off instead of skipping a tick.
+            if data
+                .swapchain
                 .wait_image(xr::Duration::from_nanos(5_000_000))
-                .ok()?;
+                .is_err()
+            {
+                let _ = data.swapchain.release_image();
+                return None;
+            }
             Some(idx)
         })() {
             Some(i) => i,
@@ -1507,8 +1515,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             alloc_bytes: ctl.alloc_bytes,
         });
         // Release before end (color path releases before end too).
-        if let Some(data) = self.depth_swapchain.as_mut() {
-            let _ = data.swapchain.release_image();
+        if let Some(data) = self.depth_swapchain.as_mut()
+            && data.swapchain.release_image().is_err()
+        {
+            debug!("depth release_image failed (generation {})", ctl.generation);
         }
         // Ack only fully-copied generations (fence-drained in the backend).
         // Skip the SHM write when the producer already observed it.
@@ -1568,6 +1578,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         {
             return true;
         }
+        // Past this point the old swapchain (if any) is dims-mismatched and
+        // unusable: drop it so `Some` always means usable dims. Backend
+        // import objects are epoch-keyed and re-created on demand.
+        self.depth_swapchain = None;
         if let Some(t) = self.depth_swapchain_next_retry
             && Instant::now() < t
         {
@@ -1685,7 +1699,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             let now = depth_feed::now_mono_ns();
             if self.submit_log_start_mono_ns == 0 {
                 self.submit_log_start_mono_ns = now;
-            } else if now - self.submit_log_start_mono_ns > 5_000_000_000 {
+            } else if now.saturating_sub(self.submit_log_start_mono_ns) > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
                 debug!(
                     "frames {:.1}/s ({} frames, {} with depth, {} plain)",

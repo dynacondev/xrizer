@@ -291,10 +291,11 @@ impl DepthFeed {
                 continue;
             }
             // Trust only the copied snapshot from here on — except the ack:
-            // consumed_gen is written concurrently (by us, and zeroed by
-            // the producer on recreate), so reload it with an acquire-load
-            // pairing our release-store. mmap is page-aligned and
-            // CONSUMED_GEN_OFF is 8-aligned, so this is always aligned.
+            // consumed_gen is written concurrently (by us via release-store;
+            // preserved — never zeroed — by the producer across recreates),
+            // so reload it with an acquire-load pairing our store.
+            // mmap is page-aligned and CONSUMED_GEN_OFF is 8-aligned,
+            // so this is always aligned.
             if h.magic != SHM_MAGIC || h.version != SHM_VERSION_V2 {
                 return None;
             }
@@ -346,6 +347,11 @@ impl DepthFeed {
                 break;
             }
             std::hint::spin_loop();
+        }
+        // Never store into a torn publish: the writer preserves the ack
+        // across recreates, so a missed store is a benign skipped tick.
+        if unsafe { read_seq(map.ptr) } & 1 != 0 {
+            return false;
         }
         debug_assert_eq!(map.len, HEADER_SIZE_V2);
         debug_assert_eq!(
