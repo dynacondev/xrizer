@@ -214,7 +214,14 @@ fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
     let oflag = (if write { libc::O_RDWR } else { libc::O_RDONLY }) | libc::O_CLOEXEC;
     let fd = unsafe { libc::shm_open(name.as_ptr(), oflag, 0o600) };
     if fd < 0 {
-        debug!("depth feed: shm_open failed (absent)");
+        // Per-frame when the plugin is absent: throttle so RUST_LOG=debug
+        // stays readable (one line per 5 s, not ~90/s).
+        static LAST_ABSENT_LOG_NS: AtomicU64 = AtomicU64::new(0);
+        let now = now_mono_ns();
+        if now.saturating_sub(LAST_ABSENT_LOG_NS.load(Ordering::Relaxed)) > 5_000_000_000 {
+            LAST_ABSENT_LOG_NS.store(now, Ordering::Relaxed);
+            debug!("depth feed: shm_open failed (absent)");
+        }
         return None;
     }
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
