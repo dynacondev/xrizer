@@ -1057,6 +1057,15 @@ struct FrameController<G: GraphicsBackend> {
     /// Resolved (near, far) for the armed depth upload (header wins, env
     /// fallback). Set alongside `depth_ready_this_frame`.
     depth_near_far: Option<(f32, f32)>,
+    /// Producer generation armed for this frame (present_no / generation).
+    /// Set alongside `depth_ready_this_frame`; used for per-frame pose/gen
+    /// correlation logging and stale (duplicate-generation) detection.
+    depth_armed_generation: Option<u64>,
+    /// Last armed generation across frames. When the producer stalls the
+    /// same generation is re-armed every submit: that is expected ring reuse
+    /// only if the producer is actually advancing; a stuck value across many
+    /// frames means stale depth (or duplicate presents).
+    prev_armed_generation: u64,
     /// Per depth-swapchain-image generation already resident (PIXELS path
     /// only). The SHM feed updates at dump-tick rate while submits run per
     /// frame: re-uploading the same 51 MB every submit costs ~12 ms on the
@@ -1072,6 +1081,13 @@ struct FrameController<G: GraphicsBackend> {
     /// end to end (server heartbeats cover the receive side). Throttled.
     submit_log_count: u64,
     submit_log_start_mono_ns: u64,
+    /// Depth-arm vs plain accounting for the submit heartbeat window.
+    /// Distinguishes "no depth arriving" from "depth arriving but falling
+    /// back to plain views" and counts src-pose identity fallbacks
+    /// (ViewStateFlags missing VALID bits at end_frame time).
+    depth_armed_frames: u64,
+    depth_plain_frames: u64,
+    src_pose_invalid_fallbacks: u64,
     depth_extension_enabled: bool,
     depth_off_logged: bool,
     /// One-shot stall warning: depth enabled but no fresh frame could be
@@ -1182,11 +1198,16 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_feed: None,
             depth_ready_this_frame: false,
             depth_near_far: None,
+            depth_armed_generation: None,
+            prev_armed_generation: 0,
             depth_slot_gen: Vec::new(),
             frame_seq: 0,
             frame_start_mono_ns: 0,
             submit_log_count: 0,
             submit_log_start_mono_ns: 0,
+            depth_armed_frames: 0,
+            depth_plain_frames: 0,
+            src_pose_invalid_fallbacks: 0,
             depth_extension_enabled: false,
             depth_off_logged: false,
             depth_stall_warned: false,
@@ -1228,6 +1249,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_slot_gen = Vec::new();
         self.depth_ready_this_frame = false;
         self.depth_near_far = None;
+        self.depth_armed_generation = None;
         self.acquire_swapchain_image();
         self.eyes_submitted = Default::default();
         true
@@ -1317,6 +1339,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.submitting_null = false;
         self.depth_ready_this_frame = false;
         self.depth_near_far = None;
+        self.depth_armed_generation = None;
         self.frame_start_mono_ns = depth_feed::now_mono_ns();
         trace!("frame begin");
     }
@@ -1489,6 +1512,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.depth_near_far =
                         Some(depth_feed::resolve_near_far(ctl.near_z, ctl.far_z));
                     self.depth_ready_this_frame = true;
+                    self.depth_armed_generation = Some(ctl.generation);
                     self.depth_stall_warned = false;
                     return;
                 }
@@ -1555,6 +1579,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             self.depth_near_far = Some(depth_feed::resolve_near_far(frame.near_z, frame.far_z));
             self.depth_ready_this_frame = true;
+            self.depth_armed_generation = Some(frame.present_no);
             self.depth_stall_warned = false;
             return;
         }
@@ -1578,6 +1603,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             self.depth_near_far = Some(depth_feed::resolve_near_far(frame.near_z, frame.far_z));
             self.depth_ready_this_frame = true;
+            self.depth_armed_generation = Some(frame.present_no);
             self.depth_stall_warned = false;
         }
     }
@@ -1668,6 +1694,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         if res.copied {
             self.depth_near_far = Some(depth_feed::resolve_near_far(ctl.near_z, ctl.far_z));
             self.depth_ready_this_frame = true;
+            self.depth_armed_generation = Some(ctl.generation);
             self.depth_stall_warned = false;
         } else if !self.depth_stall_warned {
             self.depth_stall_warned = true;
@@ -1902,6 +1929,49 @@ impl<G: GraphicsBackend> FrameController<G> {
             return false;
         }
 
+        // Repro forensics (logging only): per-frame src-pose / flags /
+        // generation correlation so a later "no reprojection" run can
+        // distinguish stale depth (same gen re-armed), identity-fallback
+        // src poses (VALID bits missing at end_frame), and tracking-space
+        // flips. DEBUG: ~1 line/frame at app rate.
+        {
+            let orient_valid = flags.contains(xr::ViewStateFlags::ORIENTATION_VALID);
+            let pos_valid = flags.contains(xr::ViewStateFlags::POSITION_VALID);
+            if !orient_valid || !pos_valid {
+                self.src_pose_invalid_fallbacks += 1;
+            }
+            let armed_gen = self.depth_armed_generation.unwrap_or(0);
+            if armed_gen != 0 && armed_gen == self.prev_armed_generation {
+                debug!(
+                    "depth end_frame frame={} gen={} STALE (same generation re-armed) display_time={} flags=({}o,{}p) origin={:?}",
+                    self.frame_seq,
+                    armed_gen,
+                    display_time.as_nanos(),
+                    orient_valid as u8,
+                    pos_valid as u8,
+                    session_data.current_origin,
+                );
+            } else {
+                debug!(
+                    "depth end_frame frame={} gen={} display_time={} flags=({}o,{}p) origin={:?} eye0 pos=({:.3},{:.3},{:.3}) quat=({:.3},{:.3},{:.3},{:.3}) eye1 pos=({:.3},{:.3},{:.3}) quat=({:.3},{:.3},{:.3},{:.3}) near={:.4} far={:.1}",
+                    self.frame_seq,
+                    armed_gen,
+                    display_time.as_nanos(),
+                    orient_valid as u8,
+                    pos_valid as u8,
+                    session_data.current_origin,
+                    poses[0].position.x, poses[0].position.y, poses[0].position.z,
+                    poses[0].orientation.x, poses[0].orientation.y, poses[0].orientation.z, poses[0].orientation.w,
+                    poses[1].position.x, poses[1].position.y, poses[1].position.z,
+                    poses[1].orientation.x, poses[1].orientation.y, poses[1].orientation.z, poses[1].orientation.w,
+                    near_z, far_z,
+                );
+            }
+            if armed_gen != 0 {
+                self.prev_armed_generation = armed_gen;
+            }
+        }
+
         let depth_infos: Vec<xr::sys::CompositionLayerDepthInfoKHR> = (0..2)
             .map(|i| xr::sys::CompositionLayerDepthInfoKHR {
                 ty: xr::sys::CompositionLayerDepthInfoKHR::TYPE,
@@ -1970,7 +2040,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.frame_seq = self.frame_seq.wrapping_add(1);
 
         // Submit-rate heartbeat (logging only): frames submitted per
-        // second end to end. Throttled; the submit path is untouched.
+        // second end to end, plus depth-arm vs plain split and src-pose
+        // fallback count. Throttled; the submit path is untouched.
         {
             self.submit_log_count += 1;
             let now = depth_feed::now_mono_ns();
@@ -1979,19 +2050,27 @@ impl<G: GraphicsBackend> FrameController<G> {
             } else if now - self.submit_log_start_mono_ns > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
                 info!(
-                    "submits {:.1}/s ({} frames)",
+                    "submits {:.1}/s ({} frames, {} with depth, {} plain, {} src-pose-invalid fallbacks)",
                     self.submit_log_count as f64 / dt,
-                    self.submit_log_count
+                    self.submit_log_count,
+                    self.depth_armed_frames,
+                    self.depth_plain_frames,
+                    self.src_pose_invalid_fallbacks,
                 );
                 self.submit_log_count = 0;
+                self.depth_armed_frames = 0;
+                self.depth_plain_frames = 0;
+                self.src_pose_invalid_fallbacks = 0;
                 self.submit_log_start_mono_ns = now;
             }
         }
 
         // Depth path first; any gate failure falls through to the plain path.
         if self.try_end_frame_with_depth(session_data, system, display_time, overlays) {
+            self.depth_armed_frames += 1;
             return;
         }
+        self.depth_plain_frames += 1;
 
         let mut proj_layer_views = Vec::new();
 
