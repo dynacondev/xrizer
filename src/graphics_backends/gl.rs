@@ -559,9 +559,7 @@ impl GraphicsBackend for GlData {
             // changes or the cooldown elapses. Without this a broken FD
             // path halves the framerate retrying every submit.
             if self.fd_failed_key == Some(key) {
-                let retry_ok = self
-                    .fd_next_retry
-                    .is_none_or(|t| Instant::now() >= t);
+                let retry_ok = self.fd_next_retry.is_none_or(|t| Instant::now() >= t);
                 if !retry_ok {
                     return inert();
                 }
@@ -584,8 +582,7 @@ impl GraphicsBackend for GlData {
                 ),
                 None => debug!(
                     "depth FD import: epoch {}, dims {}x{}, format {}, seg {}, alloc {}",
-                    req.setup_epoch, req.w, req.h, req.vk_format, req.seg_len,
-                    req.alloc_bytes,
+                    req.setup_epoch, req.w, req.h, req.vk_format, req.seg_len, req.alloc_bytes,
                 ),
             }
             self.drop_depth_imports();
@@ -611,8 +608,7 @@ impl GraphicsBackend for GlData {
                     // skip the import until the cooldown elapses. The warn
                     // inside import_fd_slots already named the failing step.
                     self.fd_failed_key = Some(key);
-                    self.fd_next_retry =
-                        Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
+                    self.fd_next_retry = Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
                     return inert();
                 }
             }
@@ -819,9 +815,7 @@ impl GlData {
         // Drain pre-existing errors so the first failure below attributes
         // exactly (debug callbacks are async; without this the blame lands
         // on whatever call happens to poll GetError next).
-        unsafe {
-            while gl::GetError() != gl::NO_ERROR {}
-        }
+        unsafe { while gl::GetError() != gl::NO_ERROR {} }
         let mut slots = [DepthFdSlot::default(); 3];
         for i in 0..3 {
             let (mut mem, mut tex, mut sem) = (0, 0, 0);
@@ -837,9 +831,7 @@ impl GlData {
                     } else {
                         gl::GenTextures(1, &mut tex);
                         gl::BindTexture(gl::TEXTURE_2D, tex);
-                        tex_storage(
-                            tex, 1, internal, req.w as i32, req.h as i32, mem, 0,
-                        );
+                        tex_storage(tex, 1, internal, req.w as i32, req.h as i32, mem, 0);
                         if !Self::gl_ok() || tex == 0 {
                             failed_at = Some("glTextureStorageMem2DEXT");
                         } else {
@@ -888,13 +880,17 @@ impl GlData {
 
     unsafe fn delete_fd_slot(s: &DepthFdSlot) {
         unsafe {
-            if s.sem != 0 && let Some(f) = DEPTH_EXT.delete_semaphores {
+            if s.sem != 0
+                && let Some(f) = DEPTH_EXT.delete_semaphores
+            {
                 f(1, &s.sem);
             }
             if s.tex != 0 {
                 gl::DeleteTextures(1, &s.tex);
             }
-            if s.mem != 0 && let Some(f) = DEPTH_EXT.delete_memory_objects {
+            if s.mem != 0
+                && let Some(f) = DEPTH_EXT.delete_memory_objects
+            {
                 f(1, &s.mem);
             }
         }
@@ -1000,7 +996,7 @@ impl Library {
 
 #[cfg(test)]
 mod tests {
-    use super::{depth_gl_format, depth_texel_bytes, GL_DEPTH_COMPONENT32F};
+    use super::{GL_DEPTH_COMPONENT32F, depth_gl_format, depth_texel_bytes};
     use crate::depth_feed::FORMAT_D32F;
 
     #[test]

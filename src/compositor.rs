@@ -1,7 +1,10 @@
 use crate::{
     AtomicF64,
     clientcore::{Injected, Injector},
-    graphics_backends::{GraphicsBackend, SupportedBackend, supported_backends_enum},
+    depth_feed::{self, DepthControl, DepthFeed},
+    graphics_backends::{
+        DepthFdRequest, GraphicsBackend, SupportedBackend, supported_backends_enum,
+    },
     input::Input,
     openxr_data::{self, FrameStream, OpenXrData, SessionCreateInfo, SessionData},
     overlay::OverlayMan,
@@ -17,7 +20,7 @@ use std::sync::{
     Arc, Mutex, Once,
     atomic::{AtomicU32, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{ffi::c_char, ops::Deref};
 
 #[derive(Default)]
@@ -284,6 +287,16 @@ impl openxr_data::Compositor for Compositor {
                 stream,
             )),
         );
+
+        // Propagate the depth-extension probe to the new controller.
+        let depth_on = self.openxr.enabled_extensions.khr_composition_layer_depth;
+        #[macros::any_graphics(DynFrameController)]
+        fn set_depth<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>, on: bool) {
+            ctrl.set_depth_extension_enabled(on);
+        }
+        if let Some(ctrl) = session_data.comp_data.0.lock().unwrap().as_mut() {
+            ctrl.with_any_graphics_mut::<set_depth>(depth_on);
+        }
 
         let old_state = std::mem::replace(
             &mut *self.frame_state.lock().unwrap(),
@@ -655,6 +668,9 @@ impl vr::IVRCompositor029_Interface for Compositor {
         ) where
             for<'b> &'b crate::overlay::AnySwapchainMap:
                 TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+            for<'a> &'a openxr_data::GraphicalSession:
+                TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+            <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
         {
             ctrl.end_frame(session_data, system, display_time, overlays)
         }
@@ -784,7 +800,7 @@ impl vr::IVRCompositor029_Interface for Compositor {
         where
             for<'d> &'d openxr_data::GraphicalSession:
                 TryInto<&'d openxr_data::Session<G::Api>, Error: std::fmt::Display>,
-            <G::Api as xr::Graphics>::Format: Eq + std::fmt::Debug,
+            <G::Api as xr::Graphics>::Format: Eq + Clone + std::fmt::Debug,
         {
             let real_texture =
                 G::get_texture(texture).ok_or(vr::EVRCompositorError::InvalidTexture)?;
@@ -1025,6 +1041,9 @@ struct SwapchainData<G: xr::Graphics> {
     initial_format: G::Format,
 }
 
+/// Cooldown between depth swapchain creation retries after a failure.
+const DEPTH_SWAPCHAIN_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
+
 struct FrameController<G: GraphicsBackend> {
     stream: xr::FrameStream<G::Api>,
     waiter: xr::FrameWaiter,
@@ -1037,6 +1056,40 @@ struct FrameController<G: GraphicsBackend> {
     eyes_submitted: [Option<SubmittedEye>; 2],
     submitting_null: bool,
     backend: G,
+    depth_swapchain: Option<SwapchainData<G::Api>>,
+    depth_feed: Option<DepthFeed>,
+    depth_ready_this_frame: bool,
+    /// Validated (near, far) for the armed depth upload (header-only, no
+    /// xrizer-side defaults). Set alongside `depth_ready_this_frame`.
+    depth_near_far: Option<(f32, f32)>,
+    /// Header (min, max) mapping range for the armed upload. Sanitized to
+    /// finite values at arm time (Monado rejects garbage with the frame).
+    depth_min_max: Option<(f32, f32)>,
+    /// Producer generation armed for this frame (present_no). Set alongside
+    /// `depth_ready_this_frame`; the end_frame upgrade uses it to detect a
+    /// newer present.
+    depth_armed_generation: Option<u64>,
+    /// Per depth-swapchain-image generation already resident. Resized on
+    /// depth swapchain (re)create.
+    depth_slot_gen: Vec<u64>,
+    frame_seq: u64,
+    frame_start_mono_ns: u64,
+    /// Debug-only submit heartbeat: submits since the last line + window
+    /// start, with the depth-armed vs plain split. Throttled 5 s.
+    submit_log_count: u64,
+    submit_log_start_mono_ns: u64,
+    depth_armed_frames: u64,
+    depth_plain_frames: u64,
+    depth_extension_enabled: bool,
+    depth_off_logged: bool,
+    /// One-shot stall warning: depth enabled but no upload could be armed
+    /// (SHM stale/dead, FD import failing, ...). Reset on every success.
+    depth_stall_warned: bool,
+    /// Earliest retry time after a depth swapchain creation failure.
+    /// Transient runtime errors cost skipped ticks, never stalls or spam.
+    depth_swapchain_next_retry: Option<Instant>,
+    /// Happy path emits exactly one info! total (first successful arm).
+    depth_first_arm_logged: bool,
 }
 supported_backends_enum!(enum DynFrameController: FrameController);
 
@@ -1126,7 +1179,29 @@ impl<G: GraphicsBackend> FrameController<G> {
             eyes_submitted: Default::default(),
             submitting_null: false,
             backend,
+            depth_swapchain: None,
+            depth_feed: None,
+            depth_ready_this_frame: false,
+            depth_near_far: None,
+            depth_min_max: None,
+            depth_armed_generation: None,
+            depth_slot_gen: Vec::new(),
+            frame_seq: 0,
+            frame_start_mono_ns: 0,
+            submit_log_count: 0,
+            submit_log_start_mono_ns: 0,
+            depth_armed_frames: 0,
+            depth_plain_frames: 0,
+            depth_extension_enabled: false,
+            depth_off_logged: false,
+            depth_stall_warned: false,
+            depth_swapchain_next_retry: None,
+            depth_first_arm_logged: false,
         }
+    }
+
+    fn set_depth_extension_enabled(&mut self, enabled: bool) {
+        self.depth_extension_enabled = enabled;
     }
 
     fn recreate_swapchain(
@@ -1146,6 +1221,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             info: create_info,
             initial_format,
         });
+        // Depth dims derive from color dims; drop it so it is recreated
+        // at the new size (GL session only; other backends never create it).
+        self.depth_swapchain = None;
+        self.depth_slot_gen = Vec::new();
+        self.depth_ready_this_frame = false;
+        self.depth_near_far = None;
+        self.depth_min_max = None;
+        self.depth_armed_generation = None;
         self.acquire_swapchain_image();
         self.eyes_submitted = Default::default();
     }
@@ -1205,6 +1288,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
         self.eyes_submitted = [None; 2];
         self.submitting_null = false;
+        self.depth_ready_this_frame = false;
+        self.depth_near_far = None;
+        self.depth_min_max = None;
+        self.depth_armed_generation = None;
+        self.frame_start_mono_ns = depth_feed::now_mono_ns();
         trace!("frame begin");
     }
 
@@ -1221,7 +1309,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         <G::Api as xr::Graphics>::Format: Eq,
         for<'b> &'b openxr_data::GraphicalSession:
             TryInto<&'b openxr_data::Session<G::Api>, Error: std::fmt::Display>,
-        <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
     {
         // No Man's Sky does this.
         if self.eyes_submitted[eye as usize].is_some() {
@@ -1269,6 +1357,30 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Default::default())
         };
 
+        // Depth upload rides the Submit GL context (proven current by the
+        // color copy above). FD mode only: GPU-side copy from the imported
+        // dma-buf ring, no CPU upload. Arms `depth_ready_this_frame` only
+        // on full success so end_frame chains both eyes or neither.
+        if self.should_render
+            && !self.submitting_null
+            && !self.depth_ready_this_frame
+            && G::supports_depth()
+            && self.depth_extension_enabled
+            && depth_feed::depth_master_enabled()
+        {
+            if self.depth_feed.is_none() {
+                self.depth_feed = DepthFeed::open();
+            }
+            // Backend viability first (no GL work without imports); the
+            // upload itself re-validates mode, dims, FDs and staleness.
+            if self.backend.depth_fd_import_viable()
+                && let Some(ctl) = self.depth_feed.as_ref().and_then(|f| f.read_control())
+                && ctl.mode == depth_feed::MODE_FD
+            {
+                self.try_upload_depth_fd(session_data, &ctl, false);
+            }
+        }
+
         trace!("submitted {eye:?}");
         if self.eyes_submitted.iter().all(|eye| eye.is_some()) {
             // If the session was restarted while no frame was begun, nothing has been acquired from the new swapchain yet, so there is nothing to release
@@ -1284,6 +1396,259 @@ impl<G: GraphicsBackend> FrameController<G> {
         Ok(())
     }
 
+    /// FD-mode upload: GPU-side copy from the imported dma-buf ring.
+    /// Runs in `submit_impl` (GL context current). No CPU upload, no
+    /// timestamp matching — the per-slot binary semaphore is the timeline.
+    /// The ack (`consumed_gen`) is stored only for fully-copied generations
+    /// (fence-drained), so the producer never reuses an in-flight slot.
+    /// Anything unexpected degrades to plain views for this frame.
+    fn try_upload_depth_fd(&mut self, session_data: &SessionData, ctl: &DepthControl, quiet: bool)
+    where
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
+    {
+        if ctl.generation == 0 {
+            return;
+        }
+        if !ctl.is_viable() {
+            debug!(
+                "depth not viable (mode {} fmt {} {}x{} epoch {} gen {}); plain views",
+                ctl.mode, ctl.format, ctl.w, ctl.h, ctl.setup_epoch, ctl.generation,
+            );
+            return;
+        }
+        // Staleness against the header timestamp (same clock, same machine).
+        let now = if self.frame_start_mono_ns != 0 {
+            self.frame_start_mono_ns
+        } else {
+            depth_feed::now_mono_ns()
+        };
+        if ctl.is_stale(now, depth_feed::max_age_ms()) {
+            if !quiet && !self.depth_stall_warned {
+                self.depth_stall_warned = true;
+                warn!("depth enabled but no fresh frame (SHM stale, dead, or producer stopped?)");
+            }
+            return;
+        }
+        // Header-only clip: invalid emits an error and falls back to plain.
+        let Some((near_z, far_z)) = depth_feed::validate_near_far(ctl.near_z, ctl.far_z) else {
+            return;
+        };
+        // Dims are authoritative per read: never stretch, skip the frame.
+        let (cw, ch) = match self.swapchain_data.as_ref() {
+            Some(c) => (c.info.width, c.info.height),
+            None => return,
+        };
+        if cw == 0 || ctl.w != cw * 2 || ctl.h != ch {
+            debug!(
+                "depth dims {}x{} vs color {cw}x{ch} — plain views this frame",
+                ctl.w, ctl.h,
+            );
+            return;
+        }
+        let eye_w = ctl.w / 2;
+        let eye_h = ctl.h;
+        if !self.ensure_depth_swapchain(session_data, eye_w, eye_h, ctl.format) {
+            if !quiet && !self.depth_stall_warned {
+                self.depth_stall_warned = true;
+                warn!(
+                    "depth swapchain unavailable (generation {})",
+                    ctl.generation
+                );
+            }
+            return;
+        }
+        let idx: usize = match (|| {
+            let data = self.depth_swapchain.as_mut()?;
+            let idx = data.swapchain.acquire_image().ok()? as usize;
+            data.swapchain.wait_image(xr::Duration::INFINITE).ok()?;
+            Some(idx)
+        })() {
+            Some(i) => i,
+            None => return,
+        };
+        let res = self.backend.import_and_copy_depth_fd(&DepthFdRequest {
+            setup_epoch: ctl.setup_epoch,
+            seg_len: ctl.seg_len,
+            w: ctl.w,
+            h: ctl.h,
+            vk_format: ctl.format,
+            mem_fds: ctl.mem_fds,
+            sem_fds: ctl.sem_fds,
+            generation: ctl.generation,
+            depth_image_index: idx,
+            eye_w,
+            eye_h,
+            alloc_bytes: ctl.alloc_bytes,
+        });
+        // Release before end (color path releases before end too).
+        if let Some(data) = self.depth_swapchain.as_mut() {
+            let _ = data.swapchain.release_image();
+        }
+        // Ack only fully-copied generations (fence-drained in the backend).
+        // Skip the SHM write when the producer already observed it.
+        if let Some(ack) = res.ack_gen
+            && ack != ctl.consumed_gen
+            && let Some(feed) = self.depth_feed.as_ref()
+            && feed.store_consumed(ack)
+        {
+            debug!("depth acked generation {ack} (was {})", ctl.consumed_gen);
+        }
+        if res.copied {
+            // Header mapping range; sanitize against frame rejection
+            // (Monado drops frames on non-finite min/max).
+            let (min_depth, max_depth) = if ctl.min_depth.is_finite() && ctl.max_depth.is_finite() {
+                (ctl.min_depth, ctl.max_depth)
+            } else {
+                debug!("depth min/max non-finite; using 0.0/1.0");
+                (0.0, 1.0)
+            };
+            self.depth_near_far = Some((near_z, far_z));
+            self.depth_min_max = Some((min_depth, max_depth));
+            self.depth_ready_this_frame = true;
+            self.depth_armed_generation = Some(ctl.generation);
+            self.depth_stall_warned = false;
+            if !self.depth_first_arm_logged {
+                self.depth_first_arm_logged = true;
+                info!(
+                    "depth armed: {eye_w}x{eye_h}x2 fmt {} near {near_z} far {far_z}",
+                    ctl.format,
+                );
+            }
+        } else if !quiet && !self.depth_stall_warned {
+            // Quiet (end_frame upgrade) failures stay silent: the
+            // submit-time arming remains valid, and a missing GL context
+            // there must not spam once per frame.
+            self.depth_stall_warned = true;
+            warn!("depth FD copy failed (generation {})", ctl.generation);
+        }
+    }
+
+    /// Ensure a per-eye depth swapchain for the mirror dims. Recreates on
+    /// dims/format change. Creation failures back off 2 s and degrade to
+    /// plain views — never stalls, never per-submit spam.
+    fn ensure_depth_swapchain(
+        &mut self,
+        session_data: &SessionData,
+        eye_w: u32,
+        eye_h: u32,
+        vk_format: i32,
+    ) -> bool
+    where
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
+    {
+        let Some(want_fmt) = G::depth_format_for_header(vk_format) else {
+            return false;
+        };
+        if let Some(d) = self.depth_swapchain.as_ref()
+            && d.info.width == eye_w
+            && d.info.height == eye_h
+            && d.initial_format == want_fmt
+        {
+            return true;
+        }
+        if let Some(t) = self.depth_swapchain_next_retry
+            && Instant::now() < t
+        {
+            return false;
+        }
+        let formats = match session_data.swapchain_formats::<G>() {
+            Some(f) => f,
+            None => return false,
+        };
+        if !formats.contains(&want_fmt) {
+            if !self.depth_off_logged {
+                self.depth_off_logged = true;
+                info!("depth off: preferred depth format not advertised; color-only");
+            }
+            return false;
+        }
+        let color_info = match self.swapchain_data.as_ref() {
+            Some(c) => &c.info,
+            None => return false,
+        };
+        let mut info = match self
+            .backend
+            .depth_swapchain_create_info(color_info, want_fmt)
+        {
+            Some(i) => i,
+            None => return false,
+        };
+        // Enforce per-eye dims derived from the color swapchain.
+        info.width = eye_w;
+        info.height = eye_h;
+        let usage_full = info.usage_flags;
+        match session_data.create_swapchain(&info) {
+            Ok(swapchain) => {
+                let images = match swapchain.enumerate_images() {
+                    Ok(images) => images,
+                    Err(e) => {
+                        warn!("failed to enumerate depth swapchain images ({e})");
+                        self.depth_swapchain_next_retry =
+                            Some(Instant::now() + DEPTH_SWAPCHAIN_RETRY_COOLDOWN);
+                        return false;
+                    }
+                };
+                self.depth_slot_gen = vec![0; images.len()];
+                self.backend
+                    .store_depth_swapchain_images(images, info.format);
+                debug!(
+                    "Created depth swapchain: {}x{}x2, format = {:?}, usage = {:?}",
+                    info.width, info.height, info.format, usage_full,
+                );
+                self.depth_swapchain = Some(SwapchainData {
+                    swapchain,
+                    info,
+                    initial_format: want_fmt,
+                });
+                self.depth_swapchain_next_retry = None;
+                true
+            }
+            Err(e) => {
+                debug!(
+                    "depth create with {usage_full:?} failed ({e}); retrying DEPTH_STENCIL only"
+                );
+                info.usage_flags = xr::SwapchainUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+                match session_data.create_swapchain(&info) {
+                    Ok(swapchain) => {
+                        let images = match swapchain.enumerate_images() {
+                            Ok(images) => images,
+                            Err(e) => {
+                                warn!("failed to enumerate depth swapchain images ({e})");
+                                self.depth_swapchain_next_retry =
+                                    Some(Instant::now() + DEPTH_SWAPCHAIN_RETRY_COOLDOWN);
+                                return false;
+                            }
+                        };
+                        self.depth_slot_gen = vec![0; images.len()];
+                        self.backend
+                            .store_depth_swapchain_images(images, info.format);
+                        info!(
+                            "Created depth swapchain (fallback usage): {}x{}x2, format = {:?}",
+                            info.width, info.height, info.format,
+                        );
+                        self.depth_swapchain = Some(SwapchainData {
+                            swapchain,
+                            info,
+                            initial_format: want_fmt,
+                        });
+                        self.depth_swapchain_next_retry = None;
+                        true
+                    }
+                    Err(e2) => {
+                        warn!("depth swapchain creation failed ({e2}); color-only");
+                        self.depth_swapchain_next_retry =
+                            Some(Instant::now() + DEPTH_SWAPCHAIN_RETRY_COOLDOWN);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
     fn end_frame(
         &mut self,
         session_data: &SessionData,
@@ -1293,7 +1658,42 @@ impl<G: GraphicsBackend> FrameController<G> {
     ) where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
     {
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+
+        // Debug-only submit heartbeat: submits/s plus the depth-armed vs
+        // plain split. Throttled 5 s; the submit path is untouched.
+        {
+            self.submit_log_count += 1;
+            let now = depth_feed::now_mono_ns();
+            if self.submit_log_start_mono_ns == 0 {
+                self.submit_log_start_mono_ns = now;
+            } else if now - self.submit_log_start_mono_ns > 5_000_000_000 {
+                let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
+                debug!(
+                    "submits {:.1}/s ({} frames, {} with depth, {} plain)",
+                    self.submit_log_count as f64 / dt,
+                    self.submit_log_count,
+                    self.depth_armed_frames,
+                    self.depth_plain_frames,
+                );
+                self.submit_log_count = 0;
+                self.depth_armed_frames = 0;
+                self.depth_plain_frames = 0;
+                self.submit_log_start_mono_ns = now;
+            }
+        }
+
+        // Depth path first; any gate failure falls through to the plain path.
+        if self.try_end_frame_with_depth(session_data, system, display_time, overlays) {
+            self.depth_armed_frames += 1;
+            return;
+        }
+        self.depth_plain_frames += 1;
+
         let mut proj_layer_views = Vec::new();
 
         if self.should_render
@@ -1375,6 +1775,207 @@ impl<G: GraphicsBackend> FrameController<G> {
             .unwrap();
 
         trace!("frame submitted");
+    }
+
+    /// Depth path for `end_frame`. Returns true when the frame was submitted
+    /// with chained `CompositionLayerDepthInfoKHR` views. Returns false on any
+    /// gate failure (extension off, master off, no ready upload, bad clip) —
+    /// caller then uses the plain path. Uploads happen in Submit (GL context
+    /// current); both halves were uploaded atomically there, so this chains
+    /// both eyes or neither and performs no GL work.
+    fn try_end_frame_with_depth(
+        &mut self,
+        session_data: &SessionData,
+        system: &System,
+        display_time: xr::Time,
+        overlays: Option<&OverlayMan>,
+    ) -> bool
+    where
+        for<'b> &'b crate::overlay::AnySwapchainMap:
+            TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
+    {
+        if !(self.should_render
+            && !self.submitting_null
+            && self.eyes_submitted.iter().all(|eye| eye.is_some()))
+        {
+            return false;
+        }
+        if !self.depth_extension_enabled || !G::supports_depth() {
+            return false;
+        }
+        if !depth_feed::depth_master_enabled() {
+            return false;
+        }
+        // Post-present upgrade: the Submit-time upload ran before X-Plane's
+        // present for this frame, so it armed the previous present's depth
+        // (systematic 1-frame lag). By end_frame the present has completed;
+        // re-read the control header and upgrade to the newest generation
+        // when the GL context allows. Quiet on failure: the submit-time
+        // arming stays valid.
+        if self.backend.depth_fd_import_viable() {
+            if self.depth_feed.is_none() {
+                self.depth_feed = DepthFeed::open();
+            }
+            let upgrade: Option<DepthControl> = self
+                .depth_feed
+                .as_ref()
+                .and_then(|f| f.read_control())
+                .filter(|ctl| {
+                    ctl.mode == depth_feed::MODE_FD
+                        && ctl.generation != 0
+                        && Some(ctl.generation) != self.depth_armed_generation
+                });
+            if let Some(ctl) = upgrade {
+                self.try_upload_depth_fd(session_data, &ctl, true);
+            }
+        }
+        // Armed by try_upload_depth_fd during Submit (or upgraded above).
+        // Both halves were handled atomically there: both eyes or neither.
+        if !self.depth_ready_this_frame {
+            return false;
+        }
+        let Some((near_z, far_z)) = self.depth_near_far else {
+            return false;
+        };
+        if near_z == far_z {
+            warn!("depth near == far ({near_z}); plain views this frame");
+            return false;
+        }
+        // Mapping range from the header (sanitized at arm time).
+        let (min_depth, max_depth) = self.depth_min_max.unwrap_or((0.0, 1.0));
+        let (eye_w, eye_h) = match self.depth_swapchain.as_ref() {
+            Some(d) => (d.info.width, d.info.height),
+            None => return false,
+        };
+        if eye_w == 0 || eye_h == 0 {
+            return false;
+        }
+
+        // Build chained views: safe wrappers from raw sys structs whose
+        // `next` points at per-eye DepthInfo. All referents (swapchains,
+        // depth_infos, views) outlive the synchronous end() call.
+        let color_data = match self.swapchain_data.as_ref() {
+            Some(c) => c,
+            None => return false,
+        };
+        let depth_data = match self.depth_swapchain.as_ref() {
+            Some(d) => d,
+            None => return false,
+        };
+        let crate::system::ViewData { flags, views } =
+            system.get_views(session_data.current_origin_as_reference_space());
+        let eyes = self.eyes_submitted;
+
+        let mut color_subs = Vec::with_capacity(2);
+        let mut depth_subs = Vec::with_capacity(2);
+        let mut poses = Vec::with_capacity(2);
+        let mut fovs = Vec::with_capacity(2);
+        for (eye_index, view) in views.into_iter().enumerate() {
+            let pose = xr::Posef {
+                orientation: if flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
+                    view.pose.orientation
+                } else {
+                    xr::Quaternionf::IDENTITY
+                },
+                position: if flags.contains(xr::ViewStateFlags::POSITION_VALID) {
+                    view.pose.position
+                } else {
+                    xr::Vector3f::default()
+                },
+            };
+            let SubmittedEye {
+                extent,
+                flip_vertically,
+            } = eyes[eye_index]
+                .unwrap_or_else(|| panic!("Eye {eye_index} has not been submitted!"));
+            let mut fov = view.fov;
+            if flip_vertically {
+                std::mem::swap(&mut fov.angle_up, &mut fov.angle_down);
+            }
+            poses.push(pose);
+            fovs.push(fov);
+            color_subs.push(
+                xr::SwapchainSubImage::new()
+                    .swapchain(&color_data.swapchain)
+                    .image_array_index(eye_index as u32)
+                    .image_rect(xr::Rect2Di {
+                        extent,
+                        offset: xr::Offset2Di::default(),
+                    }),
+            );
+            depth_subs.push(
+                xr::SwapchainSubImage::new()
+                    .swapchain(&depth_data.swapchain)
+                    .image_array_index(eye_index as u32)
+                    .image_rect(xr::Rect2Di {
+                        extent: xr::Extent2Di {
+                            width: eye_w as i32,
+                            height: eye_h as i32,
+                        },
+                        offset: xr::Offset2Di::default(),
+                    }),
+            );
+        }
+        if color_subs.len() != 2 || depth_subs.len() != 2 {
+            return false;
+        }
+
+        let depth_infos: Vec<xr::sys::CompositionLayerDepthInfoKHR> = (0..2)
+            .map(|i| xr::sys::CompositionLayerDepthInfoKHR {
+                ty: xr::sys::CompositionLayerDepthInfoKHR::TYPE,
+                next: std::ptr::null(),
+                sub_image: *depth_subs[i].as_raw(),
+                min_depth,
+                max_depth,
+                near_z,
+                far_z,
+            })
+            .collect();
+        // Monado rejects near == far and out-of-range min/max; near/far was
+        // validated at arm time, min/max sanitized to finite values.
+        let sys_views: Vec<xr::sys::CompositionLayerProjectionView> = (0..2)
+            .map(|i| xr::sys::CompositionLayerProjectionView {
+                ty: xr::sys::CompositionLayerProjectionView::TYPE,
+                next: &depth_infos[i] as *const _ as *const std::ffi::c_void,
+                pose: poses[i],
+                fov: fovs[i],
+                sub_image: *color_subs[i].as_raw(),
+            })
+            .collect();
+        // SAFETY: from_raw only wraps the structs; lifetimes are preserved
+        // because swapchains, views, and depth_infos all outlive end().
+        let proj_views: Vec<xr::CompositionLayerProjectionView<G::Api>> = sys_views
+            .into_iter()
+            .map(|s| unsafe { xr::CompositionLayerProjectionView::from_raw(s) })
+            .collect();
+
+        trace!("projection layer present (with depth)");
+        let proj_layer = xr::CompositionLayerProjection::new()
+            .space(session_data.tracking_space())
+            .views(&proj_views);
+        let mut layers: Vec<&xr::CompositionLayerBase<_>> = Vec::new();
+        layers.push(&proj_layer);
+        let overlay_layers;
+        if let Some(overlay_man) = overlays {
+            overlay_layers = overlay_man.get_layers(session_data, self.app_fade_grid);
+            layers.extend(overlay_layers.iter().map(Deref::deref));
+        }
+        match self
+            .stream
+            .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
+        {
+            Ok(()) => {
+                trace!("frame submitted (with depth)");
+                true
+            }
+            Err(e) => {
+                warn!("depth frame end failed ({e}); retrying plain views");
+                false
+            }
+        }
     }
 }
 
@@ -2012,5 +2613,148 @@ mod tests {
         assert_eq!(overlays.ShowOverlay(overlay), vr::EVROverlayError::None);
         f.comp.PostPresentHandoff();
         f.check_frame_state(fakexr::FrameState::Ended);
+    }
+
+    #[test]
+    fn depth_fd_mode_inert_without_import_viable() {
+        // v2 FD segment present at the fixed path + master on, but the Fake
+        // backend carries no depth support: frames go through plain views,
+        // no depth state armed.
+        let _lock = crate::depth_feed::env_guard();
+        let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
+        unsafe {
+            let cname = std::ffi::CString::new(seg_name).unwrap();
+            libc::shm_unlink(cname.as_ptr());
+            let len = 128usize;
+            let fd = libc::shm_open(
+                cname.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+                0o600,
+            );
+            assert!(fd >= 0);
+            assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            libc::close(fd);
+            let hdr = crate::depth_feed::XdShmHeaderV2 {
+                magic: 0x5850_4450,
+                version: 2,
+                seq: 1,
+                w: 20,
+                h: 10,
+                format: 126,
+                eye_layout: 1,
+                present_no: 1,
+                time_mono_ns: crate::depth_feed::now_mono_ns(),
+                min_depth: 0.0,
+                max_depth: 1.0,
+                _pad56: [0, 0],
+                mode: 1,
+                setup_epoch: 3,
+                consumed_gen: 0,
+                mem_fds: [-1, -1, -1],
+                sem_fds: [-1, -1, -1],
+                near_z: 0.01,
+                far_z: 200.0,
+                alloc_bytes: 800,
+                reserved: [0, 0, 0],
+            };
+            (ptr as *mut crate::depth_feed::XdShmHeaderV2).write_unaligned(hdr);
+            (ptr as *mut u32).add(2).write_volatile(2);
+            libc::munmap(ptr, len);
+        }
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = true;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
+
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert!(!ctrl.depth_ready_this_frame);
+            assert!(ctrl.depth_near_far.is_none());
+            assert!(ctrl.depth_min_max.is_none());
+            assert!(ctrl.depth_armed_generation.is_none());
+        }
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+        unsafe {
+            let cname = std::ffi::CString::new(seg_name).unwrap();
+            libc::shm_unlink(cname.as_ptr());
+        }
+    }
+
+    #[test]
+    fn depth_inert_with_unsupported_backend() {
+        // Master switch on, but the Fake backend has no depth support:
+        // frames must go through plain views with no depth state armed.
+        let _lock = crate::depth_feed::env_guard();
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+        // Defensive: the fixed path must be absent for this test.
+        unsafe {
+            let cname = std::ffi::CString::new(crate::depth_feed::DEFAULT_SHM_NAME).unwrap();
+            libc::shm_unlink(cname.as_ptr());
+        }
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        // Force the render path: fakexr never reports should_render.
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = true;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
+
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert!(ctrl.depth_swapchain.is_none());
+            assert!(ctrl.depth_feed.is_none());
+            assert!(!ctrl.depth_ready_this_frame);
+        }
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
     }
 }

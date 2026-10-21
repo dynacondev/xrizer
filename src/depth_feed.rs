@@ -59,26 +59,26 @@ pub const DEFAULT_MAX_AGE_MS: u64 = 100;
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct XdShmHeaderV2 {
-    pub magic: u32,        // +0
-    pub version: u32,      // +4
-    pub seq: u32,          // +8
-    pub w: u32,            // +12
-    pub h: u32,            // +16
-    pub format: i32,       // +20
-    pub eye_layout: u32,   // +24
-    pub present_no: u64,   // +32
-    pub time_mono_ns: u64, // +40
-    pub min_depth: f32,    // +48
-    pub max_depth: f32,    // +52
-    pub _pad56: [u32; 2],  // +56,+60
-    pub mode: u32,         // +64
-    pub setup_epoch: u32,  // +68
-    pub consumed_gen: u64, // +72 xrizer -> shim
-    pub mem_fds: [i32; 3], // +80
-    pub sem_fds: [i32; 3], // +92
-    pub near_z: f32,       // +104
-    pub far_z: f32,        // +108
-    pub alloc_bytes: u32,  // +112
+    pub magic: u32,         // +0
+    pub version: u32,       // +4
+    pub seq: u32,           // +8
+    pub w: u32,             // +12
+    pub h: u32,             // +16
+    pub format: i32,        // +20
+    pub eye_layout: u32,    // +24
+    pub present_no: u64,    // +32
+    pub time_mono_ns: u64,  // +40
+    pub min_depth: f32,     // +48
+    pub max_depth: f32,     // +52
+    pub _pad56: [u32; 2],   // +56,+60
+    pub mode: u32,          // +64
+    pub setup_epoch: u32,   // +68
+    pub consumed_gen: u64,  // +72 xrizer -> shim
+    pub mem_fds: [i32; 3],  // +80
+    pub sem_fds: [i32; 3],  // +92
+    pub near_z: f32,        // +104
+    pub far_z: f32,         // +108
+    pub alloc_bytes: u32,   // +112
     pub reserved: [u32; 3], // +116,+120,+124
 }
 
@@ -762,8 +762,8 @@ mod tests {
             .expect("readable");
         assert!(!ctl.is_viable(), "epoch/gen 0 must not arm");
         // Bad dims / format / layout.
-    type HeaderTweak = (&'static str, fn(&mut XdShmHeaderV2));
-    let tweaks: [HeaderTweak; 6] = [
+        type HeaderTweak = (&'static str, fn(&mut XdShmHeaderV2));
+        let tweaks: [HeaderTweak; 6] = [
             ("oddw", |h: &mut XdShmHeaderV2| h.w = 7),
             ("zerow", |h: &mut XdShmHeaderV2| h.w = 0),
             ("huge", |h: &mut XdShmHeaderV2| h.w = 16385),
