@@ -662,6 +662,9 @@ impl GraphicsBackend for GlData {
             };
         };
         // Wait once per generation (binary semaphores; skip on re-copy).
+        // Recorded only on a clean wait: a failed wait (e.g. no current
+        // GL context on the upgrade path) must not mark the generation
+        // consumed, or the next copy would skip its wait and risk tearing.
         let slot = (req.generation % 3) as usize;
         if cache.last_waited != Some((req.setup_epoch, req.generation)) {
             let Some(wait) = DEPTH_EXT.wait_semaphore else {
@@ -670,7 +673,7 @@ impl GraphicsBackend for GlData {
                     ack_gen: ack,
                 };
             };
-            unsafe {
+            let waited_ok = unsafe {
                 wait(
                     cache.slots[slot].sem,
                     0,
@@ -679,8 +682,11 @@ impl GraphicsBackend for GlData {
                     std::ptr::null(),
                     std::ptr::null(),
                 );
+                gl::GetError() == gl::NO_ERROR
+            };
+            if waited_ok {
+                cache.last_waited = Some((req.setup_epoch, req.generation));
             }
-            cache.last_waited = Some((req.setup_epoch, req.generation));
         }
         let ok = unsafe {
             for eye in 0..2u32 {

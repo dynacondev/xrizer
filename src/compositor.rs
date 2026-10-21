@@ -280,13 +280,26 @@ impl openxr_data::Compositor for Compositor {
             .into()
         }
 
-        *session_data.comp_data.0.lock().unwrap() = Some(
+        let old = session_data.comp_data.0.lock().unwrap().replace(
             backend_data.with_any_graphics_owned::<new_frame_controller>((
                 session_data,
                 waiter,
                 stream,
             )),
         );
+        // Texture-switch path: the old controller was never harvested into
+        // tmp_backend, so replacing comp_data just dropped it — release its
+        // backend GL imports here (they reference the old swapchain's
+        // images). Normal restarts replace None: no-op. Deletes without a
+        // current GL context are harmless no-ops; the new controller
+        // reimports on demand (epoch-keyed).
+        if let Some(mut old_ctrl) = old {
+            #[macros::any_graphics(DynFrameController)]
+            fn drop_imports<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) {
+                ctrl.backend.drop_depth_imports();
+            }
+            old_ctrl.with_any_graphics_mut::<drop_imports>(());
+        }
 
         // Propagate the depth-extension probe to the new controller.
         let depth_on = self.openxr.enabled_extensions.khr_composition_layer_depth;
@@ -1069,8 +1082,6 @@ struct FrameController<G: GraphicsBackend> {
     /// `depth_ready_this_frame`; the end_frame upgrade uses it to detect a
     /// newer present.
     depth_armed_generation: Option<u64>,
-    frame_seq: u64,
-    frame_start_mono_ns: u64,
     /// Debug-only submit heartbeat: submits since the last line + window
     /// start, with the depth-armed vs plain split. Throttled 5 s.
     submit_log_count: u64,
@@ -1182,8 +1193,6 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_near_far: None,
             depth_min_max: None,
             depth_armed_generation: None,
-            frame_seq: 0,
-            frame_start_mono_ns: 0,
             submit_log_count: 0,
             submit_log_start_mono_ns: 0,
             depth_armed_frames: 0,
@@ -1290,7 +1299,6 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_near_far = None;
         self.depth_min_max = None;
         self.depth_armed_generation = None;
-        self.frame_start_mono_ns = depth_feed::now_mono_ns();
         trace!("frame begin");
     }
 
@@ -1416,12 +1424,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             );
             return;
         }
-        // Staleness against the header timestamp (same clock, same machine).
-        let now = if self.frame_start_mono_ns != 0 {
-            self.frame_start_mono_ns
-        } else {
-            depth_feed::now_mono_ns()
-        };
+        // Staleness against the header timestamp, sampled at use: the
+        // end-frame upgrade reads generations published after frame start,
+        // which a frame-start clock would misjudge as future stamps.
+        let now = depth_feed::now_mono_ns();
         if ctl.is_stale(now, depth_feed::max_age_ms()) {
             if !quiet && !self.depth_stall_warned {
                 self.depth_stall_warned = true;
@@ -1672,8 +1678,6 @@ impl<G: GraphicsBackend> FrameController<G> {
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
     {
-        self.frame_seq = self.frame_seq.wrapping_add(1);
-
         // Debug-only submit heartbeat: submits/s plus the depth-armed vs
         // plain split. Throttled 5 s; the submit path is untouched.
         {
@@ -1977,10 +1981,16 @@ impl<G: GraphicsBackend> FrameController<G> {
         {
             Ok(()) => {
                 trace!("frame submitted (with depth)");
+                self.depth_stall_warned = false;
                 true
             }
             Err(e) => {
-                warn!("depth frame end failed ({e}); retrying plain views");
+                // Throttled like every other depth failure: a persistently
+                // rejecting runtime must not warn per frame.
+                if !self.depth_stall_warned {
+                    self.depth_stall_warned = true;
+                    warn!("depth frame end failed ({e}); retrying plain views");
+                }
                 false
             }
         }
@@ -2634,8 +2644,10 @@ mod tests {
     fn depth_fd_mode_inert_without_import_viable() {
         // Viable v2 FD segment at the fixed path + master on + extension on,
         // but the Fake backend reports no import viability (no GL context):
-        // the gate chain opens the feed and reads the header, yet frames go
-        // through plain views with nothing armed and no ack written.
+        // the submit path opens the feed yet arms nothing and acks nothing.
+        // (Feed reads stay harness-side: without GL the controller never
+        // reaches read_control, so this is an inertness + feed-lifecycle
+        // tripwire, not gate-chain coverage — logic is Tier-1 covered.)
         let _lock = crate::depth_feed::env_guard();
         let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
         unsafe {
@@ -2743,7 +2755,8 @@ mod tests {
         // Master switch on and a depth-capable backend, but the runtime did
         // not advertise khr_composition_layer_depth: the extension gate
         // short-circuits before the feed is even opened — plain views,
-        // no depth state at all.
+        // no depth state at all. Also pins the wired (non-)mapping of an
+        // unknown Vulkan format: no depth swapchain, still plain.
         let _lock = crate::depth_feed::env_guard();
         crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
         // Defensive: the fixed path must be absent for this test.
@@ -2782,6 +2795,19 @@ mod tests {
             assert!(ctrl.depth_swapchain.is_none());
             assert!(ctrl.depth_feed.is_none());
             assert!(!ctrl.depth_ready_this_frame);
+            // Extension probe propagated (false here): the gate never opens.
+            assert!(!ctrl.depth_extension_enabled);
+        }
+        // Unknown Vulkan formats map to no GL depth format: the swapchain
+        // is never created, frames stay plain.
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert!(!ctrl.ensure_depth_swapchain(&data, 10, 10, 96));
+            assert!(ctrl.depth_swapchain.is_none());
         }
 
         crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
