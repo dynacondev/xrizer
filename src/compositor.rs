@@ -668,6 +668,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
         ) where
             for<'b> &'b crate::overlay::AnySwapchainMap:
                 TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+            for<'a> &'a openxr_data::GraphicalSession:
+                TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
             <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
         {
             ctrl.end_frame(session_data, system, display_time, overlays)
@@ -1434,7 +1436,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                         && ctl.mode == MODE_FD
                         && self.backend.depth_fd_import_viable() =>
                 {
-                    self.try_upload_depth_fd(session_data, &ctl);
+                    self.try_upload_depth_fd(session_data, &ctl, false);
                 }
                 other => self.try_upload_depth(session_data, other.as_ref()),
             }
@@ -1613,7 +1615,12 @@ impl<G: GraphicsBackend> FrameController<G> {
     /// timestamp matching — the per-slot binary semaphore is the timeline.
     /// The ack (`consumed_gen`) is stored only for fully-copied generations
     /// (fence-drained), so the producer never reuses an in-flight slot.
-    fn try_upload_depth_fd(&mut self, session_data: &SessionData, ctl: &DepthControl)
+    fn try_upload_depth_fd(
+        &mut self,
+        session_data: &SessionData,
+        ctl: &DepthControl,
+        quiet: bool,
+    )
     where
         for<'a> &'a openxr_data::GraphicalSession:
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
@@ -1696,7 +1703,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.depth_ready_this_frame = true;
             self.depth_armed_generation = Some(ctl.generation);
             self.depth_stall_warned = false;
-        } else if !self.depth_stall_warned {
+        } else if !quiet && !self.depth_stall_warned {
+            // Quiet (end_frame upgrade) failures stay silent: the
+            // submit-time arming remains valid, and a missing GL context
+            // there must not spam once per frame.
             self.depth_stall_warned = true;
             warn!("depth FD copy failed (generation {})", ctl.generation);
         }
@@ -1826,6 +1836,8 @@ impl<G: GraphicsBackend> FrameController<G> {
     where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
     {
         if !(self.should_render
@@ -1840,8 +1852,37 @@ impl<G: GraphicsBackend> FrameController<G> {
         if !depth_feed::depth_master_enabled() {
             return false;
         }
-        // Armed by try_upload_depth / try_upload_depth_fd during Submit.
-        // Both halves were handled atomically there: both eyes or neither.
+        // Post-present upgrade: the Submit-time upload ran before X-Plane's
+        // present for this frame, so it armed the previous present's depth
+        // (systematic 1-frame lag). By end_frame the present has completed;
+        // re-read the control header and upgrade to the newest viable
+        // generation when the GL context allows. Quiet on failure: the
+        // submit-time arming stays valid.
+        if self.backend.depth_fd_import_viable() {
+            if self.depth_feed.is_none() {
+                self.depth_feed = DepthFeed::open();
+            }
+            let upgrade: Option<DepthControl> = self
+                .depth_feed
+                .as_ref()
+                .and_then(|f| f.read_control())
+                .filter(|ctl| {
+                    ctl.version == SHM_VERSION_V2
+                        && ctl.mode == MODE_FD
+                        && ctl.generation != 0
+                        && Some(ctl.generation) != self.depth_armed_generation
+                });
+            if let Some(ctl) = upgrade {
+                debug!(
+                    "depth FD upgrade check frame={} armed={:?} latest={}",
+                    self.frame_seq, self.depth_armed_generation, ctl.generation,
+                );
+                self.try_upload_depth_fd(session_data, &ctl, true);
+            }
+        }
+        // Armed by try_upload_depth / try_upload_depth_fd during Submit
+        // (or upgraded above). Both halves were handled atomically there:
+        // both eyes or neither.
         if !self.depth_ready_this_frame {
             return false;
         }
@@ -2035,6 +2076,8 @@ impl<G: GraphicsBackend> FrameController<G> {
     ) where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
     {
         self.frame_seq = self.frame_seq.wrapping_add(1);

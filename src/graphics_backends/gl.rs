@@ -649,6 +649,27 @@ impl GraphicsBackend for GlData {
                     i += 1;
                 }
             }
+            // Bound the ack trail: the just-submitted copy (~0.1 ms) is
+            // almost always done long before the next submit, so a short
+            // bounded wait lets the ack track the newest generation
+            // instead of trailing a full frame. That keeps the producer's
+            // 3-slot ring ahead of bursty double-presents (mirror + HMD),
+            // which otherwise wedge it into busy-skips. Long waits only
+            // happen under real GPU pressure, where slowing submissions
+            // is the correct backpressure anyway.
+            if let Some(&(bits, g)) = cache.pending.last() {
+                let sync = bits as gl::types::GLsync;
+                let status =
+                    unsafe { gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, 5_000_000) };
+                if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
+                    unsafe { gl::DeleteSync(sync) };
+                    cache.pending.pop();
+                    ack = Some(ack.map_or(g, |a: u64| a.max(g)));
+                } else if status == gl::WAIT_FAILED {
+                    unsafe { gl::DeleteSync(sync) };
+                    cache.pending.pop();
+                }
+            }
         }
         let Some(cache) = self.depth_fd.as_mut() else {
             return DepthFdResult {
