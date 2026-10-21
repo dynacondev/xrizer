@@ -533,18 +533,6 @@ impl GraphicsBackend for GlData {
         if self.depth_images.is_empty() || req.depth_image_index >= self.depth_images.len() {
             return inert();
         }
-        // alloc_bytes bound: the driver allocation can pad past w*h*bpp,
-        // so imports cover the full allocation — but a requirement larger
-        // than a known allocation means writer/reader drift. Reject before
-        // any GL call (0 = unknown, tolerate).
-        let want = req.w as u64 * req.h as u64 * bpp;
-        if req.alloc_bytes != 0 && want > req.alloc_bytes as u64 {
-            warn!(
-                "depth FD setup rejected: want {want} > alloc {} (epoch {}, {}x{} fmt {})",
-                req.alloc_bytes, req.setup_epoch, req.w, req.h, req.vk_format,
-            );
-            return inert();
-        }
         let dst = self.depth_images[req.depth_image_index];
         // Reimport on epoch/dims/format change (old GL objects first).
         // Segment size is deliberately NOT part of the identity.
@@ -563,6 +551,21 @@ impl GraphicsBackend for GlData {
                 if !retry_ok {
                     return inert();
                 }
+            }
+            // alloc_bytes bound: the driver allocation can pad past w*h*bpp,
+            // so imports cover the full allocation — but a requirement
+            // larger than a known allocation means writer/reader drift.
+            // Fail the key through the same backoff (one warn per episode,
+            // not per submit). 0 = unknown, tolerate.
+            let want = req.w as u64 * req.h as u64 * bpp;
+            if req.alloc_bytes != 0 && want > req.alloc_bytes as u64 {
+                warn!(
+                    "depth FD setup rejected: want {want} > alloc {} (epoch {}, {}x{} fmt {})",
+                    req.alloc_bytes, req.setup_epoch, req.w, req.h, req.vk_format,
+                );
+                self.fd_failed_key = Some(key);
+                self.fd_next_retry = Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
+                return inert();
             }
             match self.depth_fd.as_ref() {
                 Some(c) => debug!(

@@ -12,7 +12,7 @@ use crate::{
     tracy_span,
 };
 
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use openvr as vr;
 use openxr as xr;
 use std::mem::offset_of;
@@ -1069,9 +1069,6 @@ struct FrameController<G: GraphicsBackend> {
     /// `depth_ready_this_frame`; the end_frame upgrade uses it to detect a
     /// newer present.
     depth_armed_generation: Option<u64>,
-    /// Per depth-swapchain-image generation already resident. Resized on
-    /// depth swapchain (re)create.
-    depth_slot_gen: Vec<u64>,
     frame_seq: u64,
     frame_start_mono_ns: u64,
     /// Debug-only submit heartbeat: submits since the last line + window
@@ -1185,7 +1182,6 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_near_far: None,
             depth_min_max: None,
             depth_armed_generation: None,
-            depth_slot_gen: Vec::new(),
             frame_seq: 0,
             frame_start_mono_ns: 0,
             submit_log_count: 0,
@@ -1223,8 +1219,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         });
         // Depth dims derive from color dims; drop it so it is recreated
         // at the new size (GL session only; other backends never create it).
+        // Release the backend GL imports too: they reference the old
+        // swapchain's images and would otherwise leak per resize.
         self.depth_swapchain = None;
-        self.depth_slot_gen = Vec::new();
+        self.backend.drop_depth_imports();
         self.depth_ready_this_frame = false;
         self.depth_near_far = None;
         self.depth_min_max = None;
@@ -1431,9 +1429,26 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             return;
         }
-        // Header-only clip: invalid emits an error and falls back to plain.
-        let Some((near_z, far_z)) = depth_feed::validate_near_far(ctl.near_z, ctl.far_z) else {
-            return;
+        // Header-only clip: invalid falls back to plain. Error on the
+        // submit path (once per episode via the stall flag), silent
+        // debug on the quiet upgrade path.
+        let (near_z, far_z) = match depth_feed::validate_near_far(ctl.near_z, ctl.far_z) {
+            Some(v) => v,
+            None => {
+                if quiet {
+                    debug!(
+                        "depth near/far invalid ({}, {}); plain views this frame",
+                        ctl.near_z, ctl.far_z,
+                    );
+                } else if !self.depth_stall_warned {
+                    self.depth_stall_warned = true;
+                    error!(
+                        "depth near/far invalid ({}, {}); plain views this frame",
+                        ctl.near_z, ctl.far_z,
+                    );
+                }
+                return;
+            }
         };
         // Dims are authoritative per read: never stretch, skip the frame.
         let (cw, ch) = match self.swapchain_data.as_ref() {
@@ -1447,7 +1462,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             );
             return;
         }
-        let eye_w = ctl.w / 2;
+        let eye_w = ctl.eye_w();
         let eye_h = ctl.h;
         if !self.ensure_depth_swapchain(session_data, eye_w, eye_h, ctl.format) {
             if !quiet && !self.depth_stall_warned {
@@ -1462,7 +1477,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         let idx: usize = match (|| {
             let data = self.depth_swapchain.as_mut()?;
             let idx = data.swapchain.acquire_image().ok()? as usize;
-            data.swapchain.wait_image(xr::Duration::INFINITE).ok()?;
+            // Bounded: never stall the app thread on a wedged swapchain.
+            data.swapchain
+                .wait_image(xr::Duration::from_nanos(5_000_000))
+                .ok()?;
             Some(idx)
         })() {
             Some(i) => i,
@@ -1496,14 +1514,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             debug!("depth acked generation {ack} (was {})", ctl.consumed_gen);
         }
         if res.copied {
-            // Header mapping range; sanitize against frame rejection
-            // (Monado drops frames on non-finite min/max).
-            let (min_depth, max_depth) = if ctl.min_depth.is_finite() && ctl.max_depth.is_finite() {
-                (ctl.min_depth, ctl.max_depth)
-            } else {
-                debug!("depth min/max non-finite; using 0.0/1.0");
-                (0.0, 1.0)
-            };
+            // Header mapping range, sanitized for the runtime.
+            let (min_depth, max_depth) = depth_feed::sanitize_min_max(ctl.min_depth, ctl.max_depth);
             self.depth_near_far = Some((near_z, far_z));
             self.depth_min_max = Some((min_depth, max_depth));
             self.depth_ready_this_frame = true;
@@ -1592,7 +1604,6 @@ impl<G: GraphicsBackend> FrameController<G> {
                         return false;
                     }
                 };
-                self.depth_slot_gen = vec![0; images.len()];
                 self.backend
                     .store_depth_swapchain_images(images, info.format);
                 debug!(
@@ -1623,7 +1634,6 @@ impl<G: GraphicsBackend> FrameController<G> {
                                 return false;
                             }
                         };
-                        self.depth_slot_gen = vec![0; images.len()];
                         self.backend
                             .store_depth_swapchain_images(images, info.format);
                         info!(
@@ -1674,7 +1684,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             } else if now - self.submit_log_start_mono_ns > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
                 debug!(
-                    "submits {:.1}/s ({} frames, {} with depth, {} plain)",
+                    "frames {:.1}/s ({} frames, {} with depth, {} plain)",
                     self.submit_log_count as f64 / dt,
                     self.submit_log_count,
                     self.depth_armed_frames,
@@ -1840,10 +1850,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         let Some((near_z, far_z)) = self.depth_near_far else {
             return false;
         };
-        if near_z == far_z {
-            warn!("depth near == far ({near_z}); plain views this frame");
-            return false;
-        }
+        // near/far was validated at arm time (near < far guaranteed);
+        // min/max likewise sanitized. No re-validation here.
         // Mapping range from the header (sanitized at arm time).
         let (min_depth, max_depth) = self.depth_min_max.unwrap_or((0.0, 1.0));
         let (eye_w, eye_h) = match self.depth_swapchain.as_ref() {
@@ -2121,6 +2129,13 @@ mod tests {
             _image_index: usize,
         ) -> openxr::Extent2Di {
             xr::Extent2Di::default()
+        }
+
+        /// Test-only depth posture: capable enough to open the feed and read
+        /// the control header, but never import (no GL context in tests).
+        /// Lets Tier-2 prove the gate chain runs without arming anything.
+        fn supports_depth() -> bool {
+            true
         }
     }
 
@@ -2617,9 +2632,10 @@ mod tests {
 
     #[test]
     fn depth_fd_mode_inert_without_import_viable() {
-        // v2 FD segment present at the fixed path + master on, but the Fake
-        // backend carries no depth support: frames go through plain views,
-        // no depth state armed.
+        // Viable v2 FD segment at the fixed path + master on + extension on,
+        // but the Fake backend reports no import viability (no GL context):
+        // the gate chain opens the feed and reads the header, yet frames go
+        // through plain views with nothing armed and no ack written.
         let _lock = crate::depth_feed::env_guard();
         let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
         unsafe {
@@ -2659,8 +2675,8 @@ mod tests {
                 mode: 1,
                 setup_epoch: 3,
                 consumed_gen: 0,
-                mem_fds: [-1, -1, -1],
-                sem_fds: [-1, -1, -1],
+                mem_fds: [11, 12, 13],
+                sem_fds: [21, 22, 23],
                 near_z: 0.01,
                 far_z: 200.0,
                 alloc_bytes: 800,
@@ -2686,6 +2702,7 @@ mod tests {
                 panic!("Frame controller was not set up or not faked!");
             };
             ctrl.should_render = true;
+            ctrl.set_depth_extension_enabled(true);
         }
         assert_eq!(f.submit(vr::EVREye::Left), None);
         assert_eq!(f.submit(vr::EVREye::Right), None);
@@ -2702,6 +2719,16 @@ mod tests {
             assert!(ctrl.depth_near_far.is_none());
             assert!(ctrl.depth_min_max.is_none());
             assert!(ctrl.depth_armed_generation.is_none());
+            // The gate chain ran (feed opened) but nothing armed…
+            assert!(ctrl.depth_feed.is_some());
+        }
+        // …and the published header still reads viable with no ack written.
+        {
+            let feed = crate::depth_feed::DepthFeed::open().expect("feed opens");
+            let ctl = feed.read_control().expect("control readable");
+            assert!(ctl.is_viable());
+            assert_eq!(ctl.generation, 1);
+            assert_eq!(ctl.consumed_gen, 0);
         }
 
         crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
@@ -2712,9 +2739,11 @@ mod tests {
     }
 
     #[test]
-    fn depth_inert_with_unsupported_backend() {
-        // Master switch on, but the Fake backend has no depth support:
-        // frames must go through plain views with no depth state armed.
+    fn depth_inert_with_extension_disabled() {
+        // Master switch on and a depth-capable backend, but the runtime did
+        // not advertise khr_composition_layer_depth: the extension gate
+        // short-circuits before the feed is even opened — plain views,
+        // no depth state at all.
         let _lock = crate::depth_feed::env_guard();
         crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
         // Defensive: the fixed path must be absent for this test.

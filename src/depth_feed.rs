@@ -35,7 +35,7 @@
 //!
 //! No new crates: `libc` + `log` only.
 
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -249,7 +249,9 @@ impl DepthFeed {
         if !depth_master_enabled() {
             return None;
         }
-        info!("depth feed: SHM path {} (master on)", DEFAULT_SHM_NAME);
+        if !FEED_OPEN_LOGGED.swap(true, Ordering::Relaxed) {
+            info!("depth feed: SHM path {} (master on)", DEFAULT_SHM_NAME);
+        }
         Some(Self {
             name: CString::new(DEFAULT_SHM_NAME).expect("SHM name contains NUL"),
         })
@@ -288,10 +290,22 @@ impl DepthFeed {
             if seq1 != seq2 {
                 continue;
             }
-            // Trust only the copied snapshot from here on.
+            // Trust only the copied snapshot from here on — except the ack:
+            // consumed_gen is written concurrently (by us, and zeroed by
+            // the producer on recreate), so reload it with an acquire-load
+            // pairing our release-store. mmap is page-aligned and
+            // CONSUMED_GEN_OFF is 8-aligned, so this is always aligned.
             if h.magic != SHM_MAGIC || h.version != SHM_VERSION_V2 {
                 return None;
             }
+            let consumed_gen = unsafe {
+                (ptr as *const u8)
+                    .add(CONSUMED_GEN_OFF)
+                    .cast::<AtomicU64>()
+                    .as_ref()
+                    .map(|a| a.load(Ordering::Acquire))
+                    .unwrap_or(h.consumed_gen)
+            };
             return Some(DepthControl {
                 version: h.version,
                 mode: h.mode,
@@ -308,7 +322,7 @@ impl DepthFeed {
                 sem_fds: h.sem_fds,
                 near_z: h.near_z,
                 far_z: h.far_z,
-                consumed_gen: h.consumed_gen,
+                consumed_gen,
                 seg_len: map_len,
                 alloc_bytes: h.alloc_bytes,
             });
@@ -363,27 +377,43 @@ unsafe fn read_header_v2(base: *mut libc::c_void) -> XdShmHeaderV2 {
     unsafe { (base as *const XdShmHeaderV2).read_unaligned() }
 }
 
-/// Header near/far win — no xrizer-side defaults. Invalid (`<= 0`,
-/// non-finite, `near >= far`) logs an error and yields `None` so the
-/// caller falls back to plain views for that frame.
+/// Header near/far win — no xrizer-side defaults. Pure predicate: invalid
+/// (`<= 0`, non-finite, `near >= far`) yields `None` so the caller falls
+/// back to plain views; the caller owns logging (error on the submit
+/// path, debug on the quiet upgrade path).
 pub fn validate_near_far(hdr_near: f32, hdr_far: f32) -> Option<(f32, f32)> {
     if !hdr_near.is_finite() || !hdr_far.is_finite() {
-        error!("depth near/far non-finite ({hdr_near}, {hdr_far}); plain views this frame");
         return None;
     }
     if hdr_near <= 0.0 || hdr_far <= 0.0 {
-        error!("depth near/far unavailable ({hdr_near}, {hdr_far}); plain views this frame");
         return None;
     }
     if hdr_near >= hdr_far {
-        error!("depth near >= far ({hdr_near} >= {hdr_far}); plain views this frame");
         return None;
     }
     Some((hdr_near, hdr_far))
 }
 
+/// Header mapping range, sanitized for the runtime (Monado rejects frames
+/// on non-finite min/max). Out-of-range or inverted ranges fall back to
+/// the identity (0.0, 1.0); the range is never used to gate depth.
+pub fn sanitize_min_max(hdr_min: f32, hdr_max: f32) -> (f32, f32) {
+    if hdr_min.is_finite()
+        && hdr_max.is_finite()
+        && hdr_min >= 0.0
+        && hdr_max <= 1.0
+        && hdr_min <= hdr_max
+    {
+        (hdr_min, hdr_max)
+    } else {
+        debug!("depth min/max ({hdr_min}, {hdr_max}) out of range; using 0.0/1.0");
+        (0.0, 1.0)
+    }
+}
+
 static WARNED_MASTER: AtomicBool = AtomicBool::new(false);
 static WARNED_MAX_AGE: AtomicBool = AtomicBool::new(false);
+static FEED_OPEN_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn warn_once_flag(flag: &AtomicBool, msg: &str) {
     if !flag.swap(true, Ordering::Relaxed) {
@@ -844,6 +874,17 @@ mod tests {
         assert_eq!(validate_near_far(1.0, 1.0), None);
         assert_eq!(validate_near_far(f32::NAN, 200.0), None);
         assert_eq!(validate_near_far(0.01, f32::INFINITY), None);
+    }
+
+    #[test]
+    fn min_max_sanitized() {
+        assert_eq!(sanitize_min_max(0.0, 1.0), (0.0, 1.0));
+        assert_eq!(sanitize_min_max(0.2, 0.8), (0.2, 0.8));
+        assert_eq!(sanitize_min_max(f32::NAN, 1.0), (0.0, 1.0));
+        assert_eq!(sanitize_min_max(0.0, f32::INFINITY), (0.0, 1.0));
+        assert_eq!(sanitize_min_max(-0.1, 1.0), (0.0, 1.0));
+        assert_eq!(sanitize_min_max(0.0, 1.5), (0.0, 1.0));
+        assert_eq!(sanitize_min_max(0.8, 0.2), (0.0, 1.0));
     }
 
     #[test]
