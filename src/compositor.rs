@@ -1088,6 +1088,12 @@ struct FrameController<G: GraphicsBackend> {
     submit_log_start_mono_ns: u64,
     depth_armed_frames: u64,
     depth_plain_frames: u64,
+    /// Debug-only upgrade accounting (same heartbeat window): end_frame
+    /// upgrades that copied a newer generation vs attempts that kept the
+    /// submit-time arming (no context, stale, or failed copy — all
+    /// silent by design). Answers live whether the 0-lag path executes.
+    depth_upgrade_ok: u64,
+    depth_upgrade_pass: u64,
     depth_extension_enabled: bool,
     depth_off_logged: bool,
     /// One-shot stall warning: depth enabled but no upload could be armed
@@ -1197,6 +1203,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             submit_log_start_mono_ns: 0,
             depth_armed_frames: 0,
             depth_plain_frames: 0,
+            depth_upgrade_ok: 0,
+            depth_upgrade_pass: 0,
             depth_extension_enabled: false,
             depth_off_logged: false,
             depth_stall_warned: false,
@@ -1702,15 +1710,19 @@ impl<G: GraphicsBackend> FrameController<G> {
             } else if now.saturating_sub(self.submit_log_start_mono_ns) > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
                 debug!(
-                    "frames {:.1}/s ({} frames, {} with depth, {} plain)",
+                    "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass)",
                     self.submit_log_count as f64 / dt,
                     self.submit_log_count,
                     self.depth_armed_frames,
                     self.depth_plain_frames,
+                    self.depth_upgrade_ok,
+                    self.depth_upgrade_pass,
                 );
                 self.submit_log_count = 0;
                 self.depth_armed_frames = 0;
                 self.depth_plain_frames = 0;
+                self.depth_upgrade_ok = 0;
+                self.depth_upgrade_pass = 0;
                 self.submit_log_start_mono_ns = now;
             }
         }
@@ -1857,7 +1869,13 @@ impl<G: GraphicsBackend> FrameController<G> {
                         && Some(ctl.generation) != self.depth_armed_generation
                 });
             if let Some(ctl) = upgrade {
+                let before = self.depth_armed_generation;
                 self.try_upload_depth_fd(session_data, &ctl, true);
+                if self.depth_armed_generation != before {
+                    self.depth_upgrade_ok += 1;
+                } else {
+                    self.depth_upgrade_pass += 1;
+                }
             }
         }
         // Armed by try_upload_depth_fd during Submit (or upgraded above).
