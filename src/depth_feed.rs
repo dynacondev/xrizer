@@ -129,6 +129,7 @@ pub struct DepthControl {
     pub far_z: f32,
     /// Highest fully-copied generation, as last observed.
     pub consumed_gen: u64,
+    /// Observed segment length; viable only when exactly 128.
     pub seg_len: usize,
     /// Driver-reported mirror allocation size (+112). Import size must be
     /// `<= alloc_bytes` when non-zero; 0 = unknown (tolerate).
