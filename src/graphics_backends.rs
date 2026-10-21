@@ -48,6 +48,86 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         bounds: vr::VRTextureBounds_t,
         image_index: usize,
     ) -> xr::Extent2Di;
+
+    /// Depth handoff (GL session only). Defaults keep other backends
+    /// compiling untouched and color-only.
+    fn depth_swapchain_create_info(
+        &self,
+        color_info: &xr::SwapchainCreateInfo<Self::Api>,
+        depth_format: <Self::Api as xr::Graphics>::Format,
+    ) -> Option<xr::SwapchainCreateInfo<Self::Api>> {
+        let _ = (color_info, depth_format);
+        None
+    }
+
+    fn store_depth_swapchain_images(
+        &mut self,
+        images: Vec<<Self::Api as xr::Graphics>::SwapchainImage>,
+        format: <Self::Api as xr::Graphics>::Format,
+    ) {
+        let _ = (images, format);
+    }
+
+    /// Whether this backend can carry depth at all. Used to skip SHM work.
+    fn supports_depth() -> bool {
+        false
+    }
+
+    /// GL swapchain format for a SHM Vulkan depth format (126 = D32F only).
+    /// Checked against the session's enumerated formats; depth stays off
+    /// when absent.
+    fn depth_format_for_header(vk_format: i32) -> Option<<Self::Api as xr::Graphics>::Format> {
+        let _ = vk_format;
+        None
+    }
+
+    /// Whether this backend can import dma-buf FDs (GL extension probe).
+    fn depth_fd_import_viable(&self) -> bool {
+        false
+    }
+
+    /// Ensure FD imports for (epoch, dims, format); GPU-copy both halves
+    /// of `generation` into `depth_image_index` (waiting first unless this
+    /// exact generation was already waited); drain completed copies and
+    /// report the highest fully-copied generation for the ack store.
+    /// Default: unsupported (keeps other backends compiling untouched).
+    fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
+        let _ = req;
+        DepthFdResult {
+            copied: false,
+            ack_gen: None,
+        }
+    }
+
+    /// Delete FD import GL objects (reimport path / teardown).
+    fn drop_depth_imports(&mut self) {}
+}
+
+/// One FD-mode frame for [`GraphicsBackend::import_and_copy_depth_fd`].
+pub struct DepthFdRequest {
+    pub setup_epoch: u32,
+    pub seg_len: usize,
+    pub w: u32,
+    pub h: u32,
+    pub vk_format: i32,
+    pub mem_fds: [i32; 3],
+    pub sem_fds: [i32; 3],
+    pub generation: u64,
+    pub depth_image_index: usize,
+    pub eye_w: u32,
+    pub eye_h: u32,
+    /// Driver-reported allocation size from the SHM header (+112). The GL
+    /// import size covers the full allocation; `want > alloc` (non-zero)
+    /// rejects the setup before any GL call. 0 = unknown, use w*h*bpp.
+    pub alloc_bytes: u32,
+}
+
+/// Outcome of [`GraphicsBackend::import_and_copy_depth_fd`].
+pub struct DepthFdResult {
+    /// Both halves copied this submit; end_frame may chain depth.
+    pub copied: bool,
+    /// Highest fully-copied generation: store to `consumed_gen`.
+    pub ack_gen: Option<u64>,
 }
 
 #[derive(macros::Backends, TryInto, From)]

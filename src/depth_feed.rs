@@ -148,7 +148,7 @@ impl DepthControl {
     }
 
     pub fn dims_plausible(&self) -> bool {
-        self.w != 0 && self.h != 0 && self.w <= 16384 && self.h <= 16384 && self.w % 2 == 0
+        self.w != 0 && self.h != 0 && self.w <= 16384 && self.h <= 16384 && self.w.is_multiple_of(2)
     }
 
     /// Full viability gate: v2 FD, published epoch+generation, D32F SBS,
@@ -338,11 +338,13 @@ impl DepthFeed {
             0
         );
         unsafe {
-            (map.ptr as *mut u8)
+            if let Some(a) = (map.ptr as *mut u8)
                 .add(CONSUMED_GEN_OFF)
                 .cast::<AtomicU64>()
                 .as_ref()
-                .map(|a| a.store(generation, Ordering::Release));
+            {
+                a.store(generation, Ordering::Release);
+            }
         }
         true
     }
@@ -760,13 +762,14 @@ mod tests {
             .expect("readable");
         assert!(!ctl.is_viable(), "epoch/gen 0 must not arm");
         // Bad dims / format / layout.
-        let tweaks: [(&str, Box<dyn Fn(&mut XdShmHeaderV2)>); 6] = [
-            ("oddw", Box::new(|h: &mut XdShmHeaderV2| h.w = 7)),
-            ("zerow", Box::new(|h: &mut XdShmHeaderV2| h.w = 0)),
-            ("huge", Box::new(|h: &mut XdShmHeaderV2| h.w = 16385)),
-            ("fmt", Box::new(|h: &mut XdShmHeaderV2| h.format = 96)),
-            ("layout", Box::new(|h: &mut XdShmHeaderV2| h.eye_layout = 0)),
-            ("gen0", Box::new(|h: &mut XdShmHeaderV2| h.present_no = 0)),
+    type HeaderTweak = (&'static str, fn(&mut XdShmHeaderV2));
+    let tweaks: [HeaderTweak; 6] = [
+            ("oddw", |h: &mut XdShmHeaderV2| h.w = 7),
+            ("zerow", |h: &mut XdShmHeaderV2| h.w = 0),
+            ("huge", |h: &mut XdShmHeaderV2| h.w = 16385),
+            ("fmt", |h: &mut XdShmHeaderV2| h.format = 96),
+            ("layout", |h: &mut XdShmHeaderV2| h.eye_layout = 0),
+            ("gen0", |h: &mut XdShmHeaderV2| h.present_no = 0),
         ];
         for (tag, tweak) in tweaks {
             let name = format!("/xrizer-depth-test-{pid}-{tag}");
