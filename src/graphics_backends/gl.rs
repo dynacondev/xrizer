@@ -725,6 +725,17 @@ impl GraphicsBackend for GlData {
         let sync = unsafe { gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) };
         if !sync.is_null() {
             cache.pending.push((sync as u64, req.generation));
+            // Bound the fence trail: a GPU that never signals would
+            // otherwise grow this Vec forever (one leak per submit).
+            // Healthy GPUs drain to 0-1; drop the oldest on overflow.
+            const MAX_PENDING_FENCES: usize = 16;
+            if cache.pending.len() > MAX_PENDING_FENCES {
+                let (old_bits, old_gen) = cache.pending.remove(0);
+                unsafe { gl::DeleteSync(old_bits as gl::types::GLsync) };
+                warn!(
+                    "depth FD fence backlog overflow, dropping oldest gen {old_gen} (GPU not signaling?)"
+                );
+            }
             unsafe { gl::Flush() };
         }
         DepthFdResult {
@@ -829,8 +840,15 @@ impl GlData {
         let import_sem = DEPTH_EXT.import_semaphore_fd?;
         // Drain pre-existing errors so the first failure below attributes
         // exactly (debug callbacks are async; without this the blame lands
-        // on whatever call happens to poll GetError next).
-        unsafe { while gl::GetError() != gl::NO_ERROR {} }
+        // on whatever call happens to poll GetError next). Bounded: the
+        // error queue is finite, but cap iterations defensively.
+        unsafe {
+            for _ in 0..64 {
+                if gl::GetError() == gl::NO_ERROR {
+                    break;
+                }
+            }
+        }
         let mut slots = [DepthFdSlot::default(); 3];
         for i in 0..3 {
             let (mut mem, mut tex, mut sem) = (0, 0, 0);

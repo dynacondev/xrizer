@@ -354,7 +354,10 @@ impl DepthFeed {
             return false;
         }
         debug_assert_eq!(map.len, HEADER_SIZE_V2);
-        debug_assert_eq!(
+        // Release assert: the AtomicU64 cast below faults on misalignment
+        // on strict architectures; page mappings are aligned in practice,
+        // but never skip this check in release.
+        assert_eq!(
             (map.ptr as usize + CONSUMED_GEN_OFF) % std::mem::align_of::<AtomicU64>(),
             0
         );
@@ -376,11 +379,15 @@ unsafe fn read_seq(base: *mut libc::c_void) -> u32 {
 }
 
 unsafe fn read_u32(base: *mut libc::c_void, off: usize) -> u32 {
-    unsafe { (base as *const u8).add(off).cast::<u32>().read() }
+    // Seqlock-protected header words: the writer mutates them concurrently,
+    // so use volatile reads (plain .read() would be a data race).
+    unsafe { (base as *const u8).add(off).cast::<u32>().read_volatile() }
 }
 
 unsafe fn read_header_v2(base: *mut libc::c_void) -> XdShmHeaderV2 {
-    unsafe { (base as *const XdShmHeaderV2).read_unaligned() }
+    // Same: torn reads are detected via the seqlock retry, but the read
+    // itself must be volatile to be sound under concurrent mutation.
+    unsafe { (base as *const XdShmHeaderV2).read_volatile() }
 }
 
 /// Header near/far win — no xrizer-side defaults. Pure predicate: invalid
