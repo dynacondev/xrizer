@@ -1096,9 +1096,20 @@ struct FrameController<G: GraphicsBackend> {
     depth_upgrade_pass: u64,
     depth_extension_enabled: bool,
     depth_off_logged: bool,
-    /// One-shot stall warning: depth enabled but no upload could be armed
-    /// (SHM stale/dead, FD import failing, ...). Reset on every success.
-    depth_stall_warned: bool,
+    /// One-shot stall warning: SHM has no fresh frame (stale, dead, or
+    /// producer stopped). Reset as soon as a fresh header passes the
+    /// staleness gate, so the next stall re-warns.
+    depth_stale_warned: bool,
+    /// One-shot failure warning: near/far invalid, swapchain missing,
+    /// acquire/wait timeout, copy failure, or depth submit rejection.
+    /// Reset on every successful copy. Kept separate from the stale flag
+    /// so one episode cannot mask the other.
+    depth_fail_warned: bool,
+    /// Last quiet-path (end_frame upgrade) skip reason, warned once per
+    /// reason episode. A changed reason re-warns; success clears it.
+    /// Lets the next live run name the ack-freeze cause (stale vs dims
+    /// vs acquire vs copy) instead of going silent.
+    depth_upgrade_skip_reason: Option<&'static str>,
     /// Earliest retry time after a depth swapchain creation failure.
     /// Transient runtime errors cost skipped ticks, never stalls or spam.
     depth_swapchain_next_retry: Option<Instant>,
@@ -1207,7 +1218,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_upgrade_pass: 0,
             depth_extension_enabled: false,
             depth_off_logged: false,
-            depth_stall_warned: false,
+            depth_stale_warned: false,
+            depth_fail_warned: false,
+            depth_upgrade_skip_reason: None,
             depth_swapchain_next_retry: None,
             depth_first_arm_logged: false,
         }
@@ -1413,6 +1426,17 @@ impl<G: GraphicsBackend> FrameController<G> {
     /// FD-mode upload: GPU-side copy from the imported dma-buf ring.
     /// Runs in `submit_impl` (GL context current). No CPU upload, no
     /// timestamp matching — the per-slot binary semaphore is the timeline.
+    /// Quiet-path skip signal: warn once per reason episode so the next
+    /// live run names the ack-freeze cause (stale vs dims vs acquire vs
+    /// copy) instead of going silent. A changed reason re-warns;
+    /// success clears it.
+    fn note_upgrade_skip(&mut self, reason: &'static str) {
+        if self.depth_upgrade_skip_reason != Some(reason) {
+            self.depth_upgrade_skip_reason = Some(reason);
+            warn!("depth upgrade skipped ({reason}); plain views");
+        }
+    }
+
     /// The ack (`consumed_gen`) is stored only for fully-copied generations
     /// (fence-drained), so the producer never reuses an in-flight slot.
     /// Anything unexpected degrades to plain views for this frame.
@@ -1437,12 +1461,15 @@ impl<G: GraphicsBackend> FrameController<G> {
         // which a frame-start clock would misjudge as future stamps.
         let now = depth_feed::now_mono_ns();
         if ctl.is_stale(now, depth_feed::max_age_ms()) {
-            if !quiet && !self.depth_stall_warned {
-                self.depth_stall_warned = true;
+            if quiet {
+                self.note_upgrade_skip("stale-shm");
+            } else if !self.depth_stale_warned {
+                self.depth_stale_warned = true;
                 warn!("depth enabled but no fresh frame (SHM stale, dead, or producer stopped?)");
             }
             return;
         }
+        self.depth_stale_warned = false;
         // Header-only clip: invalid falls back to plain. Error on the
         // submit path (once per episode via the stall flag), silent
         // debug on the quiet upgrade path.
@@ -1450,12 +1477,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(v) => v,
             None => {
                 if quiet {
-                    debug!(
-                        "depth near/far invalid ({}, {}); plain views this frame",
-                        ctl.near_z, ctl.far_z,
-                    );
-                } else if !self.depth_stall_warned {
-                    self.depth_stall_warned = true;
+                    self.note_upgrade_skip("near-far-invalid");
+                } else if !self.depth_fail_warned {
+                    self.depth_fail_warned = true;
                     error!(
                         "depth near/far invalid ({}, {}); plain views this frame",
                         ctl.near_z, ctl.far_z,
@@ -1470,17 +1494,23 @@ impl<G: GraphicsBackend> FrameController<G> {
             None => return,
         };
         if cw == 0 || ctl.w != cw * 2 || ctl.h != ch {
-            debug!(
-                "depth dims {}x{} vs color {cw}x{ch} — plain views this frame",
-                ctl.w, ctl.h,
-            );
+            if quiet {
+                self.note_upgrade_skip("dims-mismatch");
+            } else {
+                debug!(
+                    "depth dims {}x{} vs color {cw}x{ch} — plain views this frame",
+                    ctl.w, ctl.h,
+                );
+            }
             return;
         }
         let eye_w = ctl.eye_w();
         let eye_h = ctl.h;
         if !self.ensure_depth_swapchain(session_data, eye_w, eye_h, ctl.format) {
-            if !quiet && !self.depth_stall_warned {
-                self.depth_stall_warned = true;
+            if quiet {
+                self.note_upgrade_skip("swapchain-unavailable");
+            } else if !self.depth_fail_warned {
+                self.depth_fail_warned = true;
                 warn!(
                     "depth swapchain unavailable (generation {})",
                     ctl.generation
@@ -1509,9 +1539,12 @@ impl<G: GraphicsBackend> FrameController<G> {
             None => {
                 // Swapchain-level stall (wedged runtime or exhausted
                 // images): silent here would look identical to a healthy
-                // idle. Once per episode; resets on the next drained copy.
-                if !quiet && !self.depth_stall_warned {
-                    self.depth_stall_warned = true;
+                // idle. Warned once per episode on the submit path, named
+                // per reason on the quiet upgrade path.
+                if quiet {
+                    self.note_upgrade_skip("acquire-wait-timeout");
+                } else if !self.depth_fail_warned {
+                    self.depth_fail_warned = true;
                     warn!(
                         "depth swapchain acquire/wait timed out (generation {}); plain views this frame",
                         ctl.generation
@@ -1556,7 +1589,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.depth_min_max = Some((min_depth, max_depth));
             self.depth_ready_this_frame = true;
             self.depth_armed_generation = Some(ctl.generation);
-            self.depth_stall_warned = false;
+            self.depth_fail_warned = false;
+            self.depth_upgrade_skip_reason = None;
             if !self.depth_first_arm_logged {
                 self.depth_first_arm_logged = true;
                 info!(
@@ -1564,11 +1598,14 @@ impl<G: GraphicsBackend> FrameController<G> {
                     ctl.format,
                 );
             }
-        } else if !quiet && !self.depth_stall_warned {
-            // Quiet (end_frame upgrade) failures stay silent: the
-            // submit-time arming remains valid, and a missing GL context
-            // there must not spam once per frame.
-            self.depth_stall_warned = true;
+        } else if quiet {
+            // Quiet (end_frame upgrade) copy failures report via the
+            // skip reason (once per reason episode), not silence: a
+            // missing GL context there must not spam once per frame,
+            // but the cause must be visible.
+            self.note_upgrade_skip("copy-failed");
+        } else if !self.depth_fail_warned {
+            self.depth_fail_warned = true;
             warn!("depth FD copy failed (generation {})", ctl.generation);
         }
     }
@@ -1722,13 +1759,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             } else if now.saturating_sub(self.submit_log_start_mono_ns) > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
                 debug!(
-                    "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass)",
+                    "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass, skip {})",
                     self.submit_log_count as f64 / dt,
                     self.submit_log_count,
                     self.depth_armed_frames,
                     self.depth_plain_frames,
                     self.depth_upgrade_ok,
                     self.depth_upgrade_pass,
+                    self.depth_upgrade_skip_reason.unwrap_or("none"),
                 );
                 self.submit_log_count = 0;
                 self.depth_armed_frames = 0;
@@ -2025,14 +2063,14 @@ impl<G: GraphicsBackend> FrameController<G> {
         {
             Ok(()) => {
                 trace!("frame submitted (with depth)");
-                self.depth_stall_warned = false;
+                self.depth_fail_warned = false;
                 true
             }
             Err(e) => {
                 // Throttled like every other depth failure: a persistently
                 // rejecting runtime must not warn per frame.
-                if !self.depth_stall_warned {
-                    self.depth_stall_warned = true;
+                if !self.depth_fail_warned {
+                    self.depth_fail_warned = true;
                     warn!("depth frame end failed ({e}); retrying plain views");
                 }
                 false
