@@ -1110,6 +1110,13 @@ struct FrameController<G: GraphicsBackend> {
     /// Lets the next live run name the ack-freeze cause (stale vs dims
     /// vs acquire vs copy) instead of going silent.
     depth_upgrade_skip_reason: Option<&'static str>,
+    /// display_time of the previous end_frame: an end reusing the same
+    /// timestamp re-presents an already-submitted frame (repeat). The
+    /// frames line reports the per-window repeat count so the next live
+    /// run shows whether this bridge ever re-emits (it shouldn't — the
+    /// runtime's multi layer recommits on its own cadence).
+    last_end_display_time: Option<xr::Time>,
+    end_repeat_count: u64,
     /// Earliest retry time after a depth swapchain creation failure.
     /// Transient runtime errors cost skipped ticks, never stalls or spam.
     depth_swapchain_next_retry: Option<Instant>,
@@ -1221,6 +1228,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_stale_warned: false,
             depth_fail_warned: false,
             depth_upgrade_skip_reason: None,
+            last_end_display_time: None,
+            end_repeat_count: 0,
             depth_swapchain_next_retry: None,
             depth_first_arm_logged: false,
         }
@@ -1753,13 +1762,20 @@ impl<G: GraphicsBackend> FrameController<G> {
         // plain split. Throttled 5 s; the submit path is untouched.
         {
             self.submit_log_count += 1;
+            // Repeat detection: same display_time as the previous end
+            // means no new app frame (repeat re-present). Expected to
+            // stay zero — repeats downstream happen in the runtime.
+            if self.last_end_display_time == Some(display_time) {
+                self.end_repeat_count += 1;
+            }
+            self.last_end_display_time = Some(display_time);
             let now = depth_feed::now_mono_ns();
             if self.submit_log_start_mono_ns == 0 {
                 self.submit_log_start_mono_ns = now;
             } else if now.saturating_sub(self.submit_log_start_mono_ns) > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
                 debug!(
-                    "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass, skip {})",
+                    "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass, skip {}, repeat-ends {})",
                     self.submit_log_count as f64 / dt,
                     self.submit_log_count,
                     self.depth_armed_frames,
@@ -1767,12 +1783,14 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.depth_upgrade_ok,
                     self.depth_upgrade_pass,
                     self.depth_upgrade_skip_reason.unwrap_or("none"),
+                    self.end_repeat_count,
                 );
                 self.submit_log_count = 0;
                 self.depth_armed_frames = 0;
                 self.depth_plain_frames = 0;
                 self.depth_upgrade_ok = 0;
                 self.depth_upgrade_pass = 0;
+                self.end_repeat_count = 0;
                 self.submit_log_start_mono_ns = now;
             }
         }
