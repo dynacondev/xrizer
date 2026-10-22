@@ -13,7 +13,7 @@
 //! +4  u32 version     2 (v1 deleted — shim only writes v2)
 //! +8  u32 seq         seqlock: odd = writer inside
 //! +12 u32 w, +16 u32 h
-//! +20 i32 format      126 = D32F only
+//! +20 i32 format      126 = D32F (preferred), 130 = D32S8 (fallback)
 //! +24 u32 eye_layout  1 = side-by-side (left half eye0, right half eye1)
 //! +32 u64 present_no  latest signaled generation (0 = never published)
 //! +40 u64 time_mono_ns (CLOCK_MONOTONIC at copy completion)
@@ -43,8 +43,12 @@ pub const SHM_MAGIC: u32 = 0x5850_4450; // 'XPDP'
 pub const SHM_VERSION_V2: u32 = 2;
 pub const EYE_SIDEBYSIDE: u32 = 1;
 pub const MODE_FD: u32 = 1;
-/// Vulkan `VK_FORMAT_D32_SFLOAT`. Only format accepted in prod.
+/// Vulkan `VK_FORMAT_D32_SFLOAT`. Preferred depth format in prod.
 pub const FORMAT_D32F: i32 = 126;
+/// Vulkan `VK_FORMAT_D32_SFLOAT_S8_UINT`. Accepted fallback (X-Plane
+/// emits D32S8-only depth in some setups). Mirror/copy/import are all
+/// depth-aspect-only, so stencil never enters the feed.
+pub const FORMAT_D32S8: i32 = 130;
 pub const HEADER_SIZE_V2: usize = 128;
 /// Byte offset of `consumed_gen`: written by xrizer, 8-aligned.
 pub const CONSUMED_GEN_OFF: usize = 72;
@@ -152,8 +156,9 @@ impl DepthControl {
         self.w != 0 && self.h != 0 && self.w <= 16384 && self.h <= 16384 && self.w.is_multiple_of(2)
     }
 
-    /// Full viability gate: v2 FD, published epoch+generation, D32F SBS,
-    /// plausible dims, exact 128-byte segment, all FDs real.
+    /// Full viability gate: v2 FD, published epoch+generation, depth SBS
+    /// (D32F preferred, D32S8 fallback), plausible dims, exact 128-byte
+    /// segment, all FDs real.
     /// `min/max` are mapping range (never gated); `near/far` validity is
     /// checked separately via [`validate_near_far`].
     pub fn is_viable(&self) -> bool {
@@ -161,7 +166,7 @@ impl DepthControl {
             && self.mode == MODE_FD
             && self.setup_epoch != 0
             && self.generation != 0
-            && self.format == FORMAT_D32F
+            && (self.format == FORMAT_D32F || self.format == FORMAT_D32S8)
             && self.eye_layout == EYE_SIDEBYSIDE
             && self.seg_len == HEADER_SIZE_V2
             && self.dims_plausible()
@@ -830,6 +835,20 @@ mod tests {
                 .expect("readable");
             assert!(!ctl.is_viable(), "{tag} must not arm");
         }
+    }
+
+    #[test]
+    fn d32s8_fallback_is_viable() {
+        let pid = std::process::id();
+        let name = format!("/xrizer-depth-test-{pid}-s8");
+        let _seg = make_seg_v2(&name, 8, 2, 3, MODE_FD, |h| {
+            h.format = FORMAT_D32S8;
+        });
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert_eq!(ctl.format, FORMAT_D32S8);
+        assert!(ctl.is_viable(), "D32S8 fallback must arm");
     }
 
     #[test]

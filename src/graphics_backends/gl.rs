@@ -18,6 +18,8 @@ static GLX: LazyLock<Library> = LazyLock::new(|| Library::new(c"libGLX.so.0"));
 
 /// GL internal format for D32F imports.
 const GL_DEPTH_COMPONENT32F: u32 = 0x8CAC;
+/// GL internal format for D32S8 imports (depth-aspect-only use).
+const GL_DEPTH32F_STENCIL8: u32 = 0x8CAD;
 
 pub struct GlData {
     session_data: Arc<SessionCreateInfo>,
@@ -795,18 +797,24 @@ impl GraphicsBackend for GlData {
     }
 }
 
-/// Texel footprint for the SHM Vulkan depth format: D32F-only in prod.
+/// Texel footprint for the SHM Vulkan depth formats. D32S8 counts the
+/// full combined texel (4 depth + 1 stencil + 3 pad = 8); the bound only
+/// sizes the import, and the copy is depth-aspect-only.
 fn depth_texel_bytes(vk_format: i32) -> Option<u64> {
     match vk_format {
         depth_feed::FORMAT_D32F => Some(4),
+        depth_feed::FORMAT_D32S8 => Some(8),
         _ => None,
     }
 }
 
-/// GL internal format for the SHM Vulkan depth format: D32F-only.
+/// GL internal format for the SHM Vulkan depth formats. The import
+/// texture matches the SHM format; the subsequent copy is same-format
+/// (depth-aspect), so no conversion is ever needed.
 fn depth_gl_format(vk_format: i32) -> Option<u32> {
     match vk_format {
         depth_feed::FORMAT_D32F => Some(GL_DEPTH_COMPONENT32F),
+        depth_feed::FORMAT_D32S8 => Some(GL_DEPTH32F_STENCIL8),
         _ => None,
     }
 }
@@ -1029,16 +1037,16 @@ impl Library {
 
 #[cfg(test)]
 mod tests {
-    use super::{GL_DEPTH_COMPONENT32F, depth_gl_format, depth_texel_bytes};
-    use crate::depth_feed::FORMAT_D32F;
+    use super::{GL_DEPTH32F_STENCIL8, GL_DEPTH_COMPONENT32F, depth_gl_format, depth_texel_bytes};
+    use crate::depth_feed::{FORMAT_D32F, FORMAT_D32S8};
 
     #[test]
     fn depth_format_maps_d32f_only() {
         assert_eq!(depth_texel_bytes(FORMAT_D32F), Some(4));
+        assert_eq!(depth_texel_bytes(FORMAT_D32S8), Some(8));
         assert_eq!(depth_texel_bytes(96), None);
-        assert_eq!(depth_texel_bytes(130), None);
         assert_eq!(depth_gl_format(FORMAT_D32F), Some(GL_DEPTH_COMPONENT32F));
+        assert_eq!(depth_gl_format(FORMAT_D32S8), Some(GL_DEPTH32F_STENCIL8));
         assert_eq!(depth_gl_format(96), None);
-        assert_eq!(depth_gl_format(130), None);
     }
 }
