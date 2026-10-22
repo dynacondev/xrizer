@@ -1506,7 +1506,19 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(idx)
         })() {
             Some(i) => i,
-            None => return,
+            None => {
+                // Swapchain-level stall (wedged runtime or exhausted
+                // images): silent here would look identical to a healthy
+                // idle. Once per episode; resets on the next drained copy.
+                if !quiet && !self.depth_stall_warned {
+                    self.depth_stall_warned = true;
+                    warn!(
+                        "depth swapchain acquire/wait timed out (generation {}); plain views this frame",
+                        ctl.generation
+                    );
+                }
+                return;
+            }
         };
         let res = self.backend.import_and_copy_depth_fd(&DepthFdRequest {
             setup_epoch: ctl.setup_epoch,
