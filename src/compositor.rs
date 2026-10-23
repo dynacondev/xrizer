@@ -122,6 +122,15 @@ impl Compositor {
         }
 
         let (display_time, display_period) = ctrl.with_any_graphics_mut::<wait_frame>(());
+        // Trace-level frame pacing log (off unless RUST_LOG enables trace):
+        // one line per WaitGetPoses-driven wait, with the predicted
+        // display time handed to the app. Compare its rate against the
+        // end_frame rate in the same log: waits advancing faster than
+        // ends means poses get predicted more than one frame ahead.
+        trace!(
+            "waited frame: display_time {:?} period {}ns",
+            display_time, display_period
+        );
         self.openxr.display_time.set(display_time);
         self.openxr
             .display_period_nanos
