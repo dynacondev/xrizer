@@ -124,12 +124,16 @@ impl Compositor {
         let (display_time, display_period) = ctrl.with_any_graphics_mut::<wait_frame>(());
         // Trace-level frame pacing log (off unless RUST_LOG enables trace):
         // one line per WaitGetPoses-driven wait, with the predicted
-        // display time handed to the app. Compare its rate against the
-        // end_frame rate in the same log: waits advancing faster than
-        // ends means poses get predicted more than one frame ahead.
+        // display time handed to the app. Thread id separates the render
+        // thread's waits from the pose-updater pump's: two interleaved
+        // streams advancing display_time independently would prove
+        // double-pumping. Compare its rate against the end_frame rate
+        // in the same log: waits advancing faster than ends means poses
+        // get predicted more than one frame ahead.
         trace!(
-            "waited frame: display_time {:?} period {}ns",
-            display_time, display_period
+            "waited frame: display_time {:?} period {}ns tid {:?}",
+            display_time, display_period,
+            std::thread::current().id()
         );
         self.openxr.display_time.set(display_time);
         self.openxr
@@ -1771,6 +1775,15 @@ impl<G: GraphicsBackend> FrameController<G> {
         // plain split. Throttled 5 s; the submit path is untouched.
         {
             self.submit_log_count += 1;
+            // Per-end stamp for the stamp-vs-render-pose audit: compare
+            // against the waited-frame display_times in the same log.
+            // A stamp newer than any wait serving this frame means the
+            // submitted frame claims a time past its render poses.
+            trace!(
+                "end frame: display_time {:?} tid {:?}",
+                display_time,
+                std::thread::current().id()
+            );
             // Repeat detection: same display_time as the previous end
             // means no new app frame (repeat re-present). Expected to
             // stay zero — repeats downstream happen in the runtime.
