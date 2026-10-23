@@ -214,6 +214,30 @@ impl vr::IVRSystem026_Interface for System {
         }
     }
     fn GetProjectionMatrix(&self, eye: vr::EVREye, near_z: f32, far_z: f32) -> vr::HmdMatrix44_t {
+        // Ground-truth clip probe: X-Plane passes its intended near/far
+        // here; we previously assumed 0.01/200 without measuring.
+        // Change-detected info! (init-only in practice, so no spam;
+        // a per-frame caller would show up as repeated lines, which
+        // is itself data). Every call also at debug for rate counting.
+        {
+            use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+            static SEEN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+            static LAST_NEAR: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+            static LAST_FAR: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+            let idx = (eye as usize).min(1);
+            let near_bits = near_z.to_bits();
+            let far_bits = far_z.to_bits();
+            let changed = !SEEN[idx].load(Ordering::Relaxed)
+                || LAST_NEAR[idx].load(Ordering::Relaxed) != near_bits
+                || LAST_FAR[idx].load(Ordering::Relaxed) != far_bits;
+            if changed {
+                SEEN[idx].store(true, Ordering::Relaxed);
+                LAST_NEAR[idx].store(near_bits, Ordering::Relaxed);
+                LAST_FAR[idx].store(far_bits, Ordering::Relaxed);
+                log::info!("GetProjectionMatrix eye={eye:?} near={near_z} far={far_z}");
+            }
+        }
+        log::debug!("GetProjectionMatrix eye={eye:?} near={near_z} far={far_z}");
         // https://github.com/ValveSoftware/openvr/wiki/IVRSystem::GetProjectionRaw
         let [mut left, mut right, mut up, mut down] = [0.0; 4];
         self.GetProjectionRaw(eye, &mut left, &mut right, &mut down, &mut up);
