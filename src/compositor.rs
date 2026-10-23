@@ -1818,7 +1818,23 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
 
         // Depth path first; any gate failure falls through to the plain path.
-        if self.try_end_frame_with_depth(session_data, system, display_time, overlays) {
+        // TEMPORARY rotation-only-group diagnostic (remove once pinned):
+        // per-end depth identity. A plain end means the server gets no
+        // depth layer for this app frame and serves straight repeats
+        // (client timewarp: rotation only) until depth resumes — the
+        // prime suspect for the every-2nd/3rd-group symptom. Generation
+        // must advance every end; a repeated gen is a reused (stale)
+        // depth frame hiding inside a "with depth" count.
+        let with_depth =
+            self.try_end_frame_with_depth(session_data, system, display_time, overlays);
+        trace!(
+            "end frame: display_time {:?} tid {:?} depth {} gen {:?}",
+            display_time,
+            std::thread::current().id(),
+            with_depth,
+            self.depth_armed_generation,
+        );
+        if with_depth {
             self.depth_armed_frames += 1;
             return;
         }
