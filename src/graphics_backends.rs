@@ -111,6 +111,7 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 /// so import size, bound check, and cache key classes are identical to the
 /// old `(w, h)` request. `seg_len` is gone: it only ever fed debug logs
 /// (always 128 whenever a request is built).
+#[derive(Copy, Clone)]
 pub struct DepthFdRequest {
     pub setup_epoch: u32,
     pub vk_format: i32,

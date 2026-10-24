@@ -20,6 +20,29 @@ const GL_DEPTH_COMPONENT32F: u32 = 0x8CAC;
 /// GL internal format for D32S8 imports (depth-aspect-only use).
 const GL_DEPTH32F_STENCIL8: u32 = 0x8CAD;
 
+/// FD import cache key (B5): (epoch, eye dims, format, mem FDs, sem FDs).
+///
+/// Crash/restart reuses epoch numbering (new process restarts epoch at 1)
+/// with different FD numbers; keying on FD identity forces a reimport on
+/// that collision instead of sampling wrong memory. Pure (no GL) so unit
+/// tests cover it.
+///
+/// Cheap because FDs are stable per epoch: the producer publishes one FD
+/// set per setup and never rewrites it mid-epoch, so the key comparison
+/// is six integer compares with no syscall.
+pub type FdCacheKey = (u32, u32, u32, i32, [i32; 3], [i32; 3]);
+
+pub fn depth_fd_cache_key(req: &DepthFdRequest) -> FdCacheKey {
+    (
+        req.setup_epoch,
+        req.eye_w,
+        req.eye_h,
+        req.vk_format,
+        req.mem_fds,
+        req.sem_fds,
+    )
+}
+
 pub struct GlData {
     session_data: Arc<SessionCreateInfo>,
     images: Vec<u32>,
@@ -35,7 +58,7 @@ pub struct GlData {
     /// import for an epoch never succeeds later (FDs are fixed per epoch),
     /// so retrying every submit just burns ~20 ms/frame on blocking GL
     /// errors. Skip until the key changes or the cooldown elapses.
-    fd_backoff: KeyedBackoff<(u32, u32, u32, i32)>,
+    fd_backoff: KeyedBackoff<FdCacheKey>,
 }
 
 #[derive(Copy, Clone, Default)]
@@ -50,6 +73,8 @@ struct DepthFdCache {
     eye_w: u32,
     eye_h: u32,
     vk_format: i32,
+    mem_fds: [i32; 3],
+    sem_fds: [i32; 3],
     alloc_bytes: u32,
     slots: [DepthFdSlot; 3],
     /// (epoch, generation) of the last semaphore wait. Survives session restarts
@@ -529,19 +554,21 @@ impl GraphicsBackend for GlData {
             return inert();
         }
         let dst = self.depth_images[req.depth_image_index];
-        // Reimport on epoch/dims/format change (old GL objects first).
-        // Full-mirror dims are exactly `eye * 2` (callers only arm even
-        // widths), so the key classes are identical to the old (w, h) key.
-        let key = (
-            req.setup_epoch,
-            req.eye_w,
-            req.eye_h,
-            req.vk_format,
-        );
-        let cached_key = self
-            .depth_fd
-            .as_ref()
-            .map(|c| (c.epoch, c.eye_w, c.eye_h, c.vk_format));
+        // Reimport on epoch/dims/format/FD-set change (old GL objects
+        // first). FD identity is in the key (B5): an epoch-number restart
+        // collision (new process, same epoch, different FDs) reimports
+        // instead of sampling the old process's memory.
+        let key = depth_fd_cache_key(req);
+        let cached_key = self.depth_fd.as_ref().map(|c| {
+            (
+                c.epoch,
+                c.eye_w,
+                c.eye_h,
+                c.vk_format,
+                c.mem_fds,
+                c.sem_fds,
+            )
+        });
         if cached_key != Some(key) {
             // Failed imports never heal for this key (FDs are fixed per
             // epoch): skip the ~20 ms of blocking GL errors until the key
@@ -599,6 +626,8 @@ impl GraphicsBackend for GlData {
                         eye_w: req.eye_w,
                         eye_h: req.eye_h,
                         vk_format: req.vk_format,
+                        mem_fds: req.mem_fds,
+                        sem_fds: req.sem_fds,
                         alloc_bytes: req.alloc_bytes,
                         slots,
                         last_waited: None,
@@ -737,6 +766,34 @@ impl GraphicsBackend for GlData {
                 );
             }
             unsafe { gl::Flush() };
+            // B6: fence the fresh copy before the caller releases the
+            // depth image. Bounded wait so a stalled GPU degrades to a
+            // plain frame (correct backpressure) instead of letting the
+            // runtime sample a torn/flat copy. Timeout/fail returns
+            // copied=false with the existing copy-failed reason; the
+            // fence stays pending so the later drain still acks it.
+            // UNVALIDATED on live GL (no GL context in tests): ships on
+            // reasoning + full suite green.
+            let fresh_status = unsafe {
+                gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, 5_000_000)
+            };
+            if fresh_status == gl::WAIT_FAILED {
+                cache.pending.pop();
+                unsafe { gl::DeleteSync(sync) };
+                return DepthFdResult {
+                    copied: false,
+                    ack_gen: ack,
+                };
+            } else if fresh_status != gl::ALREADY_SIGNALED
+                && fresh_status != gl::CONDITION_SATISFIED
+            {
+                // TIMEOUT_EXPIRED (or unexpected): GPU hasn't finished.
+                // Plain frame this tick; keep the fence for the drain.
+                return DepthFdResult {
+                    copied: false,
+                    ack_gen: ack,
+                };
+            }
         }
         DepthFdResult {
             copied: true,
@@ -1057,5 +1114,40 @@ mod tests {
         assert_eq!(depth_gl_format(FORMAT_D32F), Some(GL_DEPTH_COMPONENT32F));
         assert_eq!(depth_gl_format(FORMAT_D32S8), Some(GL_DEPTH32F_STENCIL8));
         assert_eq!(depth_gl_format(96), None);
+    }
+
+    #[test]
+    fn fd_cache_key_covers_epoch_restart() {
+        use super::depth_fd_cache_key;
+        use crate::graphics_backends::DepthFdRequest;
+        let base = DepthFdRequest {
+            setup_epoch: 1,
+            vk_format: FORMAT_D32F,
+            mem_fds: [11, 12, 13],
+            sem_fds: [21, 22, 23],
+            generation: 9,
+            depth_image_index: 0,
+            eye_w: 10,
+            eye_h: 10,
+            alloc_bytes: 800,
+        };
+        // Identical setup (generation/index/alloc differ) → same key.
+        let same = DepthFdRequest { generation: 10, depth_image_index: 1, alloc_bytes: 0, ..base };
+        assert_eq!(depth_fd_cache_key(&base), depth_fd_cache_key(&same));
+        // Epoch-restart collision: same epoch number, different FDs →
+        // different key, forcing a reimport (B5).
+        let restart = DepthFdRequest {
+            mem_fds: [31, 32, 33],
+            sem_fds: [41, 42, 43],
+            ..base
+        };
+        assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&restart));
+        // Dims/format changes also reimport.
+        let dims = DepthFdRequest { eye_w: 20, ..base };
+        assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&dims));
+        let fmt = DepthFdRequest { vk_format: FORMAT_D32S8, ..base };
+        assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&fmt));
+        let epoch = DepthFdRequest { setup_epoch: 2, ..base };
+        assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&epoch));
     }
 }

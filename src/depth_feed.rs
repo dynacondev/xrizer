@@ -246,13 +246,53 @@ impl DepthControl {
     /// Staleness against the header timestamp. Future stamps and zero
     /// stamps are stale (clock skew or never published).
     pub fn is_stale(&self, now_mono_ns: u64, max_age_ms: u64) -> bool {
-        if self.time_ns == 0 || self.time_ns > now_mono_ns {
-            return true;
+        depth_armed_is_stale(self.time_ns, now_mono_ns, max_age_ms)
+    }
+}
+
+/// Armed-depth age predicate (B7): chain-time re-validation of the
+/// timestamp captured at arm time. Pure so tests use synthetic
+/// timestamps with no SHM. Same semantics as the header gate:
+/// zero/future stamps are stale; otherwise age must be within bound.
+/// `max_age_ms` is clamped 1..=60000 upstream, so the multiply cannot
+/// overflow (see `is_stale` comment).
+pub fn depth_armed_is_stale(armed_time_ns: u64, now_mono_ns: u64, max_age_ms: u64) -> bool {
+    if armed_time_ns == 0 || armed_time_ns > now_mono_ns {
+        return true;
+    }
+    now_mono_ns.saturating_sub(armed_time_ns) > max_age_ms.saturating_mul(1_000_000)
+}
+
+/// Reason-coded SHM read failure (B1). Every `read_control` miss now
+/// names its cause so torn seqlocks and unlink/recreate races are
+/// attributable instead of silent-plain.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReadFail {
+    /// `shm_open`/`fstat`/`mmap` failed: plugin absent or mid-recreate.
+    Absent,
+    /// Segment length is not exactly 128 (mid-recreate, foreign writer).
+    WrongSize,
+    /// Header magic mismatch (foreign writer).
+    BadMagic,
+    /// Header version mismatch (stale v1 / future writer).
+    BadVersion,
+    /// Seqlock disagree after bounded retries (concurrent publish).
+    TornSeqlock,
+    /// Writer held the odd seq across all retries (stuck publisher).
+    StuckWriter,
+}
+
+impl ReadFail {
+    /// Stable short reason for heartbeat/skip accounting.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            ReadFail::Absent => "shm-absent",
+            ReadFail::WrongSize => "shm-wrong-size",
+            ReadFail::BadMagic => "shm-bad-magic",
+            ReadFail::BadVersion => "shm-bad-version",
+            ReadFail::TornSeqlock => "shm-torn",
+            ReadFail::StuckWriter => "shm-stuck-writer",
         }
-        // max_age_ms is clamped to 1..=60000 by max_age_ms(), so
-        // max_age_ms * 1_000_000 <= 6e10 ns: saturating_mul can never
-        // overflow u64 here (do NOT "fix" with u128).
-        now_mono_ns.saturating_sub(self.time_ns) > max_age_ms.saturating_mul(1_000_000)
     }
 }
 
@@ -296,7 +336,10 @@ unsafe impl Send for MappedSeg {}
 /// `WaitGetPoses` on another thread) and a held fd would mask a producer
 /// `shm_unlink`+recreate/epoch bump — so every `read_control` still maps
 /// fresh here.
-fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
+///
+/// Reason-coded (B1): absent vs wrong-size are distinct so
+/// unlink/recreate races attribute instead of vanishing.
+fn map_segment(name: &CString, write: bool) -> Result<MappedSeg, ReadFail> {
     let oflag = (if write { libc::O_RDWR } else { libc::O_RDONLY }) | libc::O_CLOEXEC;
     let fd = unsafe { libc::shm_open(name.as_ptr(), oflag, 0o600) };
     if fd < 0 {
@@ -308,27 +351,27 @@ fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
             LAST_ABSENT_LOG_NS.store(now, Ordering::Relaxed);
             debug!("depth feed: shm_open failed (absent)");
         }
-        return None;
+        return Err(ReadFail::Absent);
     }
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         unsafe { libc::close(fd) };
-        return None;
+        return Err(ReadFail::Absent);
     }
     let map_len = stat.st_size as usize;
     // FD mode needs exactly the 128-byte header: anything else belongs to
     // a dead run (unlinked, mid-recreate) or a foreign writer.
     if map_len != HEADER_SIZE_V2 {
         unsafe { libc::close(fd) };
-        return None;
+        return Err(ReadFail::WrongSize);
     }
     let prot = libc::PROT_READ | (if write { libc::PROT_WRITE } else { 0 });
     let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, prot, libc::MAP_SHARED, fd, 0) };
     if ptr == libc::MAP_FAILED {
         unsafe { libc::close(fd) };
-        return None;
+        return Err(ReadFail::Absent);
     }
-    Some(MappedSeg {
+    Ok(MappedSeg {
         fd,
         ptr,
         len: map_len,
@@ -359,11 +402,13 @@ impl DepthFeed {
     }
 
     /// Seqlock-read of the v2 control header. No pixel copy (FD mode has
-    /// no pixel plane). Returns `None` on absent/wrong-size/torn/foreign
-    /// data so callers fall back to plain views.
-    pub fn read_control(&self) -> Option<DepthControl> {
+    /// no pixel plane). Reason-coded (B1): absent/wrong-size/torn/foreign
+    /// data each name their cause so callers attribute instead of
+    /// falling back to plain silently.
+    pub fn read_control(&self) -> Result<DepthControl, ReadFail> {
         let map = map_segment(&self.name, false)?;
         let (ptr, map_len) = (map.ptr, map.len);
+        let mut saw_torn = false;
         for _ in 0..4 {
             let seq1 = unsafe { read_seq(ptr) };
             if seq1 & 1 == 1 {
@@ -371,15 +416,16 @@ impl DepthFeed {
                 continue;
             }
             if unsafe { read_u32(ptr, 0) } != SHM_MAGIC {
-                return None;
+                return Err(ReadFail::BadMagic);
             }
             if unsafe { read_u32(ptr, 4) } != SHM_VERSION_V2 {
-                return None;
+                return Err(ReadFail::BadVersion);
             }
             // Copy under seq1; the closing seq check covers torn reads.
             let h = unsafe { read_header_v2(ptr) };
             let seq2 = unsafe { read_seq(ptr) };
             if seq1 != seq2 {
+                saw_torn = true;
                 continue;
             }
             // Trust only the copied snapshot from here on — except the ack:
@@ -389,7 +435,11 @@ impl DepthFeed {
             // mmap is page-aligned and CONSUMED_GEN_OFF is 8-aligned,
             // so this is always aligned.
             if h.magic != SHM_MAGIC || h.version != SHM_VERSION_V2 {
-                return None;
+                return Err(if h.magic != SHM_MAGIC {
+                    ReadFail::BadMagic
+                } else {
+                    ReadFail::BadVersion
+                });
             }
             let consumed_gen = unsafe {
                 (ptr as *const u8)
@@ -399,7 +449,7 @@ impl DepthFeed {
                     .map(|a| a.load(Ordering::Acquire))
                     .unwrap_or(h.consumed_gen)
             };
-            return Some(DepthControl {
+            return Ok(DepthControl {
                 version: h.version,
                 mode: h.mode,
                 setup_epoch: h.setup_epoch,
@@ -420,7 +470,11 @@ impl DepthFeed {
                 alloc_bytes: h.alloc_bytes,
             });
         }
-        None
+        if saw_torn {
+            Err(ReadFail::TornSeqlock)
+        } else {
+            Err(ReadFail::StuckWriter)
+        }
     }
 
     /// Record the highest fully-copied generation. Release store pairs
@@ -428,8 +482,9 @@ impl DepthFeed {
     /// (benign). Always stores (bounded even-seq spin first): a missed
     /// ack stalls the producer ring. Call ONLY after both eyes copied.
     pub fn store_consumed(&self, generation: u64) -> bool {
-        let Some(map) = map_segment(&self.name, true) else {
-            return false;
+        let map = match map_segment(&self.name, true) {
+            Ok(m) => m,
+            Err(_) => return false,
         };
         if map.len != HEADER_SIZE_V2 {
             return false;
@@ -848,9 +903,10 @@ mod tests {
             hdr[2] = 2; // even seq
             std::ptr::copy_nonoverlapping(hdr.as_ptr(), ptr as *mut u32, 16);
         });
-        assert!(
-            DepthFeed::open_for_test(&name).read_control().is_none(),
-            "v1 size must miss"
+        assert_eq!(
+            DepthFeed::open_for_test(&name).read_control().unwrap_err(),
+            ReadFail::WrongSize,
+            "v1 size must miss as wrong-size"
         );
         // 128-byte segment stamped version 1: wrong version.
         let name2 = format!("/xrizer-depth-test-{pid}-v1b");
@@ -882,9 +938,10 @@ mod tests {
             (ptr as *mut XdShmHeaderV2).write_unaligned(hdr);
             (ptr as *mut u32).add(2).write_volatile(2);
         });
-        assert!(
-            DepthFeed::open_for_test(&name2).read_control().is_none(),
-            "version 1 must miss"
+        assert_eq!(
+            DepthFeed::open_for_test(&name2).read_control().unwrap_err(),
+            ReadFail::BadVersion,
+            "version 1 must miss as bad-version"
         );
     }
 
@@ -897,9 +954,10 @@ mod tests {
             (seg.ptr as *mut u32).write_volatile(0xdead_beef);
             (seg.ptr as *mut u32).add(2).write_volatile(2);
         }
-        assert!(
-            DepthFeed::open_for_test(&name).read_control().is_none(),
-            "bad magic must miss"
+        assert_eq!(
+            DepthFeed::open_for_test(&name).read_control().unwrap_err(),
+            ReadFail::BadMagic,
+            "bad magic must miss as bad-magic"
         );
         // Oversized segment: foreign writer, not our 128B header.
         let name2 = format!("/xrizer-depth-test-{pid}-big");
@@ -909,9 +967,10 @@ mod tests {
             (ptr as *mut u32).add(1).write_volatile(SHM_VERSION_V2);
             (ptr as *mut u32).add(2).write_volatile(2);
         });
-        assert!(
-            DepthFeed::open_for_test(&name2).read_control().is_none(),
-            "wrong size must miss"
+        assert_eq!(
+            DepthFeed::open_for_test(&name2).read_control().unwrap_err(),
+            ReadFail::WrongSize,
+            "wrong size must miss as wrong-size"
         );
     }
 
@@ -1029,21 +1088,77 @@ mod tests {
     }
 
     #[test]
-    fn stuck_odd_seqlock_returns_none() {
+    fn stuck_odd_seqlock_reports_stuck_writer() {
         let name = format!("/xrizer-depth-test-{}-odd", std::process::id());
         let seg = make_seg_v2(&name, 8, 2, 1, MODE_FD, |_| {});
         unsafe {
             (seg.ptr as *mut u32).add(2).write_volatile(3);
         }
         let feed = DepthFeed::open_for_test(&name);
-        assert!(feed.read_control().is_none());
+        assert_eq!(
+            feed.read_control().unwrap_err(),
+            ReadFail::StuckWriter,
+            "odd seq held must report stuck-writer"
+        );
     }
 
     #[test]
-    fn absent_returns_none() {
+    fn torn_seqlock_reports_torn() {
+        // Even seq at entry, torn mid-copy: seq1 != seq2 on every retry.
+        // Simulate by stamping an odd entry seq is not enough (that is
+        // stuck-writer); instead flip the closing seq after the magic and
+        // version checks pass. The simplest deterministic torn is a
+        // writer that bumps seq between the two reads: emulate with a
+        // segment whose seq is even but whose header copy straddles a
+        // concurrent publish — here we force the torn path by writing
+        // seq=2 at entry and racing it is timing-dependent, so instead
+        // assert the reason mapping directly: TornSeqlock names shm-torn.
+        assert_eq!(ReadFail::TornSeqlock.reason(), "shm-torn");
+        assert_eq!(ReadFail::StuckWriter.reason(), "shm-stuck-writer");
+        assert_eq!(ReadFail::Absent.reason(), "shm-absent");
+        assert_eq!(ReadFail::WrongSize.reason(), "shm-wrong-size");
+        assert_eq!(ReadFail::BadMagic.reason(), "shm-bad-magic");
+        assert_eq!(ReadFail::BadVersion.reason(), "shm-bad-version");
+    }
+
+    #[test]
+    fn absent_reports_absent() {
         let feed = DepthFeed::open_for_test("/xrizer-depth-test-definitely-absent");
-        assert!(feed.read_control().is_none());
+        assert_eq!(
+            feed.read_control().unwrap_err(),
+            ReadFail::Absent,
+            "absent SHM must report absent"
+        );
         assert!(!feed.store_consumed(1));
+    }
+
+    #[test]
+    fn armed_age_predicate_synthetic() {
+        // B7 armed variant: pure, no SHM. Bound 100ms.
+        let now = 1_000_000_000u64;
+        // Fresh: 50ms old.
+        assert!(!depth_armed_is_stale(
+            now - 50_000_000,
+            now,
+            100
+        ));
+        // Boundary: exactly 100ms is fresh (strict >).
+        assert!(!depth_armed_is_stale(
+            now - 100_000_000,
+            now,
+            100
+        ));
+        // Stale: 101ms old.
+        assert!(depth_armed_is_stale(
+            now - 101_000_000,
+            now,
+            100
+        ));
+        // Zero and future stamps are stale.
+        assert!(depth_armed_is_stale(0, now, 100));
+        assert!(depth_armed_is_stale(now + 1, now, 100));
+        // Large bound clamps upstream; predicate itself is raw.
+        assert!(!depth_armed_is_stale(now - 1_000_000, now, 60_000));
     }
 
     #[test]
