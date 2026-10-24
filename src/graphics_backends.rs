@@ -96,11 +96,20 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         DepthFdResult {
             copied: false,
             ack_gen: None,
+            full_waits: 0,
+            overflow_drops: 0,
         }
     }
 
     /// Delete FD import GL objects (reimport path / teardown).
-    fn drop_depth_imports(&mut self) {}
+    /// Returns the highest still-pending generation that was already
+    /// signaled at drop time (R8: zero-timeout poll, never blocking),
+    /// so the caller can ack it instead of orphaning. `None` when
+    /// nothing signaled. Deletes always happen (no leak); the return is
+    /// observability + ack preservation only.
+    fn drop_depth_imports(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// One FD-mode frame for [`GraphicsBackend::import_and_copy_depth_fd`].
@@ -133,6 +142,15 @@ pub struct DepthFdResult {
     pub copied: bool,
     /// Highest fully-copied generation: store to `consumed_gen`.
     pub ack_gen: Option<u64>,
+    /// R5: number of bounded waits that hit the full 5 ms bound this
+    /// call (trailing drain + B6 fresh wait). Observability only; bounds
+    /// unchanged. Surfaced in the heartbeat as `full-wait`.
+    pub full_waits: u32,
+    /// R16: fence-backlog overflow drops this call (oldest pending
+    /// fence deleted while still unsignaled). Observability only; the
+    /// drop + orphan-ack behavior is unchanged. Surfaced in the
+    /// heartbeat as `fence-overflow` alongside `ack-fail`.
+    pub overflow_drops: u32,
 }
 
 #[derive(macros::Backends, TryInto, From)]

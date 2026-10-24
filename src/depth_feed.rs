@@ -230,24 +230,82 @@ impl DepthControl {
     /// (D32F preferred, D32S8 fallback), plausible dims, exact 128-byte
     /// segment, all FDs real.
     /// `min/max` are mapping range (never gated); `near/far` validity is
-    /// checked separately via [`validate_near_far`].
+    /// checked separately via [`validate_near_far`]. Kept for tests and
+    /// external checks; the submit/quiet paths use [`viability_reason`]
+    /// for named skips.
+    #[allow(dead_code)]
     pub fn is_viable(&self) -> bool {
-        self.version == SHM_VERSION_V2
-            && self.mode == MODE_FD
-            && self.setup_epoch != 0
-            && self.generation != 0
-            && (self.format == FORMAT_D32F || self.format == FORMAT_D32S8)
-            && self.eye_layout == EYE_SIDEBYSIDE
-            && self.seg_len == HEADER_SIZE_V2
-            && self.dims_plausible()
-            && self.fds_valid()
+        self.viability_reason().is_none()
+    }
+
+    /// Pure viability cause (R4): `None` when viable, otherwise the
+    /// specific gate that fails. Single source of truth for
+    /// [`is_viable`]; submit path warns once per episode on the
+    /// returned reason, quiet path records it as the upgrade skip
+    /// reason. Stable strings for heartbeat/skip accounting.
+    pub fn viability_reason(&self) -> Option<&'static str> {
+        if self.version != SHM_VERSION_V2 {
+            return Some("bad-version");
+        }
+        if self.mode != MODE_FD {
+            return Some("mode-not-fd");
+        }
+        if self.setup_epoch == 0 {
+            return Some("epoch-zero");
+        }
+        if self.generation == 0 {
+            return Some("gen-zero");
+        }
+        if self.format != FORMAT_D32F && self.format != FORMAT_D32S8 {
+            return Some("bad-format");
+        }
+        if self.eye_layout != EYE_SIDEBYSIDE {
+            return Some("bad-layout");
+        }
+        if self.seg_len != HEADER_SIZE_V2 {
+            return Some("bad-seg-len");
+        }
+        if !self.dims_plausible() {
+            return Some("bad-dims");
+        }
+        if !self.fds_valid() {
+            return Some("bad-fds");
+        }
+        None
     }
 
     /// Staleness against the header timestamp. Future stamps and zero
-    /// stamps are stale (clock skew or never published).
+    /// stamps are stale (clock skew or never published). Kept for tests;
+    /// prod paths use [`stale_reason`] for named clock-skew skips.
+    #[allow(dead_code)]
     pub fn is_stale(&self, now_mono_ns: u64, max_age_ms: u64) -> bool {
-        depth_armed_is_stale(self.time_ns, now_mono_ns, max_age_ms)
+        stale_reason(self.time_ns, now_mono_ns, max_age_ms).is_some()
     }
+}
+
+/// Stale cause (R9/R10): `None` when fresh, otherwise the specific
+/// reason. Classification stays stale (safe direction: plain views);
+/// callers upgrade future/zero causes to a loud once-per-episode
+/// clock-skew warn instead of silent-plain. Pure so tests use
+/// synthetic timestamps with no SHM.
+pub fn stale_reason(time_ns: u64, now_mono_ns: u64, max_age_ms: u64) -> Option<&'static str> {
+    // `now == 0` means `clock_gettime` failed (R10): everything is
+    // stale, but loudly (clock-skew suspicion) rather than silently.
+    if now_mono_ns == 0 {
+        return Some("stale-zero-clock");
+    }
+    if time_ns == 0 {
+        return Some("stale-zero-stamp");
+    }
+    // Same-machine same-clock future stamps are impossible (R9):
+    // clock skew or torn publish. Stale (safe), but loud.
+    if time_ns > now_mono_ns {
+        return Some("stale-future");
+    }
+    if now_mono_ns.saturating_sub(time_ns) > max_age_ms.saturating_mul(1_000_000) {
+        return Some("stale-aged");
+    }
+    None
 }
 
 /// Armed-depth age predicate (B7): chain-time re-validation of the
@@ -255,12 +313,11 @@ impl DepthControl {
 /// timestamps with no SHM. Same semantics as the header gate:
 /// zero/future stamps are stale; otherwise age must be within bound.
 /// `max_age_ms` is clamped 1..=60000 upstream, so the multiply cannot
-/// overflow (see `is_stale` comment).
+/// overflow (see `is_stale` comment). Delegates to [`stale_reason`]
+/// so future/zero causes stay distinguishable (R9/R10) while the
+/// boolean stays stale (safe direction).
 pub fn depth_armed_is_stale(armed_time_ns: u64, now_mono_ns: u64, max_age_ms: u64) -> bool {
-    if armed_time_ns == 0 || armed_time_ns > now_mono_ns {
-        return true;
-    }
-    now_mono_ns.saturating_sub(armed_time_ns) > max_age_ms.saturating_mul(1_000_000)
+    stale_reason(armed_time_ns, now_mono_ns, max_age_ms).is_some()
 }
 
 /// Reason-coded SHM read failure (B1). Every `read_control` miss now
@@ -370,6 +427,24 @@ fn map_segment(name: &CString, write: bool) -> Result<MappedSeg, ReadFail> {
     if ptr == libc::MAP_FAILED {
         unsafe { libc::close(fd) };
         return Err(ReadFail::Absent);
+    }
+    // R11 post-mmap TOCTOU: the producer may ftruncate between the
+    // fstat above and this mmap (geometry change / recreate). A shrink
+    // would make volatile reads past the new EOF raise SIGBUS. Re-fstat
+    // after mmap; on size change, unmap + report WrongSize so the caller
+    // degrades to plain and retries next tick. Over-sizing races the
+    // same way (stale mapping length) and retry the same path.
+    // Harness limitation: the ftruncate-in-the-window race cannot be
+    // deterministically simulated in-test (requires fault injection
+    // between two syscalls), so this is code-review-grade + live-run
+    // observable via the shm-wrong-size skip counter.
+    let mut stat2: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat2) } != 0 || stat2.st_size as usize != map_len {
+        unsafe {
+            libc::munmap(ptr, map_len);
+            libc::close(fd);
+        }
+        return Err(ReadFail::WrongSize);
     }
     Ok(MappedSeg {
         fd,
@@ -1221,5 +1296,86 @@ mod tests {
 
         restore("XRIZER_DEPTH_SHM", orig_master);
         restore("XRIZER_DEPTH_MAX_AGE_MS", orig_age);
+    }
+
+    #[test]
+    fn viability_reason_names_each_cause() {
+        // R4: pure cause for every non-viable header; is_viable stays the
+        // single-source gate.
+        use super::DepthControl;
+        fn viable() -> DepthControl {
+            DepthControl {
+                version: SHM_VERSION_V2,
+                mode: MODE_FD,
+                setup_epoch: 7,
+                w: 8,
+                h: 2,
+                format: FORMAT_D32F,
+                eye_layout: EYE_SIDEBYSIDE,
+                generation: 3,
+                time_ns: 1,
+                min_depth: 0.0,
+                max_depth: 1.0,
+                mem_fds: [11, 12, 13],
+                sem_fds: [21, 22, 23],
+                near_z: 0.01,
+                far_z: 200.0,
+                consumed_gen: 0,
+                seg_len: HEADER_SIZE_V2,
+                alloc_bytes: 64,
+            }
+        }
+        assert_eq!(viable().viability_reason(), None);
+        assert!(viable().is_viable());
+        let mut c = viable();
+        c.version = 1;
+        assert_eq!(c.viability_reason(), Some("bad-version"));
+        let mut c = viable();
+        c.mode = 0;
+        assert_eq!(c.viability_reason(), Some("mode-not-fd"));
+        let mut c = viable();
+        c.setup_epoch = 0;
+        assert_eq!(c.viability_reason(), Some("epoch-zero"));
+        let mut c = viable();
+        c.generation = 0;
+        assert_eq!(c.viability_reason(), Some("gen-zero"));
+        let mut c = viable();
+        c.format = 96;
+        assert_eq!(c.viability_reason(), Some("bad-format"));
+        let mut c = viable();
+        c.eye_layout = 0;
+        assert_eq!(c.viability_reason(), Some("bad-layout"));
+        let mut c = viable();
+        c.seg_len = 64;
+        assert_eq!(c.viability_reason(), Some("bad-seg-len"));
+        let mut c = viable();
+        c.w = 7;
+        assert_eq!(c.viability_reason(), Some("bad-dims"));
+        let mut c = viable();
+        c.mem_fds = [-1, 12, 13];
+        assert_eq!(c.viability_reason(), Some("bad-fds"));
+        let mut c = viable();
+        c.sem_fds = [21, 2, 23];
+        assert_eq!(c.viability_reason(), Some("bad-fds"));
+        // D32S8 still viable.
+        let mut c = viable();
+        c.format = FORMAT_D32S8;
+        assert_eq!(c.viability_reason(), None);
+        assert!(c.is_viable());
+    }
+
+    #[test]
+    fn stale_reason_distinguishes_clock_skew() {
+        // R9/R10: future/zero stay stale (safe) but name the cause.
+        use super::stale_reason;
+        let now = 1_000_000_000u64;
+        assert_eq!(stale_reason(now - 50_000_000, now, 100), None);
+        assert_eq!(
+            stale_reason(now - 500_000_000, now, 100),
+            Some("stale-aged")
+        );
+        assert_eq!(stale_reason(0, now, 100), Some("stale-zero-stamp"));
+        assert_eq!(stale_reason(now + 1, now, 100), Some("stale-future"));
+        assert_eq!(stale_reason(now - 1_000, 0, 100), Some("stale-zero-clock"));
     }
 }

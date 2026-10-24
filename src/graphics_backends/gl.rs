@@ -20,17 +20,23 @@ const GL_DEPTH_COMPONENT32F: u32 = 0x8CAC;
 /// GL internal format for D32S8 imports (depth-aspect-only use).
 const GL_DEPTH32F_STENCIL8: u32 = 0x8CAD;
 
-/// FD import cache key (B5): (epoch, eye dims, format, mem FDs, sem FDs).
+/// FD import cache key (B5+R7): (epoch, eye dims, format, mem FDs,
+/// sem FDs, alloc_bytes).
 ///
 /// Crash/restart reuses epoch numbering (new process restarts epoch at 1)
 /// with different FD numbers; keying on FD identity forces a reimport on
 /// that collision instead of sampling wrong memory. Pure (no GL) so unit
 /// tests cover it.
 ///
+/// R7: `alloc_bytes` is in the key because the driver allocation can pad
+/// and grow within an epoch (padding growth, not a new setup). Without
+/// it the import keeps the stale size until the next epoch bump and the
+/// later copy fails generically; with it a growth reimports immediately.
+///
 /// Cheap because FDs are stable per epoch: the producer publishes one FD
 /// set per setup and never rewrites it mid-epoch, so the key comparison
-/// is six integer compares with no syscall.
-pub type FdCacheKey = (u32, u32, u32, i32, [i32; 3], [i32; 3]);
+/// is integer compares with no syscall.
+pub type FdCacheKey = (u32, u32, u32, i32, [i32; 3], [i32; 3], u32);
 
 pub fn depth_fd_cache_key(req: &DepthFdRequest) -> FdCacheKey {
     (
@@ -40,6 +46,7 @@ pub fn depth_fd_cache_key(req: &DepthFdRequest) -> FdCacheKey {
         req.vk_format,
         req.mem_fds,
         req.sem_fds,
+        req.alloc_bytes,
     )
 }
 
@@ -531,6 +538,8 @@ impl GraphicsBackend for GlData {
         let inert = || DepthFdResult {
             copied: false,
             ack_gen: None,
+            full_waits: 0,
+            overflow_drops: 0,
         };
         if !self.fd_import_viable {
             return inert();
@@ -557,7 +566,8 @@ impl GraphicsBackend for GlData {
         // Reimport on epoch/dims/format/FD-set change (old GL objects
         // first). FD identity is in the key (B5): an epoch-number restart
         // collision (new process, same epoch, different FDs) reimports
-        // instead of sampling the old process's memory.
+        // instead of sampling the old process's memory. R7: alloc_bytes
+        // is in the key, so driver padding growth reimports too.
         let key = depth_fd_cache_key(req);
         let cached_key = self.depth_fd.as_ref().map(|c| {
             (
@@ -567,8 +577,11 @@ impl GraphicsBackend for GlData {
                 c.vk_format,
                 c.mem_fds,
                 c.sem_fds,
+                c.alloc_bytes,
             )
         });
+        // R8: signaled gens preserved across the reimport drop below.
+        let mut dropped_ack: Option<u64> = None;
         if cached_key != Some(key) {
             // Failed imports never heal for this key (FDs are fixed per
             // epoch): skip the ~20 ms of blocking GL errors until the key
@@ -618,7 +631,11 @@ impl GraphicsBackend for GlData {
                     req.alloc_bytes,
                 ),
             }
-            self.drop_depth_imports();
+            // R8: preserve signaled acks across the reimport drop. The old
+            // cache's pending fences are polled (zero-timeout) inside
+            // `drop_depth_imports`; any signaled gens merge into this
+            // call's ack instead of orphaning.
+            dropped_ack = self.drop_depth_imports();
             match Self::import_fd_slots(req, bpp, internal) {
                 Some(slots) => {
                     self.depth_fd = Some(DepthFdCache {
@@ -647,7 +664,20 @@ impl GraphicsBackend for GlData {
         }
         // Drain completed copies; ack only fully-copied generations so the
         // producer never reuses a slot whose copy is still in flight.
-        let mut ack = None;
+        //
+        // R5 worst-case app-thread stall accounting (bounds UNCHANGED):
+        // each `import_and_copy_depth_fd` call can block up to
+        // 5 ms (trailing drain below) + 5 ms (B6 fresh wait after
+        // `FenceSync`), and the compositor calls it up to twice per
+        // frame (submit + end-frame upgrade), so the worst case is
+        // ~20 ms/frame under full GPU pressure. Long waits only happen
+        // when the GPU is genuinely behind (correct backpressure); the
+        // `full_waits` counter below records how often we actually hit
+        // the full bound, surfaced in the heartbeat for live-run
+        // observability. No retunes: 5 ms bounds stay as-is.
+        let mut ack = dropped_ack;
+        let mut full_waits: u32 = 0;
+        let mut overflow_drops: u32 = 0;
         if let Some(cache) = self.depth_fd.as_mut() {
             let mut i = 0;
             while i < cache.pending.len() {
@@ -670,6 +700,7 @@ impl GraphicsBackend for GlData {
             // the ack track the newest generation instead of trailing a full
             // frame. Long waits only happen under real GPU pressure, where
             // slowing submissions is the correct backpressure anyway.
+            // R5: a TIMEOUT_EXPIRED here means we blocked the full 5 ms.
             if let Some(&(bits, g)) = cache.pending.last() {
                 let sync = bits as gl::types::GLsync;
                 let status =
@@ -681,6 +712,11 @@ impl GraphicsBackend for GlData {
                 } else if status == gl::WAIT_FAILED {
                     unsafe { gl::DeleteSync(sync) };
                     cache.pending.pop();
+                } else {
+                    // TIMEOUT_EXPIRED (or unexpected): blocked the full
+                    // bound without completion. Counted for the heartbeat;
+                    // the fence stays pending so the drain still acks it.
+                    full_waits += 1;
                 }
             }
         }
@@ -688,18 +724,28 @@ impl GraphicsBackend for GlData {
             return DepthFdResult {
                 copied: false,
                 ack_gen: ack,
+                full_waits,
+                overflow_drops,
             };
         };
         // Wait once per generation (binary semaphores; skip on re-copy).
-        // Recorded only on a clean wait: a failed wait (e.g. no current
-        // GL context on the upgrade path) must not mark the generation
-        // consumed, or the next copy would skip its wait and risk tearing.
+        // R6 invariant (pinned): the dedup below must NEVER skip the FIRST
+        // wait for an (epoch, generation). `last_waited` starts as None
+        // (and resets to None on every reimport above), and is set ONLY
+        // after a clean wait (`waited_ok`, GL context current, no error).
+        // A failed wait (e.g. no current GL context on the upgrade path)
+        // therefore never marks the generation consumed, so the next copy
+        // re-waits properly and can never tear. Verified by read: the
+        // only assignment is guarded by `waited_ok` below; no other
+        // writer exists. No behavior change.
         let slot = (req.generation % 3) as usize;
         if cache.last_waited != Some((req.setup_epoch, req.generation)) {
             let Some(wait) = DEPTH_EXT.wait_semaphore else {
                 return DepthFdResult {
                     copied: false,
                     ack_gen: ack,
+                    full_waits,
+                    overflow_drops,
                 };
             };
             let waited_ok = unsafe {
@@ -719,6 +765,8 @@ impl GraphicsBackend for GlData {
                 return DepthFdResult {
                     copied: false,
                     ack_gen: ack,
+                    full_waits,
+                    overflow_drops,
                 };
             }
             cache.last_waited = Some((req.setup_epoch, req.generation));
@@ -749,6 +797,8 @@ impl GraphicsBackend for GlData {
             return DepthFdResult {
                 copied: false,
                 ack_gen: ack,
+                full_waits,
+                overflow_drops,
             };
         }
         let sync = unsafe { gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) };
@@ -757,10 +807,14 @@ impl GraphicsBackend for GlData {
             // Bound the fence trail: a GPU that never signals would
             // otherwise grow this Vec forever (one leak per submit).
             // Healthy GPUs drain to 0-1; drop the oldest on overflow.
+            // R16: the drop orphans that gen's ack (behavior unchanged);
+            // the overflow counter below surfaces it in the heartbeat
+            // alongside ack-fail so a wedged GPU is observable.
             const MAX_PENDING_FENCES: usize = 16;
             if cache.pending.len() > MAX_PENDING_FENCES {
                 let (old_bits, old_gen) = cache.pending.remove(0);
                 unsafe { gl::DeleteSync(old_bits as gl::types::GLsync) };
+                overflow_drops += 1;
                 warn!(
                     "depth FD fence backlog overflow, dropping oldest gen {old_gen} (GPU not signaling?)"
                 );
@@ -774,6 +828,8 @@ impl GraphicsBackend for GlData {
             // fence stays pending so the later drain still acks it.
             // UNVALIDATED on live GL (no GL context in tests): ships on
             // reasoning + full suite green.
+            // R5: TIMEOUT_EXPIRED here = full 5 ms block; counted above
+            // for the heartbeat (observability only, bound unchanged).
             let fresh_status = unsafe {
                 gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, 5_000_000)
             };
@@ -783,41 +839,63 @@ impl GraphicsBackend for GlData {
                 return DepthFdResult {
                     copied: false,
                     ack_gen: ack,
+                    full_waits,
+                    overflow_drops,
                 };
             } else if fresh_status != gl::ALREADY_SIGNALED
                 && fresh_status != gl::CONDITION_SATISFIED
             {
                 // TIMEOUT_EXPIRED (or unexpected): GPU hasn't finished.
                 // Plain frame this tick; keep the fence for the drain.
+                full_waits += 1;
                 return DepthFdResult {
                     copied: false,
                     ack_gen: ack,
+                    full_waits,
+                    overflow_drops,
                 };
             }
         }
         DepthFdResult {
             copied: true,
             ack_gen: ack,
+            full_waits,
+            overflow_drops,
         }
     }
 
-    fn drop_depth_imports(&mut self) {
-        if let Some(cache) = self.depth_fd.take() {
-            unsafe {
-                for (bits, _) in cache.pending {
-                    gl::DeleteSync(bits as gl::types::GLsync);
+    /// R8: drain-then-delete. Pending fences are polled with a
+    /// zero-timeout `ClientWaitSync` (NOT blocking) before deletion;
+    /// any signaled gens are returned as the max so the caller can ack
+    /// instead of orphaning. Deletes always happen (no leak): unsignaled
+    /// fences are deleted un-acked (their slot stays un-reused until the
+    /// next successful copy acks a newer gen, same as before). The
+    /// zero-timeout poll cannot stall the app thread; it only converts
+    /// already-complete work into an immediate ack.
+    fn drop_depth_imports(&mut self) -> Option<u64> {
+        let cache = self.depth_fd.take()?;
+        let mut ack = None;
+        unsafe {
+            for (bits, g) in cache.pending {
+                let sync = bits as gl::types::GLsync;
+                // Zero-timeout poll only: never block here.
+                let status = gl::ClientWaitSync(sync, 0, 0);
+                if status == gl::ALREADY_SIGNALED || status == gl::CONDITION_SATISFIED {
+                    ack = Some(ack.map_or(g, |a: u64| a.max(g)));
                 }
-                for s in &cache.slots {
-                    if let Some(f) = DEPTH_EXT.delete_semaphores {
-                        f(1, &s.sem);
-                    }
-                    gl::DeleteTextures(1, &s.tex);
-                    if let Some(f) = DEPTH_EXT.delete_memory_objects {
-                        f(1, &s.mem);
-                    }
+                gl::DeleteSync(sync);
+            }
+            for s in &cache.slots {
+                if let Some(f) = DEPTH_EXT.delete_semaphores {
+                    f(1, &s.sem);
+                }
+                gl::DeleteTextures(1, &s.tex);
+                if let Some(f) = DEPTH_EXT.delete_memory_objects {
+                    f(1, &s.mem);
                 }
             }
         }
+        ack
     }
 
     fn depth_swapchain_create_info(
@@ -1131,8 +1209,9 @@ mod tests {
             eye_h: 10,
             alloc_bytes: 800,
         };
-        // Identical setup (generation/index/alloc differ) → same key.
-        let same = DepthFdRequest { generation: 10, depth_image_index: 1, alloc_bytes: 0, ..base };
+        // Identical setup (generation/index differ) → same key.
+        // alloc_bytes is in the key (R7), so it must match here.
+        let same = DepthFdRequest { generation: 10, depth_image_index: 1, ..base };
         assert_eq!(depth_fd_cache_key(&base), depth_fd_cache_key(&same));
         // Epoch-restart collision: same epoch number, different FDs →
         // different key, forcing a reimport (B5).
@@ -1142,12 +1221,19 @@ mod tests {
             ..base
         };
         assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&restart));
-        // Dims/format changes also reimport.
+        // Dims/format/alloc changes also reimport (R7: driver padding
+        // growth within an epoch keeps a stale import size until epoch
+        // bump without the alloc_bytes key).
         let dims = DepthFdRequest { eye_w: 20, ..base };
         assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&dims));
         let fmt = DepthFdRequest { vk_format: FORMAT_D32S8, ..base };
         assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&fmt));
         let epoch = DepthFdRequest { setup_epoch: 2, ..base };
         assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&epoch));
+        let alloc = DepthFdRequest { alloc_bytes: 900, ..base };
+        assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&alloc));
+        // Zero (unknown) vs known allocation also reimports (conservative).
+        let alloc_zero = DepthFdRequest { alloc_bytes: 0, ..base };
+        assert_ne!(depth_fd_cache_key(&base), depth_fd_cache_key(&alloc_zero));
     }
 }

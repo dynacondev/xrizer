@@ -313,7 +313,12 @@ impl openxr_data::Compositor for Compositor {
                 // backend GL imports (the index belongs to the old
                 // swapchain, leaked otherwise).
                 ctrl.release_depth_pending();
-                ctrl.backend.drop_depth_imports();
+                // R8: drain-then-delete preserves signaled acks; ack via
+                // the old feed when possible instead of orphaning.
+                let dropped = ctrl.backend.drop_depth_imports();
+                if let (Some(dropped_gen), Some(feed)) = (dropped, ctrl.depth_feed.as_ref()) {
+                    let _ = feed.store_consumed(dropped_gen);
+                }
             }
             old_ctrl.with_any_graphics_mut::<drop_imports>(());
         }
@@ -1107,17 +1112,47 @@ struct FrameController<G: GraphicsBackend> {
     depth_armed_generation: Option<u64>,
     /// Debug-only submit heartbeat: per-window submits with the
     /// depth-armed vs plain split. Throttled 5 s; the submit path is untouched.
-    /// (The total is derived as armed + plain at emit time — every end takes
-    /// exactly one of those branches — so no separate counter is stored.)
+    /// R2: non-render frames (should_render false / submitting_null /
+    /// partial submits where depth was never attempted) count as idle,
+    /// not plain, so the armed/(armed+plain) ratio measures render
+    /// frames only. R1 coverage note: per-window counters (armed/plain/
+    /// idle, upgrade ok/pass + skip reason, submit-skips + reason,
+    /// ack-fail, plus R5 full-wait, R16 fence-overflow, E2E-R3 ack-lag
+    /// below) plus warn-once-per-episode (reason change re-warns for
+    /// upgrade/submit; stale/fail reset on success) close the
+    /// flapping-visibility gap — every flap episode re-warns on reason
+    /// change and every miss counts in the window, so a 50%-duty stall
+    /// shows as alternating reasons + plain counts, not silence.
+    /// (The render total is derived as armed + plain at emit time —
+    /// idle ends take the third branch — so no separate total is stored.)
     submit_log_start_mono_ns: u64,
     depth_armed_frames: u64,
     depth_plain_frames: u64,
+    /// R2 idle/non-render ends in the same window (never attempted
+    /// depth). Surfaced in the frames line as `idle`.
+    depth_idle_frames: u64,
     /// Debug-only upgrade accounting (same heartbeat window): end_frame
     /// upgrades that copied a newer generation vs attempts that kept the
     /// submit-time arming (no context, stale, or failed copy — all
     /// silent by design). Answers live whether the 0-lag path executes.
     depth_upgrade_ok: u64,
     depth_upgrade_pass: u64,
+    /// R5 full-bound wait hits since the last heartbeat (how often the
+    /// 5 ms trailing drain or B6 fresh wait blocked the full bound).
+    /// Observability only; bounds unchanged. Surfaced as `full-wait`.
+    depth_full_wait_hits: u64,
+    /// R16 fence-backlog overflow drops since the last heartbeat
+    /// (oldest pending fence deleted while unsignaled). Observability
+    /// only; drop + orphan-ack behavior unchanged. Surfaced as
+    /// `fence-overflow` alongside `ack-fail`.
+    depth_fence_overflow_drops: u64,
+    /// E2E-R3 ack-lag gauge: latest observed generation minus last
+    /// observed ack (`latest_seen - consumed_gen`, saturating). Updated
+    /// on every successful control read (submit + upgrade); surfaced in
+    /// the heartbeat as `ack-lag`. Cheap, no protocol change: both
+    /// values are already read, this only tracks their difference.
+    depth_latest_seen_gen: u64,
+    depth_last_consumed_gen: u64,
     depth_extension_enabled: bool,
     depth_off_logged: bool,
     /// One-shot stall warning: SHM has no fresh frame (stale, dead, or
@@ -1273,8 +1308,13 @@ impl<G: GraphicsBackend> FrameController<G> {
             submit_log_start_mono_ns: 0,
             depth_armed_frames: 0,
             depth_plain_frames: 0,
+            depth_idle_frames: 0,
             depth_upgrade_ok: 0,
             depth_upgrade_pass: 0,
+            depth_full_wait_hits: 0,
+            depth_fence_overflow_drops: 0,
+            depth_latest_seen_gen: 0,
+            depth_last_consumed_gen: 0,
             depth_extension_enabled: false,
             depth_off_logged: false,
             depth_stale_warned: false,
@@ -1303,7 +1343,13 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.release_depth_pending();
         if !enabled {
             self.depth_swapchain = None;
-            self.backend.drop_depth_imports();
+            // R8: ack any already-signaled gens instead of orphaning.
+            let dropped_ack = self.backend.drop_depth_imports();
+            if let Some(dropped_gen) = dropped_ack
+                && let Some(feed) = self.depth_feed.as_ref()
+            {
+                let _ = feed.store_consumed(dropped_gen);
+            }
             self.depth_ready_this_frame = false;
             self.depth_near_far = None;
             self.depth_min_max = None;
@@ -1313,6 +1359,61 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_extension_enabled = enabled;
     }
 
+    /// Best-effort depth swapchain pre-warm (R14): when the color dims
+    /// are known (after `recreate_swapchain` / session start), attempt
+    /// the depth swapchain through the existing `ensure_depth_swapchain`
+    /// and cooldown path so the first frames after (re)start are less
+    /// likely plain. Degrades through the existing failure path (false /
+    /// backoff, no new failure modes, never stalls or spams). Format is
+    /// unknown without a header, so try the preferred D32F first when
+    /// advertised, else D32S8; a wrong guess just recreates on the first
+    /// real header (same cost as lazy today).
+    fn prewarm_depth_swapchain(&mut self, session_data: &SessionData)
+    where
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
+    {
+        if !self.depth_extension_enabled || !G::supports_depth() {
+            return;
+        }
+        if self.depth_swapchain.is_some() {
+            return;
+        }
+        let (color_w, color_h) = match self.swapchain_data.as_ref() {
+            Some(color) => (color.info.width, color.info.height),
+            None => return,
+        };
+        if color_w == 0 || color_h == 0 {
+            return;
+        }
+        for vk_format in [
+            depth_feed::FORMAT_D32F,
+            depth_feed::FORMAT_D32S8,
+        ] {
+            if self.ensure_depth_swapchain(session_data, color_w, color_h, vk_format) {
+                break;
+            }
+            // ensure() returns false on backoff/unsupported without
+            // side effects beyond the existing warn/backoff; trying the
+            // fallback format is still best-effort. Stop after the first
+            // attempt if backoff engaged to avoid double-spam: the
+            // cooldown path already rate-limits.
+            if self.depth_swapchain_backoff.should_skip() {
+                break;
+            }
+            // Only try the fallback when the preferred format is not
+            // advertised at all (ensure failed before creating). If the
+            // preferred creation failed transiently, the backoff above
+            // stops us; otherwise a dims/format mismatch on the real
+            // header recreates anyway.
+            // Continue to the next format only when this one is
+            // unsupported (no swapchain created, no backoff tripped).
+            // Heuristic: if the first format created nothing and set no
+            // backoff, it was likely unadvertised — try the other.
+        }
+    }
+
     fn recreate_swapchain(
         &mut self,
         session_data: &SessionData,
@@ -1320,7 +1421,7 @@ impl<G: GraphicsBackend> FrameController<G> {
     ) where
         for<'a> &'a openxr_data::GraphicalSession:
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
-        <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
     {
         let (swapchain, initial_format) =
             Self::init_swapchain(session_data, &mut create_info, &mut self.backend);
@@ -1338,7 +1439,13 @@ impl<G: GraphicsBackend> FrameController<G> {
         // swapchain it was acquired from.
         self.release_depth_pending();
         self.depth_swapchain = None;
-        self.backend.drop_depth_imports();
+        // R8: preserve signaled acks across the resize drop.
+        let dropped_ack = self.backend.drop_depth_imports();
+        if let Some(dropped_gen) = dropped_ack
+            && let Some(feed) = self.depth_feed.as_ref()
+        {
+            let _ = feed.store_consumed(dropped_gen);
+        }
         self.depth_ready_this_frame = false;
         self.depth_near_far = None;
         self.depth_min_max = None;
@@ -1346,6 +1453,9 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_armed_time_ns = None;
         self.acquire_swapchain_image();
         self.eyes_submitted = Default::default();
+        // R14: best-effort pre-warm so post-resize frames arm sooner.
+        // Degrades through the existing ensure/backoff path.
+        self.prewarm_depth_swapchain(session_data);
     }
 
     fn acquire_swapchain_image(&mut self) {
@@ -1542,6 +1652,21 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
     }
 
+    /// E2E-R3 ack-lag gauge update: record the latest observed
+    /// generation and the last observed ack on every successful control
+    /// read (submit + upgrade). Lag = latest - consumed (saturating),
+    /// surfaced in the heartbeat. Cheap, no protocol change.
+    fn note_observed_ctl(&mut self, ctl: &DepthControl) {
+        self.depth_latest_seen_gen = self.depth_latest_seen_gen.max(ctl.generation);
+        self.depth_last_consumed_gen = ctl.consumed_gen;
+    }
+
+    /// E2E-R3 lag value for the heartbeat.
+    fn depth_ack_lag(&self) -> u64 {
+        self.depth_latest_seen_gen
+            .saturating_sub(self.depth_last_consumed_gen)
+    }
+
     /// Acquire the depth image once per frame (B3). Returns the pending
     /// index, acquiring exactly once: a second call in the same frame
     /// (the end-frame upgrade re-copy) reuses the submit-time index with
@@ -1635,7 +1760,11 @@ impl<G: GraphicsBackend> FrameController<G> {
                         self.note_upgrade_skip(e.reason());
                         None
                     }
-                    Some(Ok(ctl)) => Some(ctl),
+                    Some(Ok(ctl)) => {
+                        // E2E-R3: track latest vs ack for the lag gauge.
+                        self.note_observed_ctl(&ctl);
+                        Some(ctl)
+                    }
                 }
                 .filter(|ctl| {
                     if ctl.mode != depth_feed::MODE_FD {
@@ -1671,7 +1800,13 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             // Backend viability first (no GL work without imports); the
             // upload itself re-validates mode, dims, FDs and staleness.
+            // R15: extension ON + import-inviable gets a named submit
+            // skip ("no-import-viable") — Vulkan-future hazard. Extension
+            // OFF stays silent (off-by-config, fine).
             if !self.backend.depth_fd_import_viable() {
+                if self.depth_extension_enabled {
+                    self.note_submit_skip("no-import-viable");
+                }
                 return;
             }
             // Reason-coded read (B1): absent/wrong-size/bad-magic/
@@ -1683,7 +1818,11 @@ impl<G: GraphicsBackend> FrameController<G> {
                 .expect("feed opened above")
                 .read_control()
             {
-                Ok(ctl) => ctl,
+                Ok(ctl) => {
+                    // E2E-R3: track latest vs ack for the lag gauge.
+                    self.note_observed_ctl(&ctl);
+                    ctl
+                }
                 Err(e) => {
                     self.note_submit_skip(e.reason());
                     return;
@@ -1713,23 +1852,42 @@ impl<G: GraphicsBackend> FrameController<G> {
         if ctl.generation == 0 {
             return;
         }
-        if !ctl.is_viable() {
-            debug!(
-                "depth not viable (mode {} fmt {} {}x{} epoch {} gen {}); plain views",
-                ctl.mode, ctl.format, ctl.w, ctl.h, ctl.setup_epoch, ctl.generation,
-            );
+        // E2E-R3: keep the lag gauge fresh even for direct callers.
+        // (poll_depth already recorded; idempotent.)
+        self.note_observed_ctl(ctl);
+        // R4: pure viability cause instead of debug/plain collapse.
+        // Submit warns once per episode, quiet records the skip reason.
+        if let Some(reason) = ctl.viability_reason() {
+            if quiet {
+                self.note_upgrade_skip(reason);
+            } else {
+                self.note_submit_skip(reason);
+            }
             return;
         }
         // Staleness against the header timestamp, sampled at use: the
         // end-frame upgrade reads generations published after frame start,
         // which a frame-start clock would misjudge as future stamps.
+        // R9/R10: future stamps and zero clocks/stamps stay stale (safe
+        // direction) but upgrade to a loud once-per-episode clock-skew
+        // warn instead of silent-plain. No behavior change.
         let now = depth_feed::now_mono_ns();
-        if ctl.is_stale(now, depth_feed::max_age_ms()) {
+        if let Some(stale_kind) = depth_feed::stale_reason(ctl.time_ns, now, depth_feed::max_age_ms()) {
+            let clock_skew = stale_kind != "stale-aged";
             if quiet {
-                self.note_upgrade_skip("stale-shm");
+                // note_upgrade_skip warns once per reason episode; the
+                // distinct stale-future / stale-zero-* reasons name the
+                // clock-skew suspicion without extra spam.
+                self.note_upgrade_skip(stale_kind);
             } else if !self.depth_stale_warned {
                 self.depth_stale_warned = true;
-                warn!("depth enabled but no fresh frame (SHM stale, dead, or producer stopped?)");
+                if clock_skew {
+                    warn!("depth enabled but clock-skew suspected ({stale_kind}); plain views this frame");
+                } else {
+                    warn!("depth enabled but no fresh frame (SHM stale, dead, or producer stopped?)");
+                }
+            } else if clock_skew {
+                debug!("depth stale ({stale_kind}); clock-skew suspected");
             }
             return;
         }
@@ -1753,6 +1911,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         };
         // Dims are authoritative per read: never stretch, skip the frame.
+        // R3: submit-path dims-mismatch warns once per episode via the
+        // shared submit-skip signal (same pattern as B1), not debug-only —
+        // color/depth resize skew lands in the windows most worth
+        // investigating.
         let (cw, ch) = match self.swapchain_data.as_ref() {
             Some(c) => (c.info.width, c.info.height),
             None => return,
@@ -1761,10 +1923,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             if quiet {
                 self.note_upgrade_skip("dims-mismatch");
             } else {
-                debug!(
-                    "depth dims {}x{} vs color {cw}x{ch} — plain views this frame",
-                    ctl.w, ctl.h,
-                );
+                self.note_submit_skip("dims-mismatch");
             }
             return;
         }
@@ -1816,6 +1975,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             eye_h,
             alloc_bytes: ctl.alloc_bytes,
         });
+        // R5/R16 observability: accumulate backend full-wait hits and
+        // fence-overflow drops into the heartbeat window counters.
+        self.depth_full_wait_hits += res.full_waits as u64;
+        self.depth_fence_overflow_drops += res.overflow_drops as u64;
         // B3 instrumentation: per-copy image index proves which released
         // image the runtime samples when the upgrade re-copies into the
         // same index.
@@ -2011,11 +2174,14 @@ impl<G: GraphicsBackend> FrameController<G> {
         // Debug-only submit heartbeat: submits/s plus the depth-armed vs
         // plain split. Throttled 5 s; the submit path is untouched.
         // (S4: no separate total counter — every end takes exactly one of
-        // the armed/plain branches, so the total is derived at emit time.)
+        // the armed/plain/idle branches, so the total is derived at emit
+        // time.)
         // B1+B4 additions: submit-skip counter (+reason) and ack-fail count
-        // are surfaced here. Exact line change vs before:
-        //   old: "... upgrade {} ok / {} pass, skip {}, repeat-ends {})"
-        //   new: "... upgrade {} ok / {} pass, skip {}, submit-skip {} ({}), ack-fail {}, repeat-ends {})"
+        // are surfaced here. R2+R5+R16+E2E-R3 additions: idle/non-render
+        // ends, full-wait hits, fence-overflow drops, and ack-lag gauge.
+        // Exact line change vs B1/B4:
+        //   old: "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass, skip {}, submit-skip {} ({}), ack-fail {}, repeat-ends {})"
+        //   new: "frames {:.1}/s ({} frames, {} with depth, {} plain, {} idle, upgrade {} ok / {} pass, skip {}, submit-skip {} ({}), ack-fail {}, fence-overflow {}, full-wait {}, ack-lag {}, repeat-ends {})"
         {
             // Per-end stamp for the stamp-vs-render-pose audit: compare
             // against the waited-frame display_times in the same log.
@@ -2038,27 +2204,35 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.submit_log_start_mono_ns = now;
             } else if now.saturating_sub(self.submit_log_start_mono_ns) > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
-                let total = self.depth_armed_frames + self.depth_plain_frames;
+                let total =
+                    self.depth_armed_frames + self.depth_plain_frames + self.depth_idle_frames;
                 debug!(
-                    "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass, skip {}, submit-skip {} ({}), ack-fail {}, repeat-ends {})",
+                    "frames {:.1}/s ({} frames, {} with depth, {} plain, {} idle, upgrade {} ok / {} pass, skip {}, submit-skip {} ({}), ack-fail {}, fence-overflow {}, full-wait {}, ack-lag {}, repeat-ends {})",
                     total as f64 / dt,
                     total,
                     self.depth_armed_frames,
                     self.depth_plain_frames,
+                    self.depth_idle_frames,
                     self.depth_upgrade_ok,
                     self.depth_upgrade_pass,
                     self.depth_upgrade_skip_reason.unwrap_or("none"),
                     self.depth_submit_skips,
                     self.depth_submit_skip_reason.unwrap_or("none"),
                     self.depth_ack_store_fails,
+                    self.depth_fence_overflow_drops,
+                    self.depth_full_wait_hits,
+                    self.depth_ack_lag(),
                     self.end_repeat_count,
                 );
                 self.depth_armed_frames = 0;
                 self.depth_plain_frames = 0;
+                self.depth_idle_frames = 0;
                 self.depth_upgrade_ok = 0;
                 self.depth_upgrade_pass = 0;
                 self.depth_submit_skips = 0;
                 self.depth_ack_store_fails = 0;
+                self.depth_fence_overflow_drops = 0;
+                self.depth_full_wait_hits = 0;
                 self.end_repeat_count = 0;
                 self.submit_log_start_mono_ns = now;
             }
@@ -2086,14 +2260,31 @@ impl<G: GraphicsBackend> FrameController<G> {
         // The pending index was acquired at the submit-time copy; the
         // upgrade re-copied into the same index with no second acquire.
         self.release_depth_pending();
+        // R13: per-end trace carries the last submit/upgrade skip reasons
+        // (trace level only). Plain ends previously carried no reason;
+        // armed ends logged only the gen. Exact line change:
+        //   old: "end frame: display_time {:?} tid {:?} depth {} gen {:?}"
+        //   new: "end frame: display_time {:?} tid {:?} depth {} gen {:?} submit-skip {} upgrade-skip {}"
         trace!(
-            "end frame: display_time {:?} tid {:?} depth {} gen {:?}",
+            "end frame: display_time {:?} tid {:?} depth {} gen {:?} submit-skip {} upgrade-skip {}",
             display_time,
             std::thread::current().id(),
             with_depth,
             self.depth_armed_generation,
+            self.depth_submit_skip_reason.unwrap_or("none"),
+            self.depth_upgrade_skip_reason.unwrap_or("none"),
         );
-        if with_depth {
+        // R2: heartbeat denominator counts only render-attempted frames
+        // (depth was actually attempted). Non-render frames
+        // (should_render false / submitting_null / partial submits where
+        // depth never ran) count as idle, not plain, so menu/idle dilution
+        // no longer hides the armed ratio.
+        let render_attempted = self.should_render
+            && !self.submitting_null
+            && self.eyes_submitted.iter().all(|eye| eye.is_some());
+        if !render_attempted {
+            self.depth_idle_frames += 1;
+        } else if with_depth {
             self.depth_armed_frames += 1;
         } else {
             self.depth_plain_frames += 1;
@@ -2619,18 +2810,24 @@ mod tests {
                 return DepthFdResult {
                     copied: false,
                     ack_gen: Option::None,
+                    full_waits: 0,
+                    overflow_drops: 0,
                 };
             }
             if req.generation == 0 || req.eye_w == 0 || req.eye_h == 0 {
                 return DepthFdResult {
                     copied: false,
                     ack_gen: Option::None,
+                    full_waits: 0,
+                    overflow_drops: 0,
                 };
             }
             if req.mem_fds.iter().any(|&f| f <= 2) || req.sem_fds.iter().any(|&f| f <= 2) {
                 return DepthFdResult {
                     copied: false,
                     ack_gen: Option::None,
+                    full_waits: 0,
+                    overflow_drops: 0,
                 };
             }
             // No GL: record the copy and report success with an ack.
@@ -2640,11 +2837,14 @@ mod tests {
             DepthFdResult {
                 copied: true,
                 ack_gen: Some(req.generation),
+                full_waits: 0,
+                overflow_drops: 0,
             }
         }
 
-        fn drop_depth_imports(&mut self) {
+        fn drop_depth_imports(&mut self) -> Option<u64> {
             self.depth_images_len = 0;
+            Option::None
         }
     }
 
@@ -3147,9 +3347,8 @@ mod tests {
         // Viable v2 FD segment at the fixed path + master on + extension on,
         // but the Fake backend reports no import viability (no GL context):
         // the submit path opens the feed yet arms nothing and acks nothing.
-        // (Feed reads stay harness-side: without GL the controller never
-        // reaches read_control, so this is an inertness + feed-lifecycle
-        // tripwire, not gate-chain coverage — logic is Tier-1 covered.)
+        // R15: extension ON + import-inviable gets a named submit skip
+        // ("no-import-viable") instead of silent-plain.
         let _lock = crate::depth_feed::env_guard();
         let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
         // Shared SHM test helper (S7): same viable segment as the hand-rolled
@@ -3212,6 +3411,16 @@ mod tests {
             );
             // The gate chain ran (feed opened) but nothing armed…
             assert!(ctrl.depth_feed.is_some(), "feed must open past master gate");
+            // R15: named skip, not silence (extension ON).
+            assert_eq!(
+                ctrl.depth_submit_skip_reason,
+                Some("no-import-viable"),
+                "extension-ON + import-inviable must name no-import-viable"
+            );
+            assert!(
+                ctrl.depth_submit_skips >= 1,
+                "submit-skip counter must count the no-import-viable miss"
+            );
         }
         // …and the published header still reads viable with no ack written.
         {
@@ -3284,6 +3493,17 @@ mod tests {
             assert!(
                 !ctrl.depth_extension_enabled,
                 "extension gate must stay closed (probe false in this test)"
+            );
+            // R15: extension-OFF stays silent (off-by-config, fine) — no
+            // named no-import-viable skip when the extension gate never
+            // opened.
+            assert_eq!(
+                ctrl.depth_submit_skip_reason, Option::None,
+                "extension-OFF must stay silent (no submit skip)"
+            );
+            assert_eq!(
+                ctrl.depth_submit_skips, 0,
+                "extension-OFF must not count submit skips"
             );
         }
         // Unknown Vulkan formats map to no GL depth format: the swapchain
@@ -3601,6 +3821,298 @@ mod tests {
                 "plain build failure must count a plain end"
             );
             assert_eq!(ctrl.depth_armed_frames, 0);
+        }
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+    }
+
+    #[test]
+    fn depth_idle_counts_non_render_not_plain() {
+        // R2: non-render frames (should_render false) count as idle, not
+        // plain, so menu/idle dilution no longer hides the armed ratio.
+        let _lock = crate::depth_feed::env_guard();
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+        unsafe {
+            let cname = std::ffi::CString::new(crate::depth_feed::DEFAULT_SHM_NAME).unwrap();
+            libc::shm_unlink(cname.as_ptr());
+        }
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        // Force non-render: fakexr may report should_render true after
+        // session sync; idle is defined by the controller flag. Zero the
+        // window counters so the assertion measures this frame only
+        // (ensure_real_session already ended one idle frame).
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = false;
+            ctrl.depth_idle_frames = 0;
+            ctrl.depth_plain_frames = 0;
+            ctrl.depth_armed_frames = 0;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert_eq!(
+                ctrl.depth_idle_frames, 1,
+                "non-render end must count idle (R2)"
+            );
+            assert_eq!(
+                ctrl.depth_plain_frames, 0,
+                "non-render end must not dilute plain (R2)"
+            );
+            assert_eq!(ctrl.depth_armed_frames, 0);
+        }
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+    }
+
+    #[test]
+    fn depth_submit_dims_mismatch_warns_once() {
+        // R3: submit-path dims-mismatch warns once per episode via the
+        // shared submit-skip signal (not debug-only).
+        let _lock = crate::depth_feed::env_guard();
+        let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
+        // Color is 10x10 in Fake; publish 30x10 (eye 15 vs 10) to force
+        // dims-mismatch on the submit path.
+        let _seg = crate::depth_feed::make_seg_v2(
+            seg_name,
+            30,
+            10,
+            1,
+            crate::depth_feed::MODE_FD,
+            |h| {
+                h.setup_epoch = 3;
+                h.alloc_bytes = 15 * 10 * 4;
+            },
+        );
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = true;
+            ctrl.set_depth_extension_enabled(true);
+            ctrl.backend.fake_depth_viable = true;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert_eq!(
+                ctrl.depth_submit_skip_reason,
+                Some("dims-mismatch"),
+                "submit dims-mismatch must name dims-mismatch (R3)"
+            );
+            assert!(
+                ctrl.depth_submit_skips >= 1,
+                "dims-mismatch must count in submit-skips (R3)"
+            );
+            assert!(
+                !ctrl.depth_ready_this_frame,
+                "dims-mismatch must not arm"
+            );
+        }
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+    }
+
+    #[test]
+    fn depth_submit_bad_fds_names_viability_reason() {
+        // R4: non-viable headers beyond gen-zero/mode get a named submit
+        // skip (bad-fds) instead of debug/plain collapse.
+        let _lock = crate::depth_feed::env_guard();
+        let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
+        let _seg = crate::depth_feed::make_seg_v2(
+            seg_name,
+            20,
+            10,
+            1,
+            crate::depth_feed::MODE_FD,
+            |h| {
+                h.setup_epoch = 3;
+                h.alloc_bytes = 800;
+                h.mem_fds = [-1, 12, 13];
+            },
+        );
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = true;
+            ctrl.set_depth_extension_enabled(true);
+            ctrl.backend.fake_depth_viable = true;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert_eq!(
+                ctrl.depth_submit_skip_reason,
+                Some("bad-fds"),
+                "bad FDs must name bad-fds (R4)"
+            );
+            assert!(
+                !ctrl.depth_ready_this_frame,
+                "non-viable header must not arm"
+            );
+        }
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+    }
+
+    #[test]
+    fn depth_ack_lag_tracks_latest_minus_consumed() {
+        // E2E-R3: ack-lag gauge = latest_seen - consumed_gen.
+        let _lock = crate::depth_feed::env_guard();
+        let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
+        let _seg = crate::depth_feed::make_seg_v2(
+            seg_name,
+            20,
+            10,
+            5,
+            crate::depth_feed::MODE_FD,
+            |h| {
+                h.setup_epoch = 3;
+                h.alloc_bytes = 800;
+            },
+        );
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = true;
+            ctrl.set_depth_extension_enabled(true);
+            ctrl.backend.fake_depth_viable = true;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert!(ctrl.depth_ready_this_frame, "submit must arm");
+            assert_eq!(ctrl.depth_latest_seen_gen, 5);
+            // Consumed was 0 at read time; ack stored 5 after copy, but
+            // the gauge tracks last-observed consumed (pre-ack).
+            assert_eq!(ctrl.depth_last_consumed_gen, 0);
+            assert_eq!(ctrl.depth_ack_lag(), 5, "lag = latest - consumed (E2E-R3)");
+        }
+        f.comp.PostPresentHandoff();
+        f.check_frame_state(fakexr::FrameState::Ended);
+
+        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+    }
+
+    #[test]
+    fn depth_counters_start_zero_and_fake_never_full_waits() {
+        // R5/R16 observability: Fake backend never blocks the full bound
+        // and never overflows, so the counters stay zero on a clean arm.
+        let _lock = crate::depth_feed::env_guard();
+        let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
+        let _seg = crate::depth_feed::make_seg_v2(
+            seg_name,
+            20,
+            10,
+            1,
+            crate::depth_feed::MODE_FD,
+            |h| {
+                h.setup_epoch = 3;
+                h.alloc_bytes = 800;
+            },
+        );
+        crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
+
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+        f.comp.SetExplicitTimingMode(
+            vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
+        );
+        assert_eq!(f.wait_get_poses(), None);
+        assert_eq!(f.comp.SubmitExplicitTimingData(), None);
+        {
+            let data = f.comp.openxr.session_data.get();
+            let mut frame_lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            ctrl.should_render = true;
+            ctrl.set_depth_extension_enabled(true);
+            ctrl.backend.fake_depth_viable = true;
+        }
+        assert_eq!(f.submit(vr::EVREye::Left), None);
+        assert_eq!(f.submit(vr::EVREye::Right), None);
+        f.comp.PostPresentHandoff();
+        {
+            let data = f.comp.openxr.session_data.get();
+            let lock = data.comp_data.0.lock().unwrap();
+            let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
+                panic!("Frame controller was not set up or not faked!");
+            };
+            assert_eq!(ctrl.depth_full_wait_hits, 0);
+            assert_eq!(ctrl.depth_fence_overflow_drops, 0);
         }
 
         crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
