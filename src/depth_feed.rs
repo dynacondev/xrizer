@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! +0  u32 magic       0x58504450 ('XPDP')
-//! +4  u32 version     2 (v1 deleted — shim only writes v2)
+//! +4  u32 version     3
 //! +8  u32 seq         seqlock: odd = writer inside
 //! +12 u32 w, +16 u32 h
 //! +20 i32 format      126 = D32F (preferred), 130 = D32S8 (fallback)
@@ -18,7 +18,8 @@
 //! +32 u64 present_no  latest signaled generation (0 = never published)
 //! +40 u64 time_mono_ns (CLOCK_MONOTONIC at copy completion)
 //! +48 f32 min_depth, +52 f32 max_depth (mapping range, never gated)
-//! +56 u32 pad[2]
+//! +56 u32 slot        mirror-slot index holding this generation's copy
+//! +60 u32 pad
 //! +64 u32 mode        1 = FD (anything else → not viable, plain views)
 //! +68 u32 setup_epoch (0 = never published; reimport on change)
 //! +72 u64 consumed_gen (written by xrizer: highest fully-copied gen)
@@ -42,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const SHM_MAGIC: u32 = 0x5850_4450; // 'XPDP'
-pub const SHM_VERSION_V2: u32 = 2;
+pub const SHM_VERSION: u32 = 3;
 pub const EYE_SIDEBYSIDE: u32 = 1;
 pub const MODE_FD: u32 = 1;
 /// Vulkan `VK_FORMAT_D32_SFLOAT`. Preferred depth format in prod.
@@ -142,7 +143,12 @@ pub struct XdShmHeaderV2 {
     pub time_mono_ns: u64,  // +40
     pub min_depth: f32,     // +48
     pub max_depth: f32,     // +52
-    pub _pad56: [u32; 2],   // +56,+60
+    /// Mirror-slot index holding the published generation's copy (+56).
+    /// The consumer MUST use this for its semaphore wait + copy source;
+    /// `generation % 3` diverges from the producer's `mirror_seq % 3`
+    /// from frame 1 and must never be used to derive the slot.
+    pub slot: u32,          // +56
+    pub _pad60: u32,        // +60
     pub mode: u32,          // +64
     pub setup_epoch: u32,   // +68
     pub consumed_gen: u64,  // +72 xrizer -> shim
@@ -169,6 +175,8 @@ const _: () = {
     assert!(std::mem::offset_of!(XdShmHeaderV2, time_mono_ns) == 40);
     assert!(std::mem::offset_of!(XdShmHeaderV2, min_depth) == 48);
     assert!(std::mem::offset_of!(XdShmHeaderV2, max_depth) == 52);
+    assert!(std::mem::offset_of!(XdShmHeaderV2, slot) == 56);
+    assert!(std::mem::offset_of!(XdShmHeaderV2, _pad60) == 60);
     assert!(std::mem::offset_of!(XdShmHeaderV2, mode) == 64);
     assert!(std::mem::offset_of!(XdShmHeaderV2, setup_epoch) == 68);
     assert!(std::mem::offset_of!(XdShmHeaderV2, consumed_gen) == CONSUMED_GEN_OFF);
@@ -180,7 +188,7 @@ const _: () = {
     assert!(std::mem::offset_of!(XdShmHeaderV2, reserved) == 116);
 };
 
-/// Snapshot of the v2 control header for the FD path.
+/// Snapshot of the v3 control header for the FD path.
 #[derive(Debug, Clone)]
 pub struct DepthControl {
     pub version: u32,
@@ -192,6 +200,9 @@ pub struct DepthControl {
     pub eye_layout: u32,
     /// Latest signaled generation (`present_no`).
     pub generation: u64,
+    /// Mirror-slot index holding this generation's copy (+56). Threaded
+    /// through to the FD copy request; never derived from `generation`.
+    pub slot: u32,
     pub time_ns: u64,
     pub min_depth: f32,
     pub max_depth: f32,
@@ -226,7 +237,7 @@ impl DepthControl {
         self.w != 0 && self.h != 0 && self.w <= 16384 && self.h <= 16384 && self.w.is_multiple_of(2)
     }
 
-    /// Full viability gate: v2 FD, published epoch+generation, depth SBS
+    /// Full viability gate: v3 FD, published epoch+generation, depth SBS
     /// (D32F preferred, D32S8 fallback), plausible dims, exact 128-byte
     /// segment, all FDs real.
     /// `min/max` are mapping range (never gated); `near/far` validity is
@@ -244,7 +255,7 @@ impl DepthControl {
     /// returned reason, quiet path records it as the upgrade skip
     /// reason. Stable strings for heartbeat/skip accounting.
     pub fn viability_reason(&self) -> Option<&'static str> {
-        if self.version != SHM_VERSION_V2 {
+        if self.version != SHM_VERSION {
             return Some("bad-version");
         }
         if self.mode != MODE_FD {
@@ -476,10 +487,12 @@ impl DepthFeed {
         }
     }
 
-    /// Seqlock-read of the v2 control header. No pixel copy (FD mode has
+    /// Seqlock-read of the v3 control header. No pixel copy (FD mode has
     /// no pixel plane). Reason-coded (B1): absent/wrong-size/torn/foreign
     /// data each name their cause so callers attribute instead of
-    /// falling back to plain silently.
+    /// falling back to plain silently. Version 2 (or 1) is a stale peer
+    /// (old producer): rejected as BadVersion, which the callers surface
+    /// loudly (once-per-episode warn + heartbeat skip reason).
     pub fn read_control(&self) -> Result<DepthControl, ReadFail> {
         let map = map_segment(&self.name, false)?;
         let (ptr, map_len) = (map.ptr, map.len);
@@ -493,7 +506,7 @@ impl DepthFeed {
             if unsafe { read_u32(ptr, 0) } != SHM_MAGIC {
                 return Err(ReadFail::BadMagic);
             }
-            if unsafe { read_u32(ptr, 4) } != SHM_VERSION_V2 {
+            if unsafe { read_u32(ptr, 4) } != SHM_VERSION {
                 return Err(ReadFail::BadVersion);
             }
             // Copy under seq1; the closing seq check covers torn reads.
@@ -509,7 +522,7 @@ impl DepthFeed {
             // so reload it with an acquire-load pairing our store.
             // mmap is page-aligned and CONSUMED_GEN_OFF is 8-aligned,
             // so this is always aligned.
-            if h.magic != SHM_MAGIC || h.version != SHM_VERSION_V2 {
+            if h.magic != SHM_MAGIC || h.version != SHM_VERSION {
                 return Err(if h.magic != SHM_MAGIC {
                     ReadFail::BadMagic
                 } else {
@@ -533,6 +546,7 @@ impl DepthFeed {
                 format: h.format,
                 eye_layout: h.eye_layout,
                 generation: h.present_no,
+                slot: h.slot,
                 time_ns: h.time_mono_ns,
                 min_depth: h.min_depth,
                 max_depth: h.max_depth,
@@ -789,7 +803,7 @@ pub(crate) fn del_env_for_tests(key: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
-/// Shared SHM test helper (S7): builds a live 128-byte v2 segment at
+/// Shared SHM test helper (S7): builds a live 128-byte v3 segment at
 /// `name` for gate tests (viable / stale / dims / format). The `tweak`
 /// closure adjusts any header field (epoch, near/far, alloc, FDs, ...);
 /// the segment is unlinked on drop. Test-only: no prod change.
@@ -844,7 +858,7 @@ pub(crate) fn make_seg_v2(
     unsafe { libc::close(fd) };
     let mut hdr = XdShmHeaderV2 {
         magic: SHM_MAGIC,
-        version: SHM_VERSION_V2,
+        version: SHM_VERSION,
         seq: 1,
         w,
         h,
@@ -854,7 +868,8 @@ pub(crate) fn make_seg_v2(
         time_mono_ns: now_mono_ns(),
         min_depth: 0.0,
         max_depth: 1.0,
-        _pad56: [0, 0],
+        slot: 0,
+        _pad60: 0,
         mode,
         setup_epoch: 7,
         consumed_gen: 0,
@@ -922,7 +937,7 @@ mod tests {
 
     #[test]
     fn header_layout_matches_shm_contract() {
-        // Byte-identical with reprojex/reprojex_shm.h (v2, 128B).
+        // Byte-identical with reprojex/reprojex_shm.h (v3, 128B).
         assert_eq!(std::mem::size_of::<XdShmHeaderV2>(), 128);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, magic), 0);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, version), 4);
@@ -935,6 +950,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, time_mono_ns), 40);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, min_depth), 48);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, max_depth), 52);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV2, slot), 56);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV2, _pad60), 60);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, mode), 64);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, setup_epoch), 68);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV2, consumed_gen), 72);
@@ -949,11 +966,15 @@ mod tests {
     #[test]
     fn roundtrip_viable() {
         let name = format!("/xrizer-depth-test-{}-1", std::process::id());
-        let _seg = make_seg_v2(&name, 8, 2, 42, MODE_FD, |_| {});
+        let _seg = make_seg_v2(&name, 8, 2, 42, MODE_FD, |h| {
+            h.slot = 1;
+        });
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("should hit");
         assert_eq!((ctl.w, ctl.h, ctl.generation), (8, 2, 42));
+        assert_eq!(ctl.slot, 1, "slot field must round-trip (gen 42 % 3 == 0)");
+        assert_eq!(ctl.version, SHM_VERSION);
         assert_eq!(ctl.mem_fds, [11, 12, 13]);
         assert_eq!(ctl.sem_fds, [21, 22, 23]);
         assert_eq!(ctl.alloc_bytes, 8 * 2 * 4);
@@ -998,7 +1019,8 @@ mod tests {
                 time_mono_ns: now_mono_ns(),
                 min_depth: 0.0,
                 max_depth: 1.0,
-                _pad56: [0, 0],
+                slot: 0,
+                _pad60: 0,
                 mode: MODE_FD,
                 setup_epoch: 7,
                 consumed_gen: 0,
@@ -1017,6 +1039,43 @@ mod tests {
             DepthFeed::open_for_test(&name2).read_control().unwrap_err(),
             ReadFail::BadVersion,
             "version 1 must miss as bad-version"
+        );
+        // 128-byte segment stamped version 2: stale peer (old producer
+        // paired with this v3 consumer). Same loud BadVersion reason.
+        let name3 = format!("/xrizer-depth-test-{pid}-v2");
+        let _seg3 = make_raw_seg(&name3, HEADER_SIZE_V2, |ptr| unsafe {
+            let mut hdr = XdShmHeaderV2 {
+                magic: SHM_MAGIC,
+                version: 2,
+                seq: 2,
+                w: 8,
+                h: 2,
+                format: FORMAT_D32F,
+                eye_layout: EYE_SIDEBYSIDE,
+                present_no: 1,
+                time_mono_ns: now_mono_ns(),
+                min_depth: 0.0,
+                max_depth: 1.0,
+                slot: 1,
+                _pad60: 0,
+                mode: MODE_FD,
+                setup_epoch: 7,
+                consumed_gen: 0,
+                mem_fds: [11, 12, 13],
+                sem_fds: [21, 22, 23],
+                near_z: 0.01,
+                far_z: 200.0,
+                alloc_bytes: 64,
+                reserved: [0, 0, 0],
+            };
+            hdr.seq = 1;
+            (ptr as *mut XdShmHeaderV2).write_unaligned(hdr);
+            (ptr as *mut u32).add(2).write_volatile(2);
+        });
+        assert_eq!(
+            DepthFeed::open_for_test(&name3).read_control().unwrap_err(),
+            ReadFail::BadVersion,
+            "version 2 (stale producer) must miss as bad-version"
         );
     }
 
@@ -1039,7 +1098,7 @@ mod tests {
         let _seg2 = make_raw_seg(&name2, HEADER_SIZE_V2 + 64, |ptr| unsafe {
             std::ptr::write_bytes(ptr as *mut u8, 0, HEADER_SIZE_V2 + 64);
             (ptr as *mut u32).write_volatile(SHM_MAGIC);
-            (ptr as *mut u32).add(1).write_volatile(SHM_VERSION_V2);
+            (ptr as *mut u32).add(1).write_volatile(SHM_VERSION);
             (ptr as *mut u32).add(2).write_volatile(2);
         });
         assert_eq!(
@@ -1305,7 +1364,7 @@ mod tests {
         use super::DepthControl;
         fn viable() -> DepthControl {
             DepthControl {
-                version: SHM_VERSION_V2,
+                version: SHM_VERSION,
                 mode: MODE_FD,
                 setup_epoch: 7,
                 w: 8,
@@ -1313,6 +1372,7 @@ mod tests {
                 format: FORMAT_D32F,
                 eye_layout: EYE_SIDEBYSIDE,
                 generation: 3,
+                slot: 0,
                 time_ns: 1,
                 min_depth: 0.0,
                 max_depth: 1.0,
@@ -1330,6 +1390,13 @@ mod tests {
         let mut c = viable();
         c.version = 1;
         assert_eq!(c.viability_reason(), Some("bad-version"));
+        let mut c = viable();
+        c.version = 2;
+        assert_eq!(
+            c.viability_reason(),
+            Some("bad-version"),
+            "v2 (stale producer) must not arm a v3 consumer"
+        );
         let mut c = viable();
         c.mode = 0;
         assert_eq!(c.viability_reason(), Some("mode-not-fd"));

@@ -237,6 +237,13 @@ impl openxr_data::Compositor for Compositor {
                 where
                     AnyTempBackendData: From<TempBackendData<G>>,
                 {
+                    // Harvest path: the controller is dropped after the
+                    // move, but its depth swapchain is not carried over —
+                    // release the pending depth image first or its index
+                    // leaks (same B3 discipline as the other swapchain
+                    // drops; release is a no-op when none is pending).
+                    let mut ctrl = ctrl;
+                    ctrl.release_depth_pending();
                     TempBackendData {
                         backend: ctrl.backend,
                         swapchain_create_info: ctrl.swapchain_data.map(|d| d.info),
@@ -1655,9 +1662,19 @@ impl<G: GraphicsBackend> FrameController<G> {
     /// E2E-R3 ack-lag gauge update: record the latest observed
     /// generation and the last observed ack on every successful control
     /// read (submit + upgrade). Lag = latest - consumed (saturating),
-    /// surfaced in the heartbeat. Cheap, no protocol change.
+    /// surfaced in the heartbeat. Cheap, no protocol change. A
+    /// generation rewind (reload restarts generations while epoch numbers
+    /// can collide) resets the gauge instead of pinning a stale max.
     fn note_observed_ctl(&mut self, ctl: &DepthControl) {
-        self.depth_latest_seen_gen = self.depth_latest_seen_gen.max(ctl.generation);
+        if ctl.generation < self.depth_latest_seen_gen && self.depth_latest_seen_gen != 0 {
+            debug!(
+                "depth ack-lag gauge reset: generation rewound {} -> {} (reload?)",
+                self.depth_latest_seen_gen, ctl.generation
+            );
+            self.depth_latest_seen_gen = ctl.generation;
+        } else {
+            self.depth_latest_seen_gen = self.depth_latest_seen_gen.max(ctl.generation);
+        }
         self.depth_last_consumed_gen = ctl.consumed_gen;
     }
 
@@ -1970,6 +1987,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             mem_fds: ctl.mem_fds,
             sem_fds: ctl.sem_fds,
             generation: ctl.generation,
+            slot: ctl.slot,
             depth_image_index: idx,
             eye_w,
             eye_h,
@@ -2593,7 +2611,8 @@ impl<G: GraphicsBackend> FrameController<G> {
 // moving `backend`/`swapchain_data` out of the controller (session-restart
 // harvest in `post_session_restart`), so every live path releases the
 // pending depth image explicitly instead (end of frame on every path;
-// before any depth-swapchain drop; old-controller harvest).
+// before any depth-swapchain drop; old-controller harvest;
+// session-restart harvest in `get_session_create_info`).
 
 pub fn is_usable_swapchain<G: xr::Graphics>(
     current: &xr::SwapchainCreateInfo<G>,
@@ -2634,9 +2653,10 @@ mod tests {
         /// B3 test hook: import-viable toggle (no GL). Default false
         /// (inert, as before); tests opt into viable copies.
         pub fake_depth_viable: bool,
-        /// B3 test hook: recorded (generation, image index) per copy, no GL.
-        /// Proves one acquire per frame (submit+upgrade share the index).
-        pub fake_depth_copies: Vec<(u64, usize)>,
+        /// B3 test hook: recorded (generation, image index, slot) per copy,
+        /// no GL. Proves one acquire per frame (submit+upgrade share the
+        /// index) and that the copy used the header slot, not gen % 3.
+        pub fake_depth_copies: Vec<(u64, usize, u32)>,
         depth_images_len: usize,
     }
     thread_local! {
@@ -2832,8 +2852,11 @@ mod tests {
             }
             // No GL: record the copy and report success with an ack.
             // The image index must be the pending (single-acquire) index;
-            // the test asserts submit+upgrade share it.
-            self.fake_depth_copies.push((req.generation, req.depth_image_index));
+            // the test asserts submit+upgrade share it. The slot must be
+            // the header slot threaded through the request (never
+            // generation % 3); the test asserts per-generation slots.
+            self.fake_depth_copies
+                .push((req.generation, req.depth_image_index, req.slot));
             DepthFdResult {
                 copied: true,
                 ack_gen: Some(req.generation),
@@ -3586,7 +3609,9 @@ mod tests {
     #[test]
     fn depth_single_acquire_release_per_frame() {
         // B3: one depth acquire per frame across submit+upgrade, released
-        // exactly once; upgrade re-copies into the SAME index.
+        // exactly once; upgrade re-copies into the SAME index. Slot
+        // contract: each copy must use the header slot (deliberately
+        // divergent from gen % 3 here), never generation % 3.
         let _lock = crate::depth_feed::env_guard();
         let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
         let _seg = crate::depth_feed::make_seg_v2(
@@ -3598,6 +3623,7 @@ mod tests {
             |h| {
                 h.setup_epoch = 3;
                 h.alloc_bytes = 800;
+                h.slot = 2; // gen 1 % 3 == 1: must copy slot 2, not 1
             },
         );
         crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
@@ -3633,6 +3659,7 @@ mod tests {
             |h| {
                 h.setup_epoch = 3;
                 h.alloc_bytes = 800;
+                h.slot = 0; // gen 2 % 3 == 2: must copy slot 0, not 2
             },
         );
         f.comp.PostPresentHandoff();
@@ -3663,12 +3690,29 @@ mod tests {
                 ctrl.backend.fake_depth_copies
             );
             let first_idx = ctrl.backend.fake_depth_copies[0].1;
-            for (_, idx) in &ctrl.backend.fake_depth_copies {
+            for (_, idx, _) in &ctrl.backend.fake_depth_copies {
                 assert_eq!(
                     *idx, first_idx,
                     "upgrade must re-copy into the SAME index (no second acquire)"
                 );
             }
+            // Slot contract: submit copied the gen-1 header slot (2, not
+            // 1 % 3 == 1) and the upgrade copied the gen-2 header slot
+            // (0, not 2 % 3 == 2).
+            let slots: Vec<(u64, u32)> = ctrl
+                .backend
+                .fake_depth_copies
+                .iter()
+                .map(|(g, _, s)| (*g, *s))
+                .collect();
+            assert!(
+                slots.contains(&(1, 2)),
+                "submit copy must use header slot 2 for gen 1, got {slots:?}"
+            );
+            assert!(
+                slots.contains(&(2, 0)),
+                "upgrade copy must use header slot 0 for gen 2, got {slots:?}"
+            );
             assert!(
                 ctrl.depth_pending_image.is_none(),
                 "pending image must be released at end of frame"

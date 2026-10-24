@@ -730,7 +730,7 @@ impl GraphicsBackend for GlData {
         };
         // Wait once per generation (binary semaphores; skip on re-copy).
         // R6 invariant (pinned): the dedup below must NEVER skip the FIRST
-        // wait for an (epoch, generation). `last_waited` starts as None
+        // wait for an (epoch, generation). `last_waited` stays as None
         // (and resets to None on every reimport above), and is set ONLY
         // after a clean wait (`waited_ok`, GL context current, no error).
         // A failed wait (e.g. no current GL context on the upgrade path)
@@ -738,7 +738,21 @@ impl GraphicsBackend for GlData {
         // re-waits properly and can never tear. Verified by read: the
         // only assignment is guarded by `waited_ok` below; no other
         // writer exists. No behavior change.
-        let slot = (req.generation % 3) as usize;
+        //
+        // Slot source: the header's explicit slot field (threaded through
+        // `req.slot`), NEVER `generation % 3` — the producer pairs
+        // (generation, mirror_seq % 3), which diverge from frame 1.
+        // `last_waited` stays keyed (epoch, generation): semaphore
+        // identity is per-generation, the slot is a consequence.
+        if req.slot >= 3 {
+            return DepthFdResult {
+                copied: false,
+                ack_gen: ack,
+                full_waits,
+                overflow_drops,
+            };
+        }
+        let slot = req.slot as usize;
         if cache.last_waited != Some((req.setup_epoch, req.generation)) {
             let Some(wait) = DEPTH_EXT.wait_semaphore else {
                 return DepthFdResult {
@@ -802,7 +816,18 @@ impl GraphicsBackend for GlData {
             };
         }
         let sync = unsafe { gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) };
-        if !sync.is_null() {
+        if sync.is_null() {
+            // Unfenced success must not report copied: the ack below would
+            // let the producer reuse a slot whose copy has no fence, so a
+            // null sync degrades to a plain frame (stays pending-free).
+            return DepthFdResult {
+                copied: false,
+                ack_gen: ack,
+                full_waits,
+                overflow_drops,
+            };
+        }
+        {
             cache.pending.push((sync as u64, req.generation));
             // Bound the fence trail: a GPU that never signals would
             // otherwise grow this Vec forever (one leak per submit).
@@ -834,7 +859,16 @@ impl GraphicsBackend for GlData {
                 gl::ClientWaitSync(sync, gl::SYNC_FLUSH_COMMANDS_BIT, 5_000_000)
             };
             if fresh_status == gl::WAIT_FAILED {
-                cache.pending.pop();
+                // Remove by identity: the fresh fence is usually last, but
+                // a wedged-GPU overflow drop above may have removed it, so
+                // a blind pop could orphan a different generation's ack.
+                if let Some(pos) = cache
+                    .pending
+                    .iter()
+                    .position(|&(bits, _)| bits == sync as u64)
+                {
+                    cache.pending.swap_remove(pos);
+                }
                 unsafe { gl::DeleteSync(sync) };
                 return DepthFdResult {
                     copied: false,
@@ -1204,14 +1238,16 @@ mod tests {
             mem_fds: [11, 12, 13],
             sem_fds: [21, 22, 23],
             generation: 9,
+            slot: 0,
             depth_image_index: 0,
             eye_w: 10,
             eye_h: 10,
             alloc_bytes: 800,
         };
-        // Identical setup (generation/index differ) → same key.
-        // alloc_bytes is in the key (R7), so it must match here.
-        let same = DepthFdRequest { generation: 10, depth_image_index: 1, ..base };
+        // Identical setup (generation/index/slot differ) → same key.
+        // alloc_bytes is in the key (R7), so it must match here; slot is
+        // NOT in the key (consequence of the generation, not identity).
+        let same = DepthFdRequest { generation: 10, depth_image_index: 1, slot: 2, ..base };
         assert_eq!(depth_fd_cache_key(&base), depth_fd_cache_key(&same));
         // Epoch-restart collision: same epoch number, different FDs →
         // different key, forcing a reimport (B5).

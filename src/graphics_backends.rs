@@ -127,6 +127,10 @@ pub struct DepthFdRequest {
     pub mem_fds: [i32; 3],
     pub sem_fds: [i32; 3],
     pub generation: u64,
+    /// Mirror-slot index holding this generation's copy (SHM +56). The
+    /// backend MUST use this for its semaphore wait + copy source and
+    /// must never derive the slot from `generation % 3`.
+    pub slot: u32,
     pub depth_image_index: usize,
     pub eye_w: u32,
     pub eye_h: u32,
