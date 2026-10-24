@@ -1366,61 +1366,6 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_extension_enabled = enabled;
     }
 
-    /// Best-effort depth swapchain pre-warm (R14): when the color dims
-    /// are known (after `recreate_swapchain` / session start), attempt
-    /// the depth swapchain through the existing `ensure_depth_swapchain`
-    /// and cooldown path so the first frames after (re)start are less
-    /// likely plain. Degrades through the existing failure path (false /
-    /// backoff, no new failure modes, never stalls or spams). Format is
-    /// unknown without a header, so try the preferred D32F first when
-    /// advertised, else D32S8; a wrong guess just recreates on the first
-    /// real header (same cost as lazy today).
-    fn prewarm_depth_swapchain(&mut self, session_data: &SessionData)
-    where
-        for<'a> &'a openxr_data::GraphicalSession:
-            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
-        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
-    {
-        if !self.depth_extension_enabled || !G::supports_depth() {
-            return;
-        }
-        if self.depth_swapchain.is_some() {
-            return;
-        }
-        let (color_w, color_h) = match self.swapchain_data.as_ref() {
-            Some(color) => (color.info.width, color.info.height),
-            None => return,
-        };
-        if color_w == 0 || color_h == 0 {
-            return;
-        }
-        for vk_format in [
-            depth_feed::FORMAT_D32F,
-            depth_feed::FORMAT_D32S8,
-        ] {
-            if self.ensure_depth_swapchain(session_data, color_w, color_h, vk_format) {
-                break;
-            }
-            // ensure() returns false on backoff/unsupported without
-            // side effects beyond the existing warn/backoff; trying the
-            // fallback format is still best-effort. Stop after the first
-            // attempt if backoff engaged to avoid double-spam: the
-            // cooldown path already rate-limits.
-            if self.depth_swapchain_backoff.should_skip() {
-                break;
-            }
-            // Only try the fallback when the preferred format is not
-            // advertised at all (ensure failed before creating). If the
-            // preferred creation failed transiently, the backoff above
-            // stops us; otherwise a dims/format mismatch on the real
-            // header recreates anyway.
-            // Continue to the next format only when this one is
-            // unsupported (no swapchain created, no backoff tripped).
-            // Heuristic: if the first format created nothing and set no
-            // backoff, it was likely unadvertised — try the other.
-        }
-    }
-
     fn recreate_swapchain(
         &mut self,
         session_data: &SessionData,
@@ -1460,9 +1405,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_armed_time_ns = None;
         self.acquire_swapchain_image();
         self.eyes_submitted = Default::default();
-        // R14: best-effort pre-warm so post-resize frames arm sooner.
-        // Degrades through the existing ensure/backoff path.
-        self.prewarm_depth_swapchain(session_data);
+        // R14: no depth pre-warm here. The first viable submit arms in one
+        // go via try_upload_depth_fd (ensure + acquire + copy), so an eager
+        // ensure with a guessed format only duplicates that lazy path (a
+        // wrong guess recreates on the first real header at the same cost).
     }
 
     fn acquire_swapchain_image(&mut self) {
@@ -1772,7 +1718,12 @@ impl<G: GraphicsBackend> FrameController<G> {
                     .as_ref()
                     .map(|f| f.read_control())
                 {
-                    None => None,
+                    None => {
+                        // Feed missing after the open attempt (master
+                        // toggled mid-frame): name it instead of silent-plain.
+                        self.note_upgrade_skip("feed-missing");
+                        None
+                    }
                     Some(Err(e)) => {
                         self.note_upgrade_skip(e.reason());
                         None
