@@ -1,5 +1,5 @@
 use super::{DepthFdRequest, DepthFdResult, GraphicsBackend};
-use crate::depth_feed;
+use crate::depth_feed::{self, KeyedBackoff};
 use derive_more::Deref;
 use glutin_glx_sys::{
     Success,
@@ -12,7 +12,6 @@ use openxr as xr;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, LazyLock, Once};
-use std::time::{Duration, Instant};
 
 static GLX: LazyLock<Library> = LazyLock::new(|| Library::new(c"libGLX.so.0"));
 
@@ -32,16 +31,12 @@ pub struct GlData {
     /// GL_EXT_memory_object(_fd) + GL_EXT_semaphore(_fd) all present.
     fd_import_viable: bool,
     depth_fd: Option<DepthFdCache>,
-    /// Last FD key whose import failed + earliest retry time. A failed
+    /// Last FD key whose import failed + its retry backoff. A failed
     /// import for an epoch never succeeds later (FDs are fixed per epoch),
     /// so retrying every submit just burns ~20 ms/frame on blocking GL
     /// errors. Skip until the key changes or the cooldown elapses.
-    fd_failed_key: Option<(u32, u32, u32, i32)>,
-    fd_next_retry: Option<Instant>,
+    fd_backoff: KeyedBackoff<(u32, u32, u32, i32)>,
 }
-
-/// Cooldown between import retries for the same failing key.
-const FD_IMPORT_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 
 #[derive(Copy, Clone, Default)]
 struct DepthFdSlot {
@@ -52,9 +47,8 @@ struct DepthFdSlot {
 
 struct DepthFdCache {
     epoch: u32,
-    seg_len: usize,
-    w: u32,
-    h: u32,
+    eye_w: u32,
+    eye_h: u32,
     vk_format: i32,
     alloc_bytes: u32,
     slots: [DepthFdSlot; 3],
@@ -327,8 +321,7 @@ impl GlData {
             depth_format: 0,
             fd_import_viable: fd_viable,
             depth_fd: None,
-            fd_failed_key: None,
-            fd_next_retry: None,
+            fd_backoff: KeyedBackoff::new(),
         })
     }
 }
@@ -537,57 +530,65 @@ impl GraphicsBackend for GlData {
         }
         let dst = self.depth_images[req.depth_image_index];
         // Reimport on epoch/dims/format change (old GL objects first).
-        // Segment size is deliberately NOT part of the identity.
-        let key = (req.setup_epoch, req.w, req.h, req.vk_format);
+        // Full-mirror dims are exactly `eye * 2` (callers only arm even
+        // widths), so the key classes are identical to the old (w, h) key.
+        let key = (
+            req.setup_epoch,
+            req.eye_w,
+            req.eye_h,
+            req.vk_format,
+        );
         let cached_key = self
             .depth_fd
             .as_ref()
-            .map(|c| (c.epoch, c.w, c.h, c.vk_format));
+            .map(|c| (c.epoch, c.eye_w, c.eye_h, c.vk_format));
         if cached_key != Some(key) {
             // Failed imports never heal for this key (FDs are fixed per
             // epoch): skip the ~20 ms of blocking GL errors until the key
             // changes or the cooldown elapses. Without this a broken FD
             // path halves the framerate retrying every submit.
-            if self.fd_failed_key == Some(key) {
-                let retry_ok = self.fd_next_retry.is_none_or(|t| Instant::now() >= t);
-                if !retry_ok {
-                    return inert();
-                }
+            if self.fd_backoff.should_skip(&key) {
+                return inert();
             }
-            // alloc_bytes bound: the driver allocation can pad past w*h*bpp,
-            // so imports cover the full allocation — but a requirement
-            // larger than a known allocation means writer/reader drift.
-            // Fail the key through the same backoff (one warn per episode,
-            // not per submit). 0 = unknown, tolerate.
-            let want = req.w as u64 * req.h as u64 * bpp;
+            // alloc_bytes bound: the driver allocation can pad past the full
+            // mirror (w*h*bpp), so imports cover the full allocation — but a
+            // requirement larger than a known allocation means writer/reader
+            // drift. Fail the key through the same backoff (one warn per
+            // episode, not per submit). 0 = unknown, tolerate.
+            let want = req.eye_w as u64 * 2 * req.eye_h as u64 * bpp;
             if req.alloc_bytes != 0 && want > req.alloc_bytes as u64 {
                 warn!(
                     "depth FD setup rejected: want {want} > alloc {} (epoch {}, {}x{} fmt {})",
-                    req.alloc_bytes, req.setup_epoch, req.w, req.h, req.vk_format,
+                    req.alloc_bytes,
+                    req.setup_epoch,
+                    req.eye_w * 2,
+                    req.eye_h,
+                    req.vk_format,
                 );
-                self.fd_failed_key = Some(key);
-                self.fd_next_retry = Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
+                self.fd_backoff.note_failure(key);
                 return inert();
             }
             match self.depth_fd.as_ref() {
                 Some(c) => debug!(
-                    "depth FD reimport: epoch {}→{}, dims {}x{}→{}x{}, format {}→{}, seg {}→{}, alloc {}→{}",
+                    "depth FD reimport: epoch {}→{}, dims {}x{}→{}x{}, format {}→{}, alloc {}→{}",
                     c.epoch,
                     req.setup_epoch,
-                    c.w,
-                    c.h,
-                    req.w,
-                    req.h,
+                    c.eye_w * 2,
+                    c.eye_h,
+                    req.eye_w * 2,
+                    req.eye_h,
                     c.vk_format,
                     req.vk_format,
-                    c.seg_len,
-                    req.seg_len,
                     c.alloc_bytes,
                     req.alloc_bytes,
                 ),
                 None => debug!(
-                    "depth FD import: epoch {}, dims {}x{}, format {}, seg {}, alloc {}",
-                    req.setup_epoch, req.w, req.h, req.vk_format, req.seg_len, req.alloc_bytes,
+                    "depth FD import: epoch {}, dims {}x{}, format {}, alloc {}",
+                    req.setup_epoch,
+                    req.eye_w * 2,
+                    req.eye_h,
+                    req.vk_format,
+                    req.alloc_bytes,
                 ),
             }
             self.drop_depth_imports();
@@ -595,9 +596,8 @@ impl GraphicsBackend for GlData {
                 Some(slots) => {
                     self.depth_fd = Some(DepthFdCache {
                         epoch: req.setup_epoch,
-                        seg_len: req.seg_len,
-                        w: req.w,
-                        h: req.h,
+                        eye_w: req.eye_w,
+                        eye_h: req.eye_h,
                         vk_format: req.vk_format,
                         alloc_bytes: req.alloc_bytes,
                         slots,
@@ -605,15 +605,13 @@ impl GraphicsBackend for GlData {
                         pending: Vec::new(),
                     });
                     // Healed (or first success): clear any failure record.
-                    self.fd_failed_key = None;
-                    self.fd_next_retry = None;
+                    self.fd_backoff.note_success();
                 }
                 None => {
                     // Remember the failure so subsequent submits for this key
                     // skip the import until the cooldown elapses. The warn
                     // inside import_fd_slots already named the failing step.
-                    self.fd_failed_key = Some(key);
-                    self.fd_next_retry = Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
+                    self.fd_backoff.note_failure(key);
                     return inert();
                 }
             }
@@ -832,11 +830,14 @@ impl GlData {
     /// same process, producer-held, valid for the segment lifetime.
     /// Never declares DEDICATED (drivers reject it on some paths).
     fn import_fd_slots(req: &DepthFdRequest, bpp: u64, internal: u32) -> Option<[DepthFdSlot; 3]> {
-        // Driver allocation can pad past w*h*bpp (alignment). Import the
-        // full allocation so glImportMemoryFdEXT never sees a truncated
+        // Driver allocation can pad past the full mirror (alignment). Import
+        // the full allocation so glImportMemoryFdEXT never sees a truncated
         // object. The want > alloc rejection already ran in the caller;
         // alloc==0 means the producer predates the header field.
-        let want = req.w as u64 * req.h as u64 * bpp;
+        // Full-mirror width is `eye_w * 2`: callers only arm even `w`
+        // (is_viable gate upstream), so this equals the old `w * h * bpp`.
+        let full_w = req.eye_w as u64 * 2;
+        let want = full_w * req.eye_h as u64 * bpp;
         let size = want.max(req.alloc_bytes as u64);
         if size == 0 {
             return None;
@@ -872,7 +873,15 @@ impl GlData {
                     } else {
                         gl::GenTextures(1, &mut tex);
                         gl::BindTexture(gl::TEXTURE_2D, tex);
-                        tex_storage(tex, 1, internal, req.w as i32, req.h as i32, mem, 0);
+                        tex_storage(
+                            tex,
+                            1,
+                            internal,
+                            full_w as i32,
+                            req.eye_h as i32,
+                            mem,
+                            0,
+                        );
                         if !Self::gl_ok() || tex == 0 {
                             failed_at = Some("glTextureStorageMem2DEXT");
                         } else {
@@ -899,8 +908,8 @@ impl GlData {
                 warn!(
                     "depth FD import failed at {step} (slot {i}/3, epoch {}, {}x{} fmt {} memfd {} semfd {} size {})",
                     req.setup_epoch,
-                    req.w,
-                    req.h,
+                    req.eye_w * 2,
+                    req.eye_h,
                     req.vk_format,
                     req.mem_fds[i],
                     req.sem_fds[i],

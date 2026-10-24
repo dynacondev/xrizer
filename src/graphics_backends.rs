@@ -104,11 +104,15 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 }
 
 /// One FD-mode frame for [`GraphicsBackend::import_and_copy_depth_fd`].
+///
+/// Per-eye dims are derived once by the caller (`eye_w = w/2`, `eye_h = h`;
+/// see `DepthControl::eye_w`). The full-mirror width is exactly
+/// `eye_w * 2`: callers only arm even `w` (the `is_viable` gate upstream),
+/// so import size, bound check, and cache key classes are identical to the
+/// old `(w, h)` request. `seg_len` is gone: it only ever fed debug logs
+/// (always 128 whenever a request is built).
 pub struct DepthFdRequest {
     pub setup_epoch: u32,
-    pub seg_len: usize,
-    pub w: u32,
-    pub h: u32,
     pub vk_format: i32,
     pub mem_fds: [i32; 3],
     pub sem_fds: [i32; 3],

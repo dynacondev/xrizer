@@ -1,7 +1,7 @@
 use crate::{
     AtomicF64,
     clientcore::{Injected, Injector},
-    depth_feed::{self, DepthControl, DepthFeed},
+    depth_feed::{self, Backoff, DepthControl, DepthFeed},
     graphics_backends::{
         DepthFdRequest, GraphicsBackend, SupportedBackend, supported_backends_enum,
     },
@@ -20,7 +20,7 @@ use std::sync::{
     Arc, Mutex, Once,
     atomic::{AtomicU32, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{ffi::c_char, ops::Deref};
 
 #[derive(Default)]
@@ -1067,9 +1067,6 @@ struct SwapchainData<G: xr::Graphics> {
     initial_format: G::Format,
 }
 
-/// Cooldown between depth swapchain creation retries after a failure.
-const DEPTH_SWAPCHAIN_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
-
 struct FrameController<G: GraphicsBackend> {
     stream: xr::FrameStream<G::Api>,
     waiter: xr::FrameWaiter,
@@ -1095,9 +1092,10 @@ struct FrameController<G: GraphicsBackend> {
     /// `depth_ready_this_frame`; the end_frame upgrade uses it to detect a
     /// newer present.
     depth_armed_generation: Option<u64>,
-    /// Debug-only submit heartbeat: submits since the last line + window
-    /// start, with the depth-armed vs plain split. Throttled 5 s.
-    submit_log_count: u64,
+    /// Debug-only submit heartbeat: per-window submits with the
+    /// depth-armed vs plain split. Throttled 5 s; the submit path is untouched.
+    /// (The total is derived as armed + plain at emit time — every end takes
+    /// exactly one of those branches — so no separate counter is stored.)
     submit_log_start_mono_ns: u64,
     depth_armed_frames: u64,
     depth_plain_frames: u64,
@@ -1132,7 +1130,9 @@ struct FrameController<G: GraphicsBackend> {
     end_repeat_count: u64,
     /// Earliest retry time after a depth swapchain creation failure.
     /// Transient runtime errors cost skipped ticks, never stalls or spam.
-    depth_swapchain_next_retry: Option<Instant>,
+    /// Shared [`Backoff`] helper (S3): same 2 s skip-until-Instant pattern
+    /// as the FD import path; warns stay at the failure sites below.
+    depth_swapchain_backoff: Backoff,
     /// Happy path emits exactly one info! total (first successful arm).
     depth_first_arm_logged: bool,
 }
@@ -1230,7 +1230,6 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_near_far: None,
             depth_min_max: None,
             depth_armed_generation: None,
-            submit_log_count: 0,
             submit_log_start_mono_ns: 0,
             depth_armed_frames: 0,
             depth_plain_frames: 0,
@@ -1243,7 +1242,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_upgrade_skip_reason: None,
             last_end_display_time: None,
             end_repeat_count: 0,
-            depth_swapchain_next_retry: None,
+            depth_swapchain_backoff: Backoff::new(),
             depth_first_arm_logged: false,
         }
     }
@@ -1410,6 +1409,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         // color copy above). FD mode only: GPU-side copy from the imported
         // dma-buf ring, no CPU upload. Arms `depth_ready_this_frame` only
         // on full success so end_frame chains both eyes or neither.
+        // Render-state gates stay here (they differ from the upgrade path);
+        // the shared feed/viability/read/upload tail lives in `poll_depth`.
         if self.should_render
             && !self.submitting_null
             && !self.depth_ready_this_frame
@@ -1417,17 +1418,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             && self.depth_extension_enabled
             && depth_feed::depth_master_enabled()
         {
-            if self.depth_feed.is_none() {
-                self.depth_feed = DepthFeed::open();
-            }
-            // Backend viability first (no GL work without imports); the
-            // upload itself re-validates mode, dims, FDs and staleness.
-            if self.backend.depth_fd_import_viable()
-                && let Some(ctl) = self.depth_feed.as_ref().and_then(|f| f.read_control())
-                && ctl.mode == depth_feed::MODE_FD
-            {
-                self.try_upload_depth_fd(session_data, &ctl, false);
-            }
+            self.poll_depth(session_data, false);
         }
 
         trace!("submitted {eye:?}");
@@ -1456,6 +1447,69 @@ impl<G: GraphicsBackend> FrameController<G> {
         if self.depth_upgrade_skip_reason != Some(reason) {
             self.depth_upgrade_skip_reason = Some(reason);
             warn!("depth upgrade skipped ({reason}); plain views");
+        }
+    }
+
+    /// Shared depth poll for the submit path (`quiet=false`: loud,
+    /// once-per-episode warns) and the end-frame upgrade (`quiet=true`:
+    /// per-reason skip accounting via [`note_upgrade_skip`]).
+    ///
+    /// Callers own the render-state gates (`should_render`, null submits,
+    /// submit-time already-armed) and the extension/master switches, which
+    /// differ per path; this owns the shared tail: feed-open, the
+    /// import-viability gate, control read, mode/generation filters, upload,
+    /// and upgrade ok/pass counting. The quiet/loud reporting inside
+    /// [`try_upload_depth_fd`] is untouched (R3/R4 depend on the
+    /// distinction), as is every log line and counter update — the two call
+    /// sites just share the boilerplate (S6).
+    fn poll_depth(&mut self, session_data: &SessionData, quiet: bool)
+    where
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
+    {
+        if quiet {
+            // Post-present upgrade: the Submit-time upload ran before
+            // X-Plane's present for this frame, so it armed the previous
+            // present's depth (systematic 1-frame lag). By end_frame the
+            // present has completed; re-read the control header and upgrade
+            // to the newest generation when the GL context allows. Quiet on
+            // failure: the submit-time arming stays valid.
+            if self.backend.depth_fd_import_viable() {
+                if self.depth_feed.is_none() {
+                    self.depth_feed = DepthFeed::open();
+                }
+                let upgrade: Option<DepthControl> = self
+                    .depth_feed
+                    .as_ref()
+                    .and_then(|f| f.read_control())
+                    .filter(|ctl| {
+                        ctl.mode == depth_feed::MODE_FD
+                            && ctl.generation != 0
+                            && Some(ctl.generation) != self.depth_armed_generation
+                    });
+                if let Some(ctl) = upgrade {
+                    let before = self.depth_armed_generation;
+                    self.try_upload_depth_fd(session_data, &ctl, true);
+                    if self.depth_armed_generation != before {
+                        self.depth_upgrade_ok += 1;
+                    } else {
+                        self.depth_upgrade_pass += 1;
+                    }
+                }
+            }
+        } else {
+            if self.depth_feed.is_none() {
+                self.depth_feed = DepthFeed::open();
+            }
+            // Backend viability first (no GL work without imports); the
+            // upload itself re-validates mode, dims, FDs and staleness.
+            if self.backend.depth_fd_import_viable()
+                && let Some(ctl) = self.depth_feed.as_ref().and_then(|f| f.read_control())
+                && ctl.mode == depth_feed::MODE_FD
+            {
+                self.try_upload_depth_fd(session_data, &ctl, false);
+            }
         }
     }
 
@@ -1577,9 +1631,6 @@ impl<G: GraphicsBackend> FrameController<G> {
         };
         let res = self.backend.import_and_copy_depth_fd(&DepthFdRequest {
             setup_epoch: ctl.setup_epoch,
-            seg_len: ctl.seg_len,
-            w: ctl.w,
-            h: ctl.h,
             vk_format: ctl.format,
             mem_fds: ctl.mem_fds,
             sem_fds: ctl.sem_fds,
@@ -1661,9 +1712,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         // unusable: drop it so `Some` always means usable dims. Backend
         // import objects are epoch-keyed and re-created on demand.
         self.depth_swapchain = None;
-        if let Some(t) = self.depth_swapchain_next_retry
-            && Instant::now() < t
-        {
+        if self.depth_swapchain_backoff.should_skip() {
             return false;
         }
         let formats = match session_data.swapchain_formats::<G>() {
@@ -1698,8 +1747,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     Ok(images) => images,
                     Err(e) => {
                         warn!("failed to enumerate depth swapchain images ({e})");
-                        self.depth_swapchain_next_retry =
-                            Some(Instant::now() + DEPTH_SWAPCHAIN_RETRY_COOLDOWN);
+                        self.depth_swapchain_backoff.note_failure();
                         return false;
                     }
                 };
@@ -1714,7 +1762,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     info,
                     initial_format: want_fmt,
                 });
-                self.depth_swapchain_next_retry = None;
+                self.depth_swapchain_backoff.note_success();
                 true
             }
             Err(e) => {
@@ -1728,8 +1776,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                             Ok(images) => images,
                             Err(e) => {
                                 warn!("failed to enumerate depth swapchain images ({e})");
-                                self.depth_swapchain_next_retry =
-                                    Some(Instant::now() + DEPTH_SWAPCHAIN_RETRY_COOLDOWN);
+                                self.depth_swapchain_backoff.note_failure();
                                 return false;
                             }
                         };
@@ -1744,13 +1791,12 @@ impl<G: GraphicsBackend> FrameController<G> {
                             info,
                             initial_format: want_fmt,
                         });
-                        self.depth_swapchain_next_retry = None;
+                        self.depth_swapchain_backoff.note_success();
                         true
                     }
                     Err(e2) => {
                         warn!("depth swapchain creation failed ({e2}); color-only");
-                        self.depth_swapchain_next_retry =
-                            Some(Instant::now() + DEPTH_SWAPCHAIN_RETRY_COOLDOWN);
+                        self.depth_swapchain_backoff.note_failure();
                         false
                     }
                 }
@@ -1773,8 +1819,10 @@ impl<G: GraphicsBackend> FrameController<G> {
     {
         // Debug-only submit heartbeat: submits/s plus the depth-armed vs
         // plain split. Throttled 5 s; the submit path is untouched.
+        // (S4: no separate total counter — every end takes exactly one of
+        // the armed/plain branches, so the total is derived at emit time.
+        // Emitted line shape and all information are unchanged.)
         {
-            self.submit_log_count += 1;
             // Per-end stamp for the stamp-vs-render-pose audit: compare
             // against the waited-frame display_times in the same log.
             // A stamp newer than any wait serving this frame means the
@@ -1796,10 +1844,11 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.submit_log_start_mono_ns = now;
             } else if now.saturating_sub(self.submit_log_start_mono_ns) > 5_000_000_000 {
                 let dt = (now - self.submit_log_start_mono_ns) as f64 / 1e9;
+                let total = self.depth_armed_frames + self.depth_plain_frames;
                 debug!(
                     "frames {:.1}/s ({} frames, {} with depth, {} plain, upgrade {} ok / {} pass, skip {}, repeat-ends {})",
-                    self.submit_log_count as f64 / dt,
-                    self.submit_log_count,
+                    total as f64 / dt,
+                    total,
                     self.depth_armed_frames,
                     self.depth_plain_frames,
                     self.depth_upgrade_ok,
@@ -1807,7 +1856,6 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.depth_upgrade_skip_reason.unwrap_or("none"),
                     self.end_repeat_count,
                 );
-                self.submit_log_count = 0;
                 self.depth_armed_frames = 0;
                 self.depth_plain_frames = 0;
                 self.depth_upgrade_ok = 0;
@@ -1957,35 +2005,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         if !depth_feed::depth_master_enabled() {
             return false;
         }
-        // Post-present upgrade: the Submit-time upload ran before X-Plane's
-        // present for this frame, so it armed the previous present's depth
-        // (systematic 1-frame lag). By end_frame the present has completed;
+        // Post-present upgrade (shared `poll_depth` tail, quiet accounting):
         // re-read the control header and upgrade to the newest generation
         // when the GL context allows. Quiet on failure: the submit-time
         // arming stays valid.
-        if self.backend.depth_fd_import_viable() {
-            if self.depth_feed.is_none() {
-                self.depth_feed = DepthFeed::open();
-            }
-            let upgrade: Option<DepthControl> = self
-                .depth_feed
-                .as_ref()
-                .and_then(|f| f.read_control())
-                .filter(|ctl| {
-                    ctl.mode == depth_feed::MODE_FD
-                        && ctl.generation != 0
-                        && Some(ctl.generation) != self.depth_armed_generation
-                });
-            if let Some(ctl) = upgrade {
-                let before = self.depth_armed_generation;
-                self.try_upload_depth_fd(session_data, &ctl, true);
-                if self.depth_armed_generation != before {
-                    self.depth_upgrade_ok += 1;
-                } else {
-                    self.depth_upgrade_pass += 1;
-                }
-            }
-        }
+        self.poll_depth(session_data, true);
         // Armed by try_upload_depth_fd during Submit (or upgraded above).
         // Both halves were handled atomically there: both eyes or neither.
         if !self.depth_ready_this_frame {
@@ -2790,54 +2814,19 @@ mod tests {
         // tripwire, not gate-chain coverage — logic is Tier-1 covered.)
         let _lock = crate::depth_feed::env_guard();
         let seg_name = crate::depth_feed::DEFAULT_SHM_NAME;
-        unsafe {
-            let cname = std::ffi::CString::new(seg_name).unwrap();
-            libc::shm_unlink(cname.as_ptr());
-            let len = 128usize;
-            let fd = libc::shm_open(
-                cname.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
-                0o600,
-            );
-            assert!(fd >= 0);
-            assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            assert_ne!(ptr, libc::MAP_FAILED);
-            libc::close(fd);
-            let hdr = crate::depth_feed::XdShmHeaderV2 {
-                magic: 0x5850_4450,
-                version: 2,
-                seq: 1,
-                w: 20,
-                h: 10,
-                format: 126,
-                eye_layout: 1,
-                present_no: 1,
-                time_mono_ns: crate::depth_feed::now_mono_ns(),
-                min_depth: 0.0,
-                max_depth: 1.0,
-                _pad56: [0, 0],
-                mode: 1,
-                setup_epoch: 3,
-                consumed_gen: 0,
-                mem_fds: [11, 12, 13],
-                sem_fds: [21, 22, 23],
-                near_z: 0.01,
-                far_z: 200.0,
-                alloc_bytes: 800,
-                reserved: [0, 0, 0],
-            };
-            (ptr as *mut crate::depth_feed::XdShmHeaderV2).write_unaligned(hdr);
-            (ptr as *mut u32).add(2).write_volatile(2);
-            libc::munmap(ptr, len);
-        }
+        // Shared SHM test helper (S7): same viable segment as the hand-rolled
+        // 128B block this replaced (20x10, gen 1, epoch 3, fresh stamp).
+        let _seg = crate::depth_feed::make_seg_v2(
+            seg_name,
+            20,
+            10,
+            1,
+            crate::depth_feed::MODE_FD,
+            |h| {
+                h.setup_epoch = 3;
+                h.alloc_bytes = 800;
+            },
+        );
         crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "1");
 
         let f = Fixture::new();
@@ -2896,10 +2885,7 @@ mod tests {
         }
 
         crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
-        unsafe {
-            let cname = std::ffi::CString::new(seg_name).unwrap();
-            libc::shm_unlink(cname.as_ptr());
-        }
+        // (`_seg`'s Drop unlinks the fixed path here.)
     }
 
     #[test]

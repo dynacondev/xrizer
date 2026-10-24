@@ -37,7 +37,9 @@
 
 use log::{debug, info, warn};
 use std::ffi::CString;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub const SHM_MAGIC: u32 = 0x5850_4450; // 'XPDP'
 pub const SHM_VERSION_V2: u32 = 2;
@@ -56,6 +58,72 @@ pub const CONSUMED_GEN_OFF: usize = 72;
 pub const DEFAULT_SHM_NAME: &str = "/xplane-depth-v1";
 /// Default staleness bound (ms) when `XRIZER_DEPTH_MAX_AGE_MS` is unset.
 pub const DEFAULT_MAX_AGE_MS: u64 = 100;
+
+/// Shared retry backoff (S3): remember-failing-key + skip-until-Instant.
+///
+/// Both depth-retry cooldowns (FD import in `gl.rs`, depth swapchain
+/// creation in `compositor.rs`) are 2 s and share this helper. The helper
+/// itself never logs: every warn stays verbatim at the call site, so warn
+/// behavior is identical to the two inlined cooldowns it replaced.
+pub const RETRY_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Unkeyed skip-until-Instant backoff.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    next_retry: Option<Instant>,
+}
+
+impl Backoff {
+    pub const fn new() -> Self {
+        Self { next_retry: None }
+    }
+
+    /// True while a recent failure is still cooling down: skip the attempt.
+    pub fn should_skip(&self) -> bool {
+        self.next_retry.is_some_and(|t| Instant::now() < t)
+    }
+
+    pub fn note_failure(&mut self) {
+        self.next_retry = Some(Instant::now() + RETRY_COOLDOWN);
+    }
+
+    pub fn note_success(&mut self) {
+        self.next_retry = None;
+    }
+}
+
+/// Keyed skip-until-Instant backoff: a failure only blocks its own key; a
+/// key change retries immediately.
+#[derive(Debug, Default)]
+pub struct KeyedBackoff<K: PartialEq> {
+    failed_key: Option<K>,
+    inner: Backoff,
+}
+
+impl<K: PartialEq> KeyedBackoff<K> {
+    pub const fn new() -> Self {
+        Self {
+            failed_key: None,
+            inner: Backoff::new(),
+        }
+    }
+
+    /// True when `key` is the remembered failing key and its cooldown has
+    /// not elapsed: skip the attempt without logging (as before).
+    pub fn should_skip(&self, key: &K) -> bool {
+        self.failed_key.as_ref() == Some(key) && self.inner.should_skip()
+    }
+
+    pub fn note_failure(&mut self, key: K) {
+        self.failed_key = Some(key);
+        self.inner.note_failure();
+    }
+
+    pub fn note_success(&mut self) {
+        self.failed_key = None;
+        self.inner.note_success();
+    }
+}
 
 /// Mirror of the C `rx_shm_header`. Must stay 128 bytes with the exact
 /// offsets below (`mode` at +64, `consumed_gen` at +72, `alloc_bytes`
@@ -220,6 +288,14 @@ unsafe impl Send for MappedSeg {}
 
 /// Open + mmap the current segment. A fresh mapping every call picks up
 /// producer recreates (epoch or size changes) with no stale fd.
+///
+/// This is the single shared open helper for all three SHM polls (submit
+/// read, upgrade read, ack store): S1-full (hold one mapping across
+/// submit->end) is deferred as unsound — the polls run on distinct API
+/// entries (`Submit` vs `PostPresentHandoff`, the latter also fired from
+/// `WaitGetPoses` on another thread) and a held fd would mask a producer
+/// `shm_unlink`+recreate/epoch bump — so every `read_control` still maps
+/// fresh here.
 fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
     let oflag = (if write { libc::O_RDWR } else { libc::O_RDONLY }) | libc::O_CLOEXEC;
     let fd = unsafe { libc::shm_open(name.as_ptr(), oflag, 0o600) };
@@ -450,9 +526,52 @@ fn warn_once_flag(flag: &AtomicBool, msg: &str) {
     }
 }
 
+/// Cached depth config (S2): `XRIZER_DEPTH_SHM` / `XRIZER_DEPTH_MAX_AGE_MS`
+/// are parsed once per process instead of 2-3x per frame, which also
+/// removes the mid-frame toggle hazard (R12: the arm and chain paths could
+/// previously observe different values within one frame). Prod env is fixed
+/// for the process lifetime, so caching is sound; tests mutate env through
+/// [`set_env_for_tests`]/[`del_env_for_tests`], which clear this cache, so
+/// every test assertion re-parses exactly as before.
+#[derive(Copy, Clone)]
+struct DepthConfig {
+    master: bool,
+    max_age_ms: u64,
+}
+
+static DEPTH_CONFIG_CACHE: Mutex<Option<DepthConfig>> = Mutex::new(None);
+
+fn depth_config() -> DepthConfig {
+    let mut guard = DEPTH_CONFIG_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = *guard {
+        return cached;
+    }
+    let parsed = DepthConfig {
+        master: parse_depth_master_enabled(),
+        max_age_ms: parse_max_age_ms(),
+    };
+    *guard = Some(parsed);
+    parsed
+}
+
 /// Master switch, default ON. Explicit `0/false/no/off` disables;
 /// anything unparseable warns once and stays ON (fail-open toward depth).
+/// Read once per process (see [`depth_config`]).
 pub fn depth_master_enabled() -> bool {
+    depth_config().master
+}
+
+/// Staleness bound in ms (valid 1..=60000). Garbage/zero/negative/huge
+/// warns once and falls back to 100. There is no disable token: use 60000
+/// (60 s) as the escape hatch to effectively disable staleness checks.
+/// Read once per process (see [`depth_config`]).
+pub fn max_age_ms() -> u64 {
+    depth_config().max_age_ms
+}
+
+fn parse_depth_master_enabled() -> bool {
     match std::env::var("XRIZER_DEPTH_SHM") {
         Err(_) => true,
         Ok(v) => {
@@ -472,10 +591,7 @@ pub fn depth_master_enabled() -> bool {
     }
 }
 
-/// Staleness bound in ms (valid 1..=60000). Garbage/zero/negative/huge
-/// warns once and falls back to 100. There is no disable token: use 60000
-/// (60 s) as the escape hatch to effectively disable staleness checks.
-pub fn max_age_ms() -> u64 {
+fn parse_max_age_ms() -> u64 {
     match std::env::var("XRIZER_DEPTH_MAX_AGE_MS") {
         Err(_) => DEFAULT_MAX_AGE_MS,
         Ok(v) => match v.trim().parse::<i64>() {
@@ -507,7 +623,7 @@ pub fn now_mono_ns() -> u64 {
 }
 
 #[cfg(test)]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 /// Serializes tests that mutate process-global env vars.
 #[cfg(test)]
@@ -520,138 +636,159 @@ pub(crate) fn env_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Test-only env mutation. Callers must hold [`env_guard`].
+/// Test-only env mutation. Callers must hold [`env_guard`]. Clears the
+/// cached depth config (S2 hook) so the next read re-parses.
 #[cfg(test)]
 pub(crate) fn set_env_for_tests(key: &str, val: &str) {
     // SAFETY: all test env mutation is serialized through env_guard(),
     // and no other thread in this binary mutates the environment.
     unsafe { std::env::set_var(key, val) }
+    *DEPTH_CONFIG_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
-/// Test-only env mutation. Callers must hold [`env_guard`].
+/// Test-only env mutation. Callers must hold [`env_guard`]. Clears the
+/// cached depth config (S2 hook) so the next read re-parses.
 #[cfg(test)]
 pub(crate) fn del_env_for_tests(key: &str) {
     // SAFETY: see set_env_for_tests.
     unsafe { std::env::remove_var(key) }
+    *DEPTH_CONFIG_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// Shared SHM test helper (S7): builds a live 128-byte v2 segment at
+/// `name` for gate tests (viable / stale / dims / format). The `tweak`
+/// closure adjusts any header field (epoch, near/far, alloc, FDs, ...);
+/// the segment is unlinked on drop. Test-only: no prod change.
+#[cfg(test)]
+pub(crate) struct TestSeg {
+    name: CString,
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+#[cfg(test)]
+impl Drop for TestSeg {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+            libc::shm_unlink(self.name.as_ptr());
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn make_seg_v2(
+    name: &str,
+    w: u32,
+    h: u32,
+    generation: u64,
+    mode: u32,
+    tweak: impl FnOnce(&mut XdShmHeaderV2),
+) -> TestSeg {
+    let cname = CString::new(name).unwrap();
+    unsafe { libc::shm_unlink(cname.as_ptr()) };
+    let len = HEADER_SIZE_V2;
+    let fd = unsafe {
+        libc::shm_open(
+            cname.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+            0o600,
+        )
+    };
+    assert!(fd >= 0, "shm_open failed");
+    assert_eq!(unsafe { libc::ftruncate(fd, len as libc::off_t) }, 0);
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    assert_ne!(ptr, libc::MAP_FAILED);
+    unsafe { libc::close(fd) };
+    let mut hdr = XdShmHeaderV2 {
+        magic: SHM_MAGIC,
+        version: SHM_VERSION_V2,
+        seq: 1,
+        w,
+        h,
+        format: FORMAT_D32F,
+        eye_layout: EYE_SIDEBYSIDE,
+        present_no: generation,
+        time_mono_ns: now_mono_ns(),
+        min_depth: 0.0,
+        max_depth: 1.0,
+        _pad56: [0, 0],
+        mode,
+        setup_epoch: 7,
+        consumed_gen: 0,
+        mem_fds: [11, 12, 13],
+        sem_fds: [21, 22, 23],
+        near_z: 0.01,
+        far_z: 200.0,
+        alloc_bytes: 8 * 2 * 4,
+        reserved: [0, 0, 0],
+    };
+    tweak(&mut hdr);
+    unsafe {
+        (ptr as *mut XdShmHeaderV2).write_unaligned(hdr);
+        (ptr as *mut u32).add(2).write_volatile(2);
+    }
+    TestSeg {
+        name: cname,
+        ptr,
+        len,
+    }
+}
+
+/// Raw-bytes segment builder for size/magic/version rejection tests.
+/// Test-only: no prod change.
+#[cfg(test)]
+pub(crate) fn make_raw_seg(
+    name: &str,
+    len: usize,
+    fill: impl FnOnce(*mut libc::c_void),
+) -> TestSeg {
+    let cname = CString::new(name).unwrap();
+    unsafe { libc::shm_unlink(cname.as_ptr()) };
+    let fd = unsafe {
+        libc::shm_open(
+            cname.as_ptr(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+            0o600,
+        )
+    };
+    assert!(fd >= 0, "shm_open failed");
+    assert_eq!(unsafe { libc::ftruncate(fd, len as libc::off_t) }, 0);
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    assert_ne!(ptr, libc::MAP_FAILED);
+    unsafe { libc::close(fd) };
+    fill(ptr);
+    TestSeg {
+        name: cname,
+        ptr,
+        len,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
-
-    struct TestSeg {
-        name: CString,
-        ptr: *mut libc::c_void,
-        len: usize,
-    }
-    impl Drop for TestSeg {
-        fn drop(&mut self) {
-            unsafe {
-                libc::munmap(self.ptr, self.len);
-                libc::shm_unlink(self.name.as_ptr());
-            }
-        }
-    }
-
-    fn make_seg_v2(
-        name: &str,
-        w: u32,
-        h: u32,
-        generation: u64,
-        mode: u32,
-        tweak: impl FnOnce(&mut XdShmHeaderV2),
-    ) -> TestSeg {
-        let cname = CString::new(name).unwrap();
-        unsafe { libc::shm_unlink(cname.as_ptr()) };
-        let len = HEADER_SIZE_V2;
-        let fd = unsafe {
-            libc::shm_open(
-                cname.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
-                0o600,
-            )
-        };
-        assert!(fd >= 0, "shm_open failed");
-        assert_eq!(unsafe { libc::ftruncate(fd, len as libc::off_t) }, 0);
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED);
-        unsafe { libc::close(fd) };
-        let mut hdr = XdShmHeaderV2 {
-            magic: SHM_MAGIC,
-            version: SHM_VERSION_V2,
-            seq: 1,
-            w,
-            h,
-            format: FORMAT_D32F,
-            eye_layout: EYE_SIDEBYSIDE,
-            present_no: generation,
-            time_mono_ns: now_mono_ns(),
-            min_depth: 0.0,
-            max_depth: 1.0,
-            _pad56: [0, 0],
-            mode,
-            setup_epoch: 7,
-            consumed_gen: 0,
-            mem_fds: [11, 12, 13],
-            sem_fds: [21, 22, 23],
-            near_z: 0.01,
-            far_z: 200.0,
-            alloc_bytes: 8 * 2 * 4,
-            reserved: [0, 0, 0],
-        };
-        tweak(&mut hdr);
-        unsafe {
-            (ptr as *mut XdShmHeaderV2).write_unaligned(hdr);
-            (ptr as *mut u32).add(2).write_volatile(2);
-        }
-        TestSeg {
-            name: cname,
-            ptr,
-            len,
-        }
-    }
-
-    fn make_raw_seg(name: &str, len: usize, fill: impl FnOnce(*mut libc::c_void)) -> TestSeg {
-        let cname = CString::new(name).unwrap();
-        unsafe { libc::shm_unlink(cname.as_ptr()) };
-        let fd = unsafe {
-            libc::shm_open(
-                cname.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
-                0o600,
-            )
-        };
-        assert!(fd >= 0, "shm_open failed");
-        assert_eq!(unsafe { libc::ftruncate(fd, len as libc::off_t) }, 0);
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED);
-        unsafe { libc::close(fd) };
-        fill(ptr);
-        TestSeg {
-            name: cname,
-            ptr,
-            len,
-        }
-    }
 
     #[test]
     fn header_layout_matches_shm_contract() {
