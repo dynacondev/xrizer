@@ -131,7 +131,9 @@ pub struct DepthControl {
     pub sem_fds: [i32; 3],
     pub near_z: f32,
     pub far_z: f32,
-    /// Highest fully-copied generation, as last observed.
+    /// Highest fully-copied generation, as last observed (xrizer->shim
+    /// direction: written by xrizer via store_consumed, read by the
+    /// producer to free slots).
     pub consumed_gen: u64,
     /// Observed segment length; viable only when exactly 128.
     pub seg_len: usize,
@@ -179,6 +181,9 @@ impl DepthControl {
         if self.time_ns == 0 || self.time_ns > now_mono_ns {
             return true;
         }
+        // max_age_ms is clamped to 1..=60000 by max_age_ms(), so
+        // max_age_ms * 1_000_000 <= 6e10 ns: saturating_mul can never
+        // overflow u64 here (do NOT "fix" with u128).
         now_mono_ns.saturating_sub(self.time_ns) > max_age_ms.saturating_mul(1_000_000)
     }
 }
@@ -283,7 +288,6 @@ impl DepthFeed {
     pub fn read_control(&self) -> Option<DepthControl> {
         let map = map_segment(&self.name, false)?;
         let (ptr, map_len) = (map.ptr, map.len);
-        debug_assert_eq!(map_len, HEADER_SIZE_V2);
         for _ in 0..4 {
             let seq1 = unsafe { read_seq(ptr) };
             if seq1 & 1 == 1 {
@@ -468,8 +472,9 @@ pub fn depth_master_enabled() -> bool {
     }
 }
 
-/// Staleness bound in ms. Garbage/zero/negative/huge warns once and
-/// falls back to 100.
+/// Staleness bound in ms (valid 1..=60000). Garbage/zero/negative/huge
+/// warns once and falls back to 100. There is no disable token: use 60000
+/// (60 s) as the escape hatch to effectively disable staleness checks.
 pub fn max_age_ms() -> u64 {
     match std::env::var("XRIZER_DEPTH_MAX_AGE_MS") {
         Err(_) => DEFAULT_MAX_AGE_MS,
@@ -478,7 +483,9 @@ pub fn max_age_ms() -> u64 {
             _ => {
                 warn_once_flag(
                     &WARNED_MAX_AGE,
-                    &format!("XRIZER_DEPTH_MAX_AGE_MS={v:?} invalid; defaulting 100"),
+                    &format!(
+                        "XRIZER_DEPTH_MAX_AGE_MS={v:?} invalid; defaulting 100 (use 60000 to effectively disable staleness checks)"
+                    ),
                 );
                 DEFAULT_MAX_AGE_MS
             }

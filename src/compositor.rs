@@ -1819,7 +1819,9 @@ impl<G: GraphicsBackend> FrameController<G> {
 
         // Depth path first; any gate failure falls through to the plain path.
         // TEMPORARY rotation-only-group diagnostic (remove once pinned):
-        // per-end depth identity. A plain end means the server gets no
+        // per-end depth identity. Trace volume is ~270 lines/s at 90 Hz
+        // (2 per end + 1 per wait-frame), not ~18/s — keep trace-only.
+        // A plain end means the server gets no
         // depth layer for this app frame and serves straight repeats
         // (client timewarp: rotation only) until depth resumes — the
         // prime suspect for the every-2nd/3rd-group symptom. Generation
@@ -2865,12 +2867,24 @@ mod tests {
             let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
             };
-            assert!(!ctrl.depth_ready_this_frame);
-            assert!(ctrl.depth_near_far.is_none());
-            assert!(ctrl.depth_min_max.is_none());
-            assert!(ctrl.depth_armed_generation.is_none());
+            assert!(
+                !ctrl.depth_ready_this_frame,
+                "import-viable gate must block arming (Fake has no GL context)"
+            );
+            assert!(
+                ctrl.depth_near_far.is_none(),
+                "import-viable gate must block arming (Fake has no GL context)"
+            );
+            assert!(
+                ctrl.depth_min_max.is_none(),
+                "import-viable gate must block arming (Fake has no GL context)"
+            );
+            assert!(
+                ctrl.depth_armed_generation.is_none(),
+                "import-viable gate must block arming (Fake has no GL context)"
+            );
             // The gate chain ran (feed opened) but nothing armed…
-            assert!(ctrl.depth_feed.is_some());
+            assert!(ctrl.depth_feed.is_some(), "feed must open past master gate");
         }
         // …and the published header still reads viable with no ack written.
         {
@@ -2930,11 +2944,23 @@ mod tests {
             let DynFrameController::Fake(ctrl) = lock.as_ref().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
             };
-            assert!(ctrl.depth_swapchain.is_none());
-            assert!(ctrl.depth_feed.is_none());
-            assert!(!ctrl.depth_ready_this_frame);
+            assert!(
+                ctrl.depth_swapchain.is_none(),
+                "extension gate must block depth before any swapchain exists"
+            );
+            assert!(
+                ctrl.depth_feed.is_none(),
+                "extension gate must short-circuit before the feed opens"
+            );
+            assert!(
+                !ctrl.depth_ready_this_frame,
+                "extension gate must block arming (khr_composition_layer_depth off)"
+            );
             // Extension probe propagated (false here): the gate never opens.
-            assert!(!ctrl.depth_extension_enabled);
+            assert!(
+                !ctrl.depth_extension_enabled,
+                "extension gate must stay closed (probe false in this test)"
+            );
         }
         // Unknown Vulkan formats map to no GL depth format: the swapchain
         // is never created, frames stay plain.
@@ -2944,8 +2970,14 @@ mod tests {
             let DynFrameController::Fake(ctrl) = frame_lock.as_mut().unwrap() else {
                 panic!("Frame controller was not set up or not faked!");
             };
-            assert!(!ctrl.ensure_depth_swapchain(&data, 10, 10, 96));
-            assert!(ctrl.depth_swapchain.is_none());
+            assert!(
+                !ctrl.ensure_depth_swapchain(&data, 10, 10, 96),
+                "format gate must reject unknown Vulkan format 96"
+            );
+            assert!(
+                ctrl.depth_swapchain.is_none(),
+                "format gate must leave no depth swapchain for unknown format 96"
+            );
         }
 
         crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");

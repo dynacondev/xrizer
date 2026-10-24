@@ -73,9 +73,9 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         false
     }
 
-    /// GL swapchain format for a SHM Vulkan depth format (126 = D32F only).
-    /// Checked against the session's enumerated formats; depth stays off
-    /// when absent.
+    /// GL swapchain format for a SHM Vulkan depth format (126 = D32F,
+    /// 130 = D32S8 fallback). Checked against the session's enumerated
+    /// formats; depth stays off when absent.
     fn depth_format_for_header(vk_format: i32) -> Option<<Self::Api as xr::Graphics>::Format> {
         let _ = vk_format;
         None
