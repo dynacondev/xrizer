@@ -24,19 +24,38 @@
 //! ```
 //!
 //! Reader discipline: fresh `shm_open`+`mmap` per call (producer
-//! unlink/recreates on geometry change), `fstat` size must be exactly 96,
-//! seqlock retry on odd/changed `seq`, `generation == 0` means nothing
-//! published yet. `pinned[]` are single atomic words written only by the
-//! consumer (`Release` store 1 before wait/sample, 0 after own fence) and
-//! read by the producer; never read them inside the seqlock snapshot.
+//! unlink/recreates on geometry change, so no fd is ever cached), `fstat`
+//! size must be exactly 96, seqlock retry (bounded, 4 tries) on odd/changed
+//! `seq`, `generation == 0` means nothing published yet. `pinned[]` are
+//! single atomic words written only by the consumer (`Release` store 1
+//! before wait/sample, 0 after own fence) and read by the producer; the
+//! logical snapshot excludes them (the physical copy reads the whole
+//! mapping but discards the pin words — they are outside the seqlock).
+//! At most one pin at a time — the API does not enforce this, the caller
+//! must; holding both stalls all publishes. Pins are backpressure-skip
+//! hints, not acks: the producer skips a pinned slot and keeps the other
+//! moving, so a stuck pin costs half rate, never a wedge.
 //! Slot for generation `G` is `G % 2`. Semaphores are timeline semaphores
 //! signaled with value `G` and must be imported as timeline type.
 //! `CLOCK_MONOTONIC` timestamps correlate frames: `age = receipt - header`.
+//!
+//! FDs are borrowed numbers used directly (no `SCM_RIGHTS`/re-open/close);
+//! valid only `> 2`, `-1` until published; (re)import all FDs on epoch
+//! change and never wait across one. `reserved0/reserved_pad/reserved`
+//! must be tolerated nonzero (forward-compat; never checked). Viability
+//! is `is_viable()` AND `alloc_covers(bpp)` AND `validate_near_far()` —
+//! none implies the others. `eye_w() == w/2` truncates; odd `w` is rejected
+//! by `dims_plausible`, never rounded.
+//! The reader never `shm_unlink`s/truncates/writes the header except
+//! `pinned[]`; mappings are `munmap`ed+closed on drop with no caching, and
+//! disappearance is treated like generation 0 (drop imports, plain frame,
+//! re-open).
 //!
 //! No new crates: `libc` + `log` only.
 
 // Slice 1 is wire-only with no callers yet; compositor/import slices will
 // consume every helper below. Silence dead-code until then.
+// TODO(depth-prod-3 slice 2): remove once compositor/import callers land.
 #![allow(dead_code)]
 
 use log::{debug, info, warn};
@@ -108,6 +127,7 @@ const _: () = {
     assert!(std::mem::offset_of!(XdShmHeaderV3, far_z) == 72);
     assert!(std::mem::offset_of!(XdShmHeaderV3, reserved_pad) == 76);
     assert!(std::mem::offset_of!(XdShmHeaderV3, pinned) == PINNED_OFF);
+    assert!(std::mem::offset_of!(XdShmHeaderV3, pinned) + 4 == 84);
     assert!(std::mem::offset_of!(XdShmHeaderV3, reserved) == 88);
 };
 
@@ -150,9 +170,13 @@ impl DepthControl {
         self.w / 2
     }
 
-    /// Full-mirror texel footprint for `bpp` bytes/texel.
+    /// Full-mirror texel footprint for `bpp` bytes/texel. Saturates:
+    /// `w/h` are untrusted pre-gate values, so plain multiplication could
+    /// wrap small and bypass [`Self::alloc_covers`].
     pub fn want_bytes(&self, bpp: u64) -> u64 {
-        u64::from(self.w) * u64::from(self.h) * bpp
+        u64::from(self.w)
+            .saturating_mul(u64::from(self.h))
+            .saturating_mul(bpp)
     }
 
     /// `alloc_bytes` bound: `want > alloc` (non-zero) means writer/reader
@@ -168,14 +192,24 @@ impl DepthControl {
         self.mem_fds.iter().all(|&f| f > 2) && self.sem_fds.iter().all(|&f| f > 2)
     }
 
+    /// Reader-policy gate: even `w` required for the SBS split. The wire
+    /// contract implies SBS but never states evenness; the mirror publishes
+    /// whatever the app's depth is, so odd `w` is rejected here (fail-safe
+    /// to plain), not claimed as unwritable.
     pub fn dims_plausible(&self) -> bool {
-        self.w != 0 && self.h != 0 && self.w <= 16384 && self.h <= 16384 && self.w.is_multiple_of(2)
+        // NOTE: `% 2` instead of `is_multiple_of` — workspace MSRV is 1.85.
+        #[allow(clippy::manual_is_multiple_of)]
+        let even = self.w % 2 == 0;
+        self.w != 0 && self.h != 0 && self.w <= 16384 && self.h <= 16384 && even
     }
 
-    /// Full viability gate: v3, published epoch+generation, depth SBS
-    /// (D32F preferred, D32S8 fallback), plausible dims, exact 96-byte
-    /// segment, all FDs real. `near/far` validity is checked separately
-    /// via [`validate_near_far`].
+    /// Full viability gate: published epoch+generation, depth format
+    /// (D32F preferred, D32S8 fallback per `reprojex/src/catalog.c`), plausible
+    /// dims, exact 96-byte segment, all FDs real. `epoch != 0` has no
+    /// contract sentence; it holds because the producer zero-inits the
+    /// mapping and its epoch is process-monotonic starting at 1. `alloc`
+    /// and `near/far` are deliberately excluded — callers must AND
+    /// [`Self::alloc_covers`] and [`validate_near_far`].
     pub fn is_viable(&self) -> bool {
         self.epoch != 0
             && self.generation != 0
@@ -185,8 +219,13 @@ impl DepthControl {
             && self.fds_valid()
     }
 
-    /// Staleness against the header timestamp. Future stamps and zero
-    /// stamps are stale (clock skew or never published).
+    /// Coarse liveness gate against the header timestamp. Zero and future
+    /// stamps are stale (never published / clock skew). Pass `now` sampled
+    /// at use (after the read), NOT a Submit-receipt timestamp: the
+    /// producer publishes at present, after Submit is woken, so a receipt
+    /// can legitimately predate the header by milliseconds — that
+    /// small-negative case is the freshest frame, not staleness, and is
+    /// handled by [`depth_age_ns`]/[`is_same_generation`], not here.
     pub fn is_stale(&self, now_mono_ns: u64, max_age_ms: u64) -> bool {
         if self.time_ns == 0 || self.time_ns > now_mono_ns {
             return true;
@@ -229,13 +268,21 @@ impl Drop for MappedSeg {
 }
 
 // SAFETY: the mapping is only read through volatile/checked seqlock copies
-// on the calling thread; the `MappedSeg` itself is never shared.
+// on the calling thread; the `MappedSeg` itself is never shared (`Send`
+// for ownership transfer across threads; `!Sync` is intentional).
 unsafe impl Send for MappedSeg {}
 
 /// Open + mmap the current segment. A fresh mapping every call picks up
 /// producer recreates (epoch or size changes) with no stale fd.
+///
+/// TOCTOU note: `fstat` runs before AND after `mmap`; a truncate inside
+/// the remaining volatile-read window would `SIGBUS` on access. The
+/// producer only ever unlink+recreates (never truncates live), and the
+/// double-`fstat` narrows the race to a best-effort window — a documented
+/// crash assumption shared with the previous generation, not a new risk.
 fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
     let oflag = (if write { libc::O_RDWR } else { libc::O_RDONLY }) | libc::O_CLOEXEC;
+    // Mode is ignored without O_CREAT; kept explicit for readability.
     let fd = unsafe { libc::shm_open(name.as_ptr(), oflag, 0o600) };
     if fd < 0 {
         // Per-frame when the layer is absent: throttle so RUST_LOG=debug
@@ -253,17 +300,28 @@ fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
         unsafe { libc::close(fd) };
         return None;
     }
-    let map_len = stat.st_size as usize;
-    // v3 needs exactly the 96-byte header: anything else belongs to a dead
-    // run (unlinked, mid-recreate) or a foreign writer.
-    if map_len != HEADER_SIZE {
+    // `st_size` is signed; compare in-domain before casting (a negative
+    // would wrap to a huge usize and only fail the equality anyway, but
+    // be explicit).
+    if stat.st_size != HEADER_SIZE as libc::off_t {
         unsafe { libc::close(fd) };
         return None;
     }
+    let map_len = HEADER_SIZE;
     let prot = libc::PROT_READ | (if write { libc::PROT_WRITE } else { 0 });
     let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, prot, libc::MAP_SHARED, fd, 0) };
-    if ptr == libc::MAP_FAILED {
+    if ptr == libc::MAP_FAILED || ptr.is_null() {
         unsafe { libc::close(fd) };
+        return None;
+    }
+    // Re-check size after mapping: a recreate between the first fstat and
+    // the mmap would otherwise leave a mapping over a replaced object.
+    let mut stat2: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat2) } != 0 || stat2.st_size != HEADER_SIZE as libc::off_t {
+        unsafe {
+            libc::munmap(ptr, map_len);
+            libc::close(fd);
+        }
         return None;
     }
     Some(MappedSeg {
@@ -298,8 +356,10 @@ impl DepthFeed {
 
     /// Seqlock-read of the v3 control header. Returns `None` on
     /// absent/wrong-size/torn/foreign data so callers fall back to plain
-    /// (color-only) views. Never touches `pinned[]`: those words are
-    /// outside the seqlock (see [`Self::pin_slot`]).
+    /// (color-only) views. The physical copy spans the whole mapping
+    /// (including the pin words, which are discarded, never interpreted);
+    /// the logical snapshot excludes `pinned[]` — those words live outside
+    /// the seqlock (see [`Self::pin_slot`]). Bounded: 4 tries, then `None`.
     pub fn read_control(&self) -> Option<DepthControl> {
         let map = map_segment(&self.name, false)?;
         let (ptr, map_len) = (map.ptr, map.len);
@@ -347,13 +407,16 @@ impl DepthFeed {
         if slot >= SLOTS || map.len != HEADER_SIZE {
             return None;
         }
-        // Release assert: the AtomicU32 cast below faults on misalignment
-        // on strict architectures; page mappings are aligned in practice,
-        // but never skip this check in release.
-        assert_eq!(
-            (map.ptr as usize + PINNED_OFF + slot * 4) % std::mem::align_of::<AtomicU32>(),
-            0
-        );
+        // Fail-safe to plain (not panic) on misalignment: `mmap` is page
+        // aligned so `+80/+84` are always 4-aligned in practice; a hostile
+        // mapping must never panic the app thread.
+        // `AtomicU32` and `u32` are layout-identical; the cast only changes
+        // how the word is accessed (atomic vs plain).
+        // NOTE: `%` instead of `is_multiple_of` — workspace MSRV is 1.85.
+        #[allow(clippy::manual_is_multiple_of)]
+        if (map.ptr as usize + PINNED_OFF + slot * 4) % std::mem::align_of::<AtomicU32>() != 0 {
+            return None;
+        }
         Some(unsafe {
             (map.ptr as *mut u8)
                 .add(PINNED_OFF + slot * 4)
@@ -362,8 +425,11 @@ impl DepthFeed {
     }
 
     /// Pin `slot` before waiting/sampling it (`Release` store of 1).
-    /// At most one slot may be pinned at a time; holding both stalls the
-    /// producer. Returns false when the segment is absent or `slot >= 2`.
+    /// Pass `slot = DepthControl::slot_for_generation(generation)` from the
+    /// generation just read (seqlock → epoch-reimport → pin → wait →
+    /// sample). At most one slot may be pinned at a time — unenforced
+    /// here; holding both stalls the producer. Returns false when the
+    /// segment is absent or `slot >= 2`.
     pub fn pin_slot(&self, slot: usize) -> bool {
         let Some(map) = map_segment(&self.name, true) else {
             return false;
@@ -371,13 +437,13 @@ impl DepthFeed {
         let Some(addr) = Self::pin_addr(&map, slot) else {
             return false;
         };
+        // Raw-pointer atomic op (no `&AtomicU32` reborrow): the word is
+        // concurrently readable by the producer outside the Rust aliasing
+        // model, so no shared reference is formed.
         unsafe {
-            if let Some(a) = addr.as_ref() {
-                a.store(1, Ordering::Release);
-                return true;
-            }
+            (*addr).store(1, Ordering::Release);
         }
-        false
+        true
     }
 
     /// Unpin `slot` after the sampler's own fence confirms completion
@@ -390,35 +456,49 @@ impl DepthFeed {
             return false;
         };
         unsafe {
-            if let Some(a) = addr.as_ref() {
-                a.store(0, Ordering::Release);
-                return true;
-            }
+            (*addr).store(0, Ordering::Release);
         }
-        false
+        true
     }
 
     /// Single `Acquire` load of a pin word. `None` when absent/out of range.
     pub fn load_pin(&self, slot: usize) -> Option<u32> {
         let map = map_segment(&self.name, false)?;
         let addr = Self::pin_addr(&map, slot)?;
-        unsafe { addr.as_ref().map(|a| a.load(Ordering::Acquire)) }
+        Some(unsafe { (*addr).load(Ordering::Acquire) })
     }
 }
 
+/// # Safety
+///
+/// `base` must be a live `mmap`ed 96-byte header for the call duration.
+/// `mmap` is page-aligned, so offset 8 is 4-aligned; same-machine SHM is
+/// native-endian.
 unsafe fn read_seq(base: *mut libc::c_void) -> u32 {
     unsafe { (base as *const u8).add(8).cast::<u32>().read_volatile() }
 }
 
+/// # Safety
+///
+/// Same as [`read_seq`]; `off` must be 4-aligned and in-bounds.
 unsafe fn read_u32(base: *mut libc::c_void, off: usize) -> u32 {
-    // Seqlock-protected header words: the writer mutates them concurrently,
-    // so use volatile reads (plain .read() would be a data race).
+    // Seqlock-idiom volatile read: inhibits compiler elision/reorder of
+    // the seq→body→seq triple. Formally this relies on platform
+    // single-copy atomicity of aligned u32 plus the seqlock retry — not
+    // on volatile being a substitute for atomics.
+    debug_assert_eq!(off % 4, 0);
     unsafe { (base as *const u8).add(off).cast::<u32>().read_volatile() }
 }
 
+/// # Safety
+///
+/// Same as [`read_seq`]; the whole 96-byte object must be mapped.
+/// The copy spans the pin words; callers discard them (see
+/// [`DepthFeed::read_control`]).
 unsafe fn read_header_v3(base: *mut libc::c_void) -> XdShmHeaderV3 {
-    // Same: torn reads are detected via the seqlock retry, but the read
-    // itself must be volatile to be sound under concurrent mutation.
+    // Same seqlock idiom as above; torn copies are detected by the
+    // closing seq check, never trusted directly.
+    debug_assert_eq!(base as usize % std::mem::align_of::<XdShmHeaderV3>(), 0);
     unsafe { (base as *const XdShmHeaderV3).read_volatile() }
 }
 
@@ -455,7 +535,8 @@ pub fn depth_age_ns(receipt_mono_ns: u64, header_mono_ns: u64) -> i64 {
 /// Submit is that frame's depth; a marginally newer stamp is the same
 /// frame arriving just after wakeup — freshest case, not an error.
 pub fn is_same_generation(age_ns: i64, frame_period_ns: i64, margin_ns: i64) -> bool {
-    age_ns >= -margin_ns && age_ns < frame_period_ns.saturating_add(margin_ns)
+    debug_assert!(margin_ns >= 0 && frame_period_ns >= 0);
+    age_ns >= margin_ns.saturating_neg() && age_ns < frame_period_ns.saturating_add(margin_ns)
 }
 
 static WARNED_MASTER: AtomicBool = AtomicBool::new(false);
@@ -509,7 +590,10 @@ pub fn max_age_ms() -> u64 {
 }
 
 /// `CLOCK_MONOTONIC` in ns. Same clock the producer stamps `time_mono_ns`
-/// with, same machine.
+/// with, same machine. Returns 0 on `clock_gettime` failure, which every
+/// consumer treats as stale (see [`DepthControl::is_stale`]: any real
+/// header postdates 0; [`depth_age_ns`] maps it to a large negative that
+/// [`is_same_generation`] rejects).
 pub fn now_mono_ns() -> u64 {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
@@ -685,29 +769,92 @@ mod tests {
         assert_eq!(std::mem::offset_of!(XdShmHeaderV3, far_z), 72);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV3, reserved_pad), 76);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV3, pinned), PINNED_OFF);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, pinned) + 4, 84);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV3, reserved), 88);
     }
 
     #[test]
-    fn roundtrip_viable() {
+    fn wire_constants_pinned() {
+        // A drifted rendezvous constant is a cross-process break; pin values.
+        assert_eq!(SHM_NAME, "/xplane-depth-v3");
+        assert_eq!(SHM_MAGIC, 0x5850_4450);
+        assert_eq!(SHM_VERSION, 3);
+        assert_eq!(HEADER_SIZE, 96);
+        assert_eq!(SLOTS, 2);
+        assert_eq!(PINNED_OFF, 80);
+        assert_eq!(FORMAT_D32F, 126);
+        assert_eq!(FORMAT_D32S8, 130);
+        assert_eq!((MIN_DEPTH, MAX_DEPTH), (0.0, 1.0));
+    }
+
+    #[test]
+    fn viable_snapshot_roundtrip() {
         let name = format!("/xrizer-depth-test-{}-1", std::process::id());
         let _seg = make_seg_v3(&name, 8, 2, 42, |_| {});
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("should hit");
-        assert_eq!((ctl.w, ctl.h, ctl.generation), (8, 2, 42));
-        assert_eq!(ctl.epoch, 7);
-        assert_eq!(ctl.mem_fds, [11, 12]);
-        assert_eq!(ctl.sem_fds, [21, 22]);
-        assert_eq!(ctl.alloc_bytes, 8 * 2 * 4);
-        assert!((ctl.near_z - 0.00742).abs() < f32::EPSILON);
-        assert!((ctl.far_z - 10000.0).abs() < f32::EPSILON);
-        assert!(ctl.is_viable());
-        assert_eq!(ctl.eye_w(), 4);
-        assert_eq!(ctl.slot(), 0); // 42 % 2
-        assert!(!ctl.is_stale(now_mono_ns(), 100));
-        assert!(ctl.alloc_covers(4));
-        assert!(!ctl.alloc_covers(4 * 1000));
+        assert_eq!((ctl.w, ctl.h, ctl.generation), (8, 2, 42), "dims+gen");
+        assert_eq!(ctl.epoch, 7, "epoch");
+        assert_eq!(ctl.mem_fds, [11, 12], "mem fds");
+        assert_eq!(ctl.sem_fds, [21, 22], "sem fds");
+        assert_eq!(ctl.alloc_bytes, 8 * 2 * 4, "alloc");
+        assert!((ctl.near_z - 0.00742).abs() < f32::EPSILON, "near");
+        assert!((ctl.far_z - 10000.0).abs() < f32::EPSILON, "far");
+        assert!(ctl.is_viable(), "viable");
+        assert_eq!(ctl.eye_w(), 4, "eye_w = w/2");
+        assert_eq!(ctl.slot(), 0, "42 % 2"); // 42 % 2
+        assert!(!ctl.is_stale(now_mono_ns(), 100), "fresh");
+        assert!(ctl.alloc_covers(4), "alloc covers bpp=4");
+        assert!(!ctl.alloc_covers(4 * 1000), "alloc rejects huge want");
+    }
+
+    #[test]
+    fn reserved_nonzero_still_viable_and_alloc_zero_tolerated() {
+        // Forward-compat: reserved words are never checked.
+        let pid = std::process::id();
+        let name = format!("/xrizer-depth-test-{pid}-rsv");
+        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+            h.reserved0 = 0xdead_beef;
+            h.reserved_pad = 1;
+            h.reserved = [7, 8];
+            h.alloc_bytes = 0;
+        });
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(ctl.is_viable(), "reserved nonzero must not gate");
+        assert!(
+            ctl.alloc_covers(4),
+            "alloc==0 tolerates any want as unknown"
+        );
+        assert!(
+            ctl.alloc_covers(u64::MAX),
+            "alloc==0 tolerates even huge want"
+        );
+    }
+
+    #[test]
+    fn viability_excludes_alloc_and_near_far() {
+        // Caller must AND all three: viable snapshot with bad clip and
+        // undersized alloc is still is_viable()==true.
+        let pid = std::process::id();
+        let name = format!("/xrizer-depth-test-{pid}-split");
+        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+            h.near_z = 0.0;
+            h.far_z = 0.0;
+            h.alloc_bytes = 1;
+        });
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(ctl.is_viable(), "alloc/clip must not gate viability");
+        assert_eq!(
+            validate_near_far(ctl.near_z, ctl.far_z),
+            None,
+            "clip invalid"
+        );
+        assert!(!ctl.alloc_covers(4), "alloc undersized");
     }
 
     #[test]
@@ -716,6 +863,63 @@ mod tests {
         assert_eq!(DepthControl::slot_for_generation(1), 1);
         assert_eq!(DepthControl::slot_for_generation(2), 0);
         assert_eq!(DepthControl::slot_for_generation(43), 1);
+        assert_eq!(DepthControl::slot_for_generation(u64::MAX), 1);
+    }
+
+    #[test]
+    fn dims_boundaries_and_eye_w() {
+        let pid = std::process::id();
+        // Max publishable dims are viable.
+        let name = format!("/xrizer-depth-test-{pid}-maxdims");
+        let _seg = make_seg_v3(&name, 16384, 16384, 3, |_| {});
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(ctl.is_viable(), "16384x16384 viable");
+        // want_bytes must not wrap at max dims (saturating).
+        assert_eq!(ctl.want_bytes(4), 16384u64 * 16384 * 4);
+        // Zero/huge on either axis rejected.
+        for (tag, w, h) in [
+            ("huge-h", 8u32, 16385u32),
+            ("zero-h", 8u32, 0u32),
+            ("zero-w", 0u32, 8u32),
+        ] {
+            let name = format!("/xrizer-depth-test-{pid}-{tag}");
+            let _seg = make_seg_v3(&name, w, h, 3, |_| {});
+            let ctl = DepthFeed::open_for_test(&name)
+                .read_control()
+                .expect("readable");
+            assert!(!ctl.is_viable(), "{tag} must not arm");
+        }
+        // Odd h is fine (only w must be even for the SBS split).
+        let name = format!("/xrizer-depth-test-{pid}-oddh");
+        let _seg = make_seg_v3(&name, 8, 3, 3, |_| {});
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(ctl.is_viable(), "odd h viable");
+        // Pure-math eye_w truncation (odd w never reaches here via SHM,
+        // but the helper truncates rather than rounds).
+        let mk = |w: u32| DepthControl {
+            epoch: 1,
+            w,
+            h: 2,
+            format: FORMAT_D32F,
+            generation: 1,
+            time_ns: 1,
+            mem_fds: [11, 12],
+            sem_fds: [21, 22],
+            near_z: 0.01,
+            far_z: 200.0,
+            seg_len: HEADER_SIZE,
+            alloc_bytes: 0,
+        };
+        assert_eq!(mk(8).eye_w(), 4);
+        assert_eq!(mk(7).eye_w(), 3);
+        // Hand-built seg_len gate (map path already enforces ==96).
+        let mut bad_len = mk(8);
+        bad_len.seg_len = 95;
+        assert!(!bad_len.is_viable(), "seg_len != 96 must not arm");
     }
 
     #[test]
@@ -742,6 +946,17 @@ mod tests {
             DepthFeed::open_for_test(&name2).read_control().is_none(),
             "version 2 must miss"
         );
+        // Future versions are equally foreign.
+        for v in [0u32, 4, u32::MAX] {
+            let name = format!("/xrizer-depth-test-{pid}-v{v}");
+            let _seg = make_seg_v3(&name, 8, 2, 1, |h| {
+                h.version = v;
+            });
+            assert!(
+                DepthFeed::open_for_test(&name).read_control().is_none(),
+                "version {v} must miss"
+            );
+        }
     }
 
     #[test]
@@ -769,6 +984,24 @@ mod tests {
             DepthFeed::open_for_test(&name2).read_control().is_none(),
             "wrong size must miss"
         );
+        // Truncated segments (mid-recreate races): same gate. (A 0-byte
+        // segment needs no mapping — fstat alone rejects it — so the
+        // smallest mappable case here is 1 byte.)
+        for (tag, len) in [("s64", 64usize), ("s95", 95usize), ("s1", 1usize)] {
+            let name = format!("/xrizer-depth-test-{pid}-{tag}");
+            let _seg = make_raw_seg(&name, len, |ptr| unsafe {
+                if len >= 12 {
+                    std::ptr::write_bytes(ptr as *mut u8, 0, len);
+                    (ptr as *mut u32).write_volatile(SHM_MAGIC);
+                    (ptr as *mut u32).add(1).write_volatile(SHM_VERSION);
+                    (ptr as *mut u32).add(2).write_volatile(2);
+                }
+            });
+            assert!(
+                DepthFeed::open_for_test(&name).read_control().is_none(),
+                "{tag} ({len}B) must miss"
+            );
+        }
     }
 
     #[test]
@@ -789,20 +1022,49 @@ mod tests {
                 "fds ({mem0}, {sem0}) must not arm"
             );
         }
+        // Second lane is checked too, plus the all-sentinel pre-publish.
+        let name = format!("/xrizer-depth-test-{pid}-fd-slot1");
+        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+            h.mem_fds[1] = -1;
+            h.sem_fds[1] = -1;
+        });
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("header readable");
+        assert!(
+            !ctl.fds_valid() && !ctl.is_viable(),
+            "slot-1 sentinel must not arm"
+        );
+        let name = format!("/xrizer-depth-test-{pid}-fd-allneg");
+        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+            h.mem_fds = [-1, -1];
+            h.sem_fds = [-1, -1];
+        });
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("header readable");
+        assert!(!ctl.fds_valid() && !ctl.is_viable(), "all -1 must not arm");
     }
 
     #[test]
     fn pre_publish_and_dims_rejected() {
         let pid = std::process::id();
-        // epoch 0 / generation 0: never published.
-        let name = format!("/xrizer-depth-test-{pid}-pre");
-        let _seg = make_seg_v3(&name, 8, 2, 0, |h| {
+        // epoch 0 with live generation: never published (zero-init mapping).
+        let name = format!("/xrizer-depth-test-{pid}-pre-epoch");
+        let _seg = make_seg_v3(&name, 8, 2, 42, |h| {
             h.epoch = 0;
         });
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
-        assert!(!ctl.is_viable(), "epoch/gen 0 must not arm");
+        assert!(!ctl.is_viable(), "epoch 0 must not arm");
+        // generation 0 with live epoch: nothing completed yet.
+        let name = format!("/xrizer-depth-test-{pid}-pre-gen");
+        let _seg = make_seg_v3(&name, 8, 2, 0, |_| {});
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(!ctl.is_viable(), "generation 0 must not arm");
         // Bad dims / format.
         let name = format!("/xrizer-depth-test-{pid}-oddw");
         let _seg = make_seg_v3(&name, 7, 2, 3, |_| {});
@@ -843,53 +1105,105 @@ mod tests {
     }
 
     #[test]
+    fn stale_boundaries_and_zero_stamp() {
+        // Pure-gate boundaries without SHM timing flakes.
+        let mk = |time_ns: u64| DepthControl {
+            epoch: 1,
+            w: 8,
+            h: 2,
+            format: FORMAT_D32F,
+            generation: 1,
+            time_ns,
+            mem_fds: [11, 12],
+            sem_fds: [21, 22],
+            near_z: 0.00742,
+            far_z: 10000.0,
+            seg_len: HEADER_SIZE,
+            alloc_bytes: 64,
+        };
+        let now = 10_000_000_000u64;
+        assert!(mk(0).is_stale(now, 100), "zero stamp stale");
+        assert!(mk(now + 1).is_stale(now, 100), "future stale");
+        assert!(
+            !mk(now - 100_000_000).is_stale(now, 100),
+            "exactly max_age fresh"
+        );
+        assert!(
+            mk(now - 100_000_001).is_stale(now, 100),
+            "max_age+1ns stale"
+        );
+    }
+
+    #[test]
     fn stale_and_future_are_stale() {
         let pid = std::process::id();
-        let now = now_mono_ns();
+        // Sample `now` after the read: the header is stamped at setup, so
+        // post-read time can only be later — no slow-CI flake.
         let name = format!("/xrizer-depth-test-{pid}-stale");
+        let now_setup = now_mono_ns();
         let _seg = make_seg_v3(&name, 8, 2, 7, |h| {
-            h.time_mono_ns = now.saturating_sub(500_000_000);
+            h.time_mono_ns = now_setup.saturating_sub(500_000_000);
         });
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
         assert!(ctl.is_viable());
-        assert!(ctl.is_stale(now, 100), "500ms old must be stale");
+        assert!(ctl.is_stale(now_mono_ns(), 100), "500ms old must be stale");
         let name2 = format!("/xrizer-depth-test-{pid}-future");
         let _seg2 = make_seg_v3(&name2, 8, 2, 8, |h| {
-            h.time_mono_ns = now.saturating_add(50_000_000);
+            h.time_mono_ns = now_mono_ns().saturating_add(5_000_000_000);
         });
         let ctl2 = DepthFeed::open_for_test(&name2)
             .read_control()
             .expect("readable");
-        assert!(ctl2.is_stale(now, 100), "future stamp must be stale");
+        assert!(
+            ctl2.is_stale(now_mono_ns(), 100),
+            "far-future stamp must be stale"
+        );
     }
 
     #[test]
     fn pin_roundtrip_outside_seqlock() {
         let name = format!("/xrizer-depth-test-{}-pin", std::process::id());
         let seg = make_seg_v3(&name, 8, 2, 42, |_| {});
+        // Independent raw view through the test's own mapping at hardcoded
+        // +80/+84 (not via PINNED_OFF): proves the ABI offset, not just
+        // self-consistency. Atomic loads — a plain read would race.
+        let raw_pin = |slot: usize| unsafe {
+            (seg.ptr as *const u8)
+                .add(80 + slot * 4)
+                .cast::<AtomicU32>()
+                .as_ref()
+                .expect("test mapping live")
+                .load(Ordering::Acquire)
+        };
         let feed = DepthFeed::open_for_test(&name);
         // Fresh segment boots unpinned; snapshot reads fine alongside pins.
         assert_eq!(feed.load_pin(0), Some(0));
         assert_eq!(feed.load_pin(1), Some(0));
+        assert_eq!((raw_pin(0), raw_pin(1)), (0, 0), "raw +80/+84 boot at 0");
         assert!(feed.read_control().is_some());
+        // Pin slot 0: raw +80 flips to 1 while +84 stays 0.
         assert!(feed.pin_slot(0));
         assert_eq!(feed.load_pin(0), Some(1));
         assert_eq!(feed.load_pin(1), Some(0));
+        assert_eq!((raw_pin(0), raw_pin(1)), (1, 0), "raw +80==1,+84==0");
         // Snapshot still clean while pinned (pins are outside the seqlock).
         assert!(feed.read_control().is_some());
+        // Pin slot 1 as well (API permits; caller must hold at most one —
+        // both set proves the words are independent).
+        assert!(feed.pin_slot(1));
+        assert_eq!((feed.load_pin(0), feed.load_pin(1)), (Some(1), Some(1)));
+        assert_eq!((raw_pin(0), raw_pin(1)), (1, 1), "raw +80==1,+84==1");
         assert!(feed.unpin_slot(0));
+        assert!(feed.unpin_slot(1));
         assert_eq!(feed.load_pin(0), Some(0));
+        assert_eq!(feed.load_pin(1), Some(0));
         // Out-of-range slots never touch the mapping.
         assert!(!feed.pin_slot(2));
         assert!(!feed.unpin_slot(2));
         assert_eq!(feed.load_pin(2), None);
-        // Direct check the words sit at +80/+84.
-        unsafe {
-            assert_eq!((seg.ptr as *const u8).add(80).cast::<u32>().read(), 0);
-            assert_eq!((seg.ptr as *const u8).add(84).cast::<u32>().read(), 0);
-        }
+        assert_eq!((raw_pin(0), raw_pin(1)), (0, 0), "raw words rest at 0");
     }
 
     #[test]
@@ -934,11 +1248,21 @@ mod tests {
         assert_eq!(depth_age_ns(1_000, 900), 100);
         // Newer header (straddled present): negative age.
         assert_eq!(depth_age_ns(1_000, 1_002), -2);
+        // Saturation at the extremes (untrusted u64 inputs).
+        assert_eq!(depth_age_ns(u64::MAX, 0), i64::MAX);
+        assert_eq!(depth_age_ns(0, u64::MAX), -i64::MAX);
         // Same-generation window: last period plus small negative margin.
         assert!(is_same_generation(5_000_000, 11_111_111, 2_000_000));
         assert!(is_same_generation(-1_000_000, 11_111_111, 2_000_000));
         assert!(!is_same_generation(-3_000_000, 11_111_111, 2_000_000));
         assert!(!is_same_generation(15_000_000, 11_111_111, 2_000_000));
+        // Boundaries: -margin inclusive, period+margin exclusive.
+        assert!(is_same_generation(-2_000_000, 11_111_111, 2_000_000));
+        assert!(!is_same_generation(-2_000_001, 11_111_111, 2_000_000));
+        assert!(!is_same_generation(13_111_111, 11_111_111, 2_000_000));
+        assert!(is_same_generation(13_111_110, 11_111_111, 2_000_000));
+        // Overflow-safe at the extremes.
+        assert!(is_same_generation(0, i64::MAX, i64::MAX));
     }
 
     #[test]
@@ -970,12 +1294,42 @@ mod tests {
         assert_eq!(max_age_ms(), DEFAULT_MAX_AGE_MS);
         set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "250");
         assert_eq!(max_age_ms(), 250);
-        for v in ["abc", "0", "-5", "", "99999999"] {
+        // Boundaries: 1 and 60000 valid (whitespace tolerated).
+        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "1");
+        assert_eq!(max_age_ms(), 1);
+        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "60000");
+        assert_eq!(max_age_ms(), 60000);
+        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", " 250 ");
+        assert_eq!(max_age_ms(), 250);
+        for v in ["abc", "0", "-5", "", "99999999", "60001"] {
             set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", v);
             assert_eq!(max_age_ms(), DEFAULT_MAX_AGE_MS, "{v:?} defaults");
         }
+        // Master edge rows: empty and out-of-vocabulary default ON.
+        set_env_for_tests("XRIZER_DEPTH_SHM", "");
+        assert!(depth_master_enabled(), "empty defaults ON");
+        set_env_for_tests("XRIZER_DEPTH_SHM", "2");
+        assert!(depth_master_enabled(), "2 defaults ON");
 
         restore("XRIZER_DEPTH_SHM", orig_master);
         restore("XRIZER_DEPTH_MAX_AGE_MS", orig_age);
+    }
+
+    #[test]
+    fn open_respects_kill_switch() {
+        // NOTE: env-mutating; serialized through the same guard. Any future
+        // test calling open()/max_age_ms() must hold env_guard() too.
+        let _lock = env_guard();
+        let save = std::env::var("XRIZER_DEPTH_SHM").ok();
+        set_env_for_tests("XRIZER_DEPTH_SHM", "0");
+        assert!(DepthFeed::open().is_none(), "kill-switch off");
+        set_env_for_tests("XRIZER_DEPTH_SHM", "bogus");
+        assert!(DepthFeed::open().is_some(), "garbage fail-open on");
+        del_env_for_tests("XRIZER_DEPTH_SHM");
+        assert!(DepthFeed::open().is_some(), "default on");
+        match save {
+            Some(v) => set_env_for_tests("XRIZER_DEPTH_SHM", &v),
+            None => del_env_for_tests("XRIZER_DEPTH_SHM"),
+        }
     }
 }
