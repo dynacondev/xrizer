@@ -1085,8 +1085,31 @@ const DEPTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Frame-counted (not clocked) so hitches and pauses can't trip it.
 /// Logging only — never a control input.
 const DEPTH_FROZEN_TRIP_FRAMES: u32 = 30;
+/// Bound on a held depth pin, in end_frames (~1s at 90Hz). A GL copy fence
+/// that never completes past this releases its pin anyway (one torn frame
+/// at most): liveness over the pin, consistent with the
+/// freshness-over-integrity tradeoff. Logging only beyond the release.
+const DEPTH_PIN_MAX_HOLD_FRAMES: u32 = 90;
 /// Display period fallback when the runtime hasn't reported one yet.
 const DEPTH_FALLBACK_PERIOD_NS: i64 = 11_111_111;
+
+/// Clamp the runtime's display period into a sane window before the age
+/// gate. A bogus huge period (pause/transient) would widen the window
+/// into accepting arbitrarily stale depth on first arm; a bogus tiny one
+/// is meaningless. Legit VR periods sit ~8–17ms (120–60Hz). Pure helper
+/// so the clamp is unit-testable.
+fn depth_window_period(display_period_ns: i64) -> i64 {
+    /// 250Hz — nothing legitimate refreshes faster.
+    const MIN_PERIOD_NS: i64 = 4_000_000;
+    /// 20Hz — slower means paused or hitching; gate narrow (plain) rather
+    /// than accept stale.
+    const MAX_PERIOD_NS: i64 = 50_000_000;
+    if display_period_ns <= 0 {
+        DEPTH_FALLBACK_PERIOD_NS
+    } else {
+        display_period_ns.clamp(MIN_PERIOD_NS, MAX_PERIOD_NS)
+    }
+}
 
 struct FrameController<G: GraphicsBackend> {
     stream: xr::FrameStream<G::Api>,
@@ -1111,6 +1134,13 @@ struct FrameController<G: GraphicsBackend> {
     /// copy (no fence vec needed). Unpinned on fence completion (polled at
     /// next end_frame entry), on every plain fallback, and on teardown.
     pinned_slot: Option<usize>,
+    /// End_frames since the current pin was taken. Ages out a held pin
+    /// that never completes (see `poll_prior_depth_pin`): without this, a
+    /// GL fence that neither signals nor fails would pin its slot forever
+    /// and the pin_held gate would refuse every later sample — the only
+    /// permanent self-sustaining stall in the design. Reset on every
+    /// pin take and every release.
+    pin_hold_run: u32,
     /// Consecutive viable reads with no generation advance. Trip warn at
     /// [`DEPTH_FROZEN_TRIP_FRAMES`]; reset on advance.
     frozen_run: u32,
@@ -1268,6 +1298,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             depth_feed: None,
             last_armed_gen: 0,
             pinned_slot: None,
+            pin_hold_run: 0,
             frozen_run: 0,
             frozen_tripped: false,
             prearm_run: 0,
@@ -1354,6 +1385,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             feed.unpin_slot(slot);
         }
         self.pinned_slot = None;
+        self.pin_hold_run = 0;
         self.backend.drop_depth_imports();
         self.depth_swapchain = None;
         self.last_armed_gen = 0;
@@ -1621,18 +1653,35 @@ impl<G: GraphicsBackend> FrameController<G> {
 
     /// Poll the outstanding depth-copy fence (zero timeout, never blocks).
     /// On completion the pin is released; prompt unpin keeps the producer
-    /// at full rate. Runs even on plain frames.
+    /// at full rate. Runs even on plain frames. A hold past
+    /// [`DEPTH_PIN_MAX_HOLD_FRAMES`] releases anyway with a warn (a fence
+    /// that neither signals nor fails would otherwise stall depth
+    /// permanently behind the pin_held gate); the next copy supersedes the
+    /// abandoned fence like any skipped generation.
     fn poll_prior_depth_pin(&mut self) {
         let Some(slot) = self.pinned_slot else {
             return;
         };
-        if !self.backend.poll_depth_copy_complete() {
+        if self.backend.poll_depth_copy_complete() {
+            if let Some(feed) = self.depth_feed.as_ref() {
+                feed.unpin_slot(slot);
+            }
+            self.pinned_slot = None;
+            self.pin_hold_run = 0;
             return;
         }
-        if let Some(feed) = self.depth_feed.as_ref() {
-            feed.unpin_slot(slot);
+        self.pin_hold_run = self.pin_hold_run.saturating_add(1);
+        if self.pin_hold_run >= DEPTH_PIN_MAX_HOLD_FRAMES {
+            warn!(
+                "depth copy fence never completed after {} frames; releasing pin on slot {} (one torn frame at most)",
+                self.pin_hold_run, slot,
+            );
+            if let Some(feed) = self.depth_feed.as_ref() {
+                feed.unpin_slot(slot);
+            }
+            self.pinned_slot = None;
+            self.pin_hold_run = 0;
         }
-        self.pinned_slot = None;
     }
 
     /// Release a held pin immediately (failure paths with no GPU work
@@ -1642,6 +1691,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             feed.unpin_slot(slot);
         }
         self.pinned_slot = None;
+        self.pin_hold_run = 0;
     }
 
     fn note_read_skip(&mut self, skip: ReadSkip) {
@@ -1828,11 +1878,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 return DepthEnd::Plain;
             }
         };
-        let period = if display_period > 0 {
-            display_period
-        } else {
-            DEPTH_FALLBACK_PERIOD_NS
-        };
+        let period = depth_window_period(display_period);
         if !is_same_generation(ctl.age_ns(receipt), period, DEPTH_MARGIN_NS) {
             self.hb_window = self.hb_window.saturating_add(1);
             return DepthEnd::Plain;
@@ -1973,6 +2019,26 @@ impl<G: GraphicsBackend> FrameController<G> {
             return DepthEnd::Plain;
         }
         self.pinned_slot = Some(slot);
+        self.pin_hold_run = 0;
+        // Structural bound check: at most one pin, ever. Ours is now set;
+        // if the OTHER word is also set (our own bug — the startup heal
+        // clears predecessors, and single-process flow cannot set both),
+        // refuse to hold both: a second tracked pin would overwrite
+        // pinned_slot and strand the first permanently, besides stalling
+        // the producer. Loud skip instead of silent leak.
+        if self
+            .depth_feed
+            .as_ref()
+            .is_some_and(|feed| feed.load_pin(1 - slot) == Some(1))
+        {
+            warn!(
+                "depth both SHM slots pinned (ours {slot}); releasing ours instead of holding both"
+            );
+            Self::release_depth_image(&mut self.depth_swapchain);
+            self.unpin_now();
+            self.hb_pin_held = self.hb_pin_held.saturating_add(1);
+            return DepthEnd::Plain;
+        }
         // Poll the slot's fence sync_file for producer-copy completion
         // (bounded; the pin keeps the polled number stable — the producer
         // closes and replaces fence FDs only on unpinned reuse, and a
@@ -3155,6 +3221,22 @@ mod tests {
     /// Heartbeat formats a fabricated window and resets every counter.
     /// No SHM/GL/runtime needed: same-module access drives the method
     /// directly with a backdated window start.
+    #[test]
+    fn depth_window_period_clamps() {
+        // Non-positive falls back; sane values pass through; absurd values
+        // clamp (huge must not widen the gate into stale accepts).
+        assert_eq!(depth_window_period(0), DEPTH_FALLBACK_PERIOD_NS);
+        assert_eq!(depth_window_period(-7), DEPTH_FALLBACK_PERIOD_NS);
+        assert_eq!(depth_window_period(11_111_111), 11_111_111);
+        assert_eq!(depth_window_period(8_333_333), 8_333_333);
+        assert_eq!(depth_window_period(1), 4_000_000);
+        assert_eq!(depth_window_period(3_999_999), 4_000_000);
+        assert_eq!(depth_window_period(4_000_000), 4_000_000);
+        assert_eq!(depth_window_period(50_000_000), 50_000_000);
+        assert_eq!(depth_window_period(50_000_001), 50_000_000);
+        assert_eq!(depth_window_period(i64::MAX), 50_000_000);
+    }
+
     #[test]
     fn depth_heartbeat_formats_and_resets_window() {
         let f = Fixture::new();
