@@ -179,6 +179,26 @@ fn gl_extension_present(name: &str) -> bool {
     false
 }
 
+/// True when a GLX context is current on this thread. Free function (no
+/// context needed to ask): resolves `glXGetCurrentContext` once via the
+/// already-loaded libGLX and calls it directly.
+fn glx_current_context() -> bool {
+    type PfGetCurrentContext = unsafe extern "system" fn() -> glx::types::GLXContext;
+    static GET_CURRENT: LazyLock<Option<PfGetCurrentContext>> = LazyLock::new(|| {
+        let ptr = GLX.get(c"glXGetCurrentContext");
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { (std::ptr::from_ref(&ptr) as *const PfGetCurrentContext).read() })
+    });
+    match *GET_CURRENT {
+        Some(f) => unsafe { !f().is_null() },
+        // libGLX without GetCurrentContext is not a GLX we can work with;
+        // fail closed (depth off) rather than issuing blind GL calls.
+        None => false,
+    }
+}
+
 #[derive(Deref)]
 struct SessionCreateInfo(xr::opengl::SessionCreateInfo);
 // SAFETY: SessionCreateInfo is only not Send + Sync because of the pointer next field.
@@ -520,6 +540,10 @@ impl GraphicsBackend for GlData {
         // Extension strings were probed at creation (needs a context); entry
         // points resolve without one. Both must hold to attempt imports.
         self.fd_import_viable && DEPTH_EXT.ready()
+    }
+
+    fn depth_context_current(&self) -> bool {
+        glx_current_context()
     }
 
     fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
@@ -865,29 +889,6 @@ fn depth_gl_format(vk_format: i32) -> Option<u32> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{depth_gl_format, depth_texel_bytes};
-    use crate::depth_feed::{FORMAT_D32F, FORMAT_D32S8};
-    use gl as gl_enum;
-
-    #[test]
-    fn depth_format_maps_d32f_and_d32s8() {
-        assert_eq!(depth_texel_bytes(FORMAT_D32F), Some(4));
-        assert_eq!(depth_texel_bytes(FORMAT_D32S8), Some(8));
-        assert_eq!(depth_texel_bytes(96), None);
-        assert_eq!(
-            depth_gl_format(FORMAT_D32F),
-            Some(gl_enum::DEPTH_COMPONENT32F)
-        );
-        assert_eq!(
-            depth_gl_format(FORMAT_D32S8),
-            Some(gl_enum::DEPTH32F_STENCIL8)
-        );
-        assert_eq!(depth_gl_format(96), None);
-    }
-}
-
 fn texture_rect_from_bounds(
     texture: glx::types::GLuint,
     bounds: vr::VRTextureBounds_t,
@@ -982,5 +983,28 @@ impl Library {
             }
         }
         symbol
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{depth_gl_format, depth_texel_bytes};
+    use crate::depth_feed::{FORMAT_D32F, FORMAT_D32S8};
+    use gl as gl_enum;
+
+    #[test]
+    fn depth_format_maps_d32f_and_d32s8() {
+        assert_eq!(depth_texel_bytes(FORMAT_D32F), Some(4));
+        assert_eq!(depth_texel_bytes(FORMAT_D32S8), Some(8));
+        assert_eq!(depth_texel_bytes(96), None);
+        assert_eq!(
+            depth_gl_format(FORMAT_D32F),
+            Some(gl_enum::DEPTH_COMPONENT32F)
+        );
+        assert_eq!(
+            depth_gl_format(FORMAT_D32S8),
+            Some(gl_enum::DEPTH32F_STENCIL8)
+        );
+        assert_eq!(depth_gl_format(96), None);
     }
 }

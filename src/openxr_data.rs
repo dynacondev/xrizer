@@ -135,6 +135,11 @@ impl<C: Compositor> OpenXrData<C> {
         exts.khr_composition_layer_equirect2 = supported_exts.khr_composition_layer_equirect2;
         exts.khr_composition_layer_color_scale_bias =
             supported_exts.khr_composition_layer_color_scale_bias;
+        exts.khr_composition_layer_depth = supported_exts.khr_composition_layer_depth;
+        info!(
+            "khr_composition_layer_depth supported: {}",
+            supported_exts.khr_composition_layer_depth
+        );
         exts.htc_vive_focus3_controller_interaction =
             supported_exts.htc_vive_focus3_controller_interaction;
         exts.meta_touch_controller_plus = supported_exts.meta_touch_controller_plus;
@@ -633,6 +638,20 @@ impl SessionData {
 
     pub fn tracking_space(&self) -> &xr::Space {
         self.get_space_for_origin(self.current_origin)
+    }
+
+    /// True when the session's runtime enumerated `format` for graphics
+    /// API `A`. Unlike [`Self::check_format`] this never falls back: depth
+    /// must be declined (not remapped to a color format) when absent.
+    pub fn has_swapchain_format<A: xr::Graphics>(&self, format: A::Format) -> bool
+    where
+        for<'a> &'a GraphicalSession: TryInto<&'a Session<A>, Error: std::fmt::Display>,
+        A::Format: PartialEq,
+    {
+        (&self.session_graphics)
+            .try_into()
+            .map(|s: &Session<A>| s.swapchain_formats.contains(&format))
+            .unwrap_or(false)
     }
 
     #[inline]
