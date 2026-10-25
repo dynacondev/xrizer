@@ -2,8 +2,8 @@
 //!
 //! Wire contract lives in `reprojex/src/shm.h` (`/xplane-depth-v3`, 96
 //! bytes) with reader ordering in `reprojex/CONSUMER_CONTRACT.md`. This
-//! module owns only the parts reprojex dictates; xrizer policy (staleness
-//! cutoff, logging, swapchain/import design) lives with callers.
+//! module owns only the parts reprojex dictates; xrizer policy (association
+//! window, logging, swapchain/import design) lives with callers.
 //!
 //! ```text
 //! +0  u32 magic       0x58504450 ('XPDP')
@@ -29,7 +29,8 @@
 //! tries) on odd/changed `seq`, `generation == 0` means nothing
 //! published yet. `read_control` returns [`ReadSkip`] on every miss so the
 //! compositor heartbeat can bucket skips with counter increments only —
-//! no formatting, no syscalls beyond the mapping itself. The wire module
+//! no formatting in the loop; the mapping itself plus one `clock_gettime`
+//! per miss for throttle gating are the only syscalls. The wire module
 //! logs only caller-invisible states (absent segment, exhausted retries),
 //! throttled to 1/5s at `debug!`; everything else is a returned reason.
 //! `pinned[]` are single atomic words written only by the consumer
@@ -62,8 +63,14 @@
 //! gate. A tight per-frame window (period + small margin) subsumes
 //! liveness: same-generation success implies fresh, and a frozen
 //! `generation` across frames (not a clock comparison) is the stalled
-//! producer signal. Feed [`AgeStats`] with one sample per frame (hits
-//! and misses alike) and report it on the heartbeat to catch sync drift.
+//! producer signal. Feed [`AgeStats`] with one [`depth_age_ns`] sample per
+//! successful read only — misses carry no timestamp, so they are counted
+//! via [`ReadSkip`] buckets instead — and report it on the heartbeat to
+//! catch sync drift.
+//!
+//! Removed knobs: `XRIZER_DEPTH_MAX_AGE_MS` (absolute-age gate) no longer
+//! exists — if set it is ignored; the kill-switch `XRIZER_DEPTH_SHM` is
+//! the only depth env var.
 //!
 //! No new crates: `libc` + `log` only.
 
@@ -240,7 +247,8 @@ impl DepthControl {
     /// Signed age of this snapshot at Submit receipt: positive = header
     /// older than receipt (normal), negative = header newer (same frame
     /// arriving just after wakeup; Submit-before-Present ordering).
-    /// Feed every sample (submitted or skipped) into [`AgeStats`].
+    /// Feed every successful read into [`AgeStats`]; read misses have no
+    /// timestamp and are bucketed by [`ReadSkip`] instead.
     pub fn age_ns(&self, receipt_mono_ns: u64) -> i64 {
         depth_age_ns(receipt_mono_ns, self.time_ns)
     }
@@ -251,8 +259,10 @@ impl DepthControl {
 /// the compositor aggregates counters for its periodic heartbeat line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadSkip {
-    /// Segment absent (open/fstat/mmap failed) — no layer installed or
-    /// torn down. Throttled `debug!` inside the mapper.
+    /// Segment absent (open/fstat/mmap failed) — no layer installed, torn
+    /// down, or transient resource failure (indistinguishable by design;
+    /// OOM buckets here too). Throttled `debug!` fires only on the
+    /// `shm_open`-absent path; post-open failures are counter-only.
     Absent,
     /// Mapped but not exactly 96 bytes — foreign writer or mid-recreate.
     WrongSize,
@@ -409,9 +419,18 @@ impl DepthFeed {
                 continue;
             }
             if unsafe { read_u32(ptr, 0) } != SHM_MAGIC {
+                // Unstable seq means a concurrent publish tore these bytes
+                // mid-read: retry (buckets as Torn on exhaustion), don't
+                // mis-bucket a torn foreign-looking word as BadMagic.
+                if unsafe { read_seq(ptr) } != seq1 {
+                    continue;
+                }
                 return Err(ReadSkip::BadMagic);
             }
             if unsafe { read_u32(ptr, 4) } != SHM_VERSION {
+                if unsafe { read_seq(ptr) } != seq1 {
+                    continue;
+                }
                 return Err(ReadSkip::BadVersion);
             }
             // Copy under seq1; the closing seq check covers torn reads.
@@ -589,14 +608,17 @@ pub fn depth_age_ns(receipt_mono_ns: u64, header_mono_ns: u64) -> i64 {
 /// check. Same-generation success implies fresh (the window sits strictly
 /// inside any sane liveness bound); a stalled producer shows up as a
 /// frozen `generation` across frames, not a clock comparison.
+/// Callers may additionally reject `time_ns == 0` (never-published
+/// sentinel): a failed receipt clock (0) coinciding with a zero stamp
+/// reads as age 0 and would otherwise pass.
 pub fn is_same_generation(age_ns: i64, frame_period_ns: i64, margin_ns: i64) -> bool {
     debug_assert!(margin_ns >= 0 && frame_period_ns >= 0);
     age_ns >= margin_ns.saturating_neg() && age_ns < frame_period_ns.saturating_add(margin_ns)
 }
 
 /// Running signed frame-vs-depth age stats for one heartbeat window.
-/// Feed one [`depth_age_ns`] sample per frame — submitted AND skipped
-/// (skipped ages are the desync signal). Integer state only (no float,
+/// Feed one [`depth_age_ns`] sample per successful read (misses have no
+/// timestamp — count those via [`ReadSkip`]). Integer state only (no float,
 /// no alloc); the heartbeat formats the summary. Reset with [`AgeStats::clear`]
 /// after each heartbeat line.
 #[derive(Debug, Default, Clone)]
@@ -891,6 +913,7 @@ mod tests {
     #[test]
     fn wire_constants_pinned() {
         // A drifted rendezvous constant is a cross-process break; pin values.
+        assert_eq!(READ_RETRIES, 4);
         assert_eq!(SHM_NAME, "/xplane-depth-v3");
         assert_eq!(SHM_MAGIC, 0x5850_4450);
         assert_eq!(SHM_VERSION, 3);
@@ -1297,10 +1320,9 @@ mod tests {
             .expect("readable");
         assert!(ctl.is_viable(), "old header still viable snapshot");
         let age = ctl.age_ns(now_mono_ns());
-        assert!(
-            age > 400_000_000 && age < 600_000_000,
-            "age ~= +500ms, got {age}"
-        );
+        // One-sided: post-read time can only be later, so slow CI only
+        // grows the age — an upper bound would flake.
+        assert!(age >= 499_000_000, "age >= ~500ms, got {age}");
         assert!(!is_same_generation(age, 11_111_111, 2_000_000));
         let name2 = format!("/xrizer-depth-test-{pid}-futhdr");
         let _seg2 = make_seg_v3(&name2, 8, 2, 8, |h| {
@@ -1360,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn stuck_odd_seqlock_returns_none() {
+    fn stuck_odd_seqlock_returns_torn() {
         let name = format!("/xrizer-depth-test-{}-odd", std::process::id());
         let seg = make_seg_v3(&name, 8, 2, 1, |_| {});
         unsafe {
@@ -1371,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_returns_none() {
+    fn absent_returns_absent() {
         let feed = DepthFeed::open_for_test("/xrizer-depth-test-definitely-absent");
         assert_eq!(feed.read_control().unwrap_err(), ReadSkip::Absent);
         assert!(!feed.pin_slot(0));
@@ -1528,6 +1550,8 @@ mod tests {
         s.sample(7);
         assert_eq!(s.count(), 1);
         assert_eq!(s.mean_ns(), Some(7.0));
+        assert_eq!(s.max_ns(), Some(7));
+        assert_eq!(s.min_ns(), Some(7));
         assert_eq!(s.neg_rate(), 0.0);
     }
 }
