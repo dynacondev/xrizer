@@ -86,6 +86,8 @@ _XRIZER_CUSTOM_BINDINGS_DIR_ - This can be used to supply a directory that xrize
 
 _XRIZER_TRACKER_SERIALS_ - This is a semi-colon (`;`) separated list of device serial numbers to use as generic trackers. Can be used to assign controllers as FBT trackers.
 
+_XRIZER_DEPTH_SHM_ - Depth-feed kill-switch (default on). Explicit `0/false/no/off` disables depth submission; anything unparseable warns once and stays on. When depth is on and the runtime supports `khr_composition_layer_depth`, xrizer reads the reprojex depth feed (`/xplane-depth-v4`, see `reprojex/CONSUMER_CONTRACT.md`) and chains depth layers. The `depth …/s` heartbeat line (every 5 s) reports frames with/without depth, per-reason skip buckets, signed age stats, and `seen[gen/epoch/dims]` — the last observed header identity, which diagnoses stale-feed stalls even when an earlier gate rejects every frame.
+
 # See also
 
 - [OpenComposite](https://gitlab.com/znixian/OpenOVR) - The original OpenVR/OpenXR implementation, much more mature than xrizer. Some of the code in this repo was rewritten based on OpenComposite.

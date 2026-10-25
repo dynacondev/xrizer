@@ -1115,6 +1115,13 @@ struct FrameController<G: GraphicsBackend> {
     /// [`DEPTH_FROZEN_TRIP_FRAMES`]; reset on advance.
     frozen_run: u32,
     frozen_tripped: bool,
+    /// Consecutive viable reads with identical generation while still unarmed
+    /// (`last_armed_gen == 0`). The post-arm frozen detector never trips
+    /// before the first arm (any `gen > 0` passes the repeat gate), so a
+    /// producer frozen from startup would otherwise stay silent behind
+    /// window rejects. Same trip threshold; logging only, never control.
+    prearm_run: u32,
+    prearm_tripped: bool,
     /// Last read outcome, for the dead-to-alive transition log. Starts true
     /// so cold-start absence (normal) stays silent.
     last_read_ok: bool,
@@ -1159,8 +1166,9 @@ struct FrameController<G: GraphicsBackend> {
     poll_count: u64,
     poll_sum_ns: u64,
     poll_max_ns: u64,
-    /// Last observed header identity (updated on every successful SHM read,
-    /// before any gate). State, not a counter: never reset. Lets a heartbeat
+    /// Last observed header identity (updated on every successful SHM read:
+    /// the end_frame-entry snapshot before any gate, plus the post-copy
+    /// epoch re-read). State, not a counter: never reset. Lets a heartbeat
     /// answer "what dims/epoch/generation are we actually seeing" even when
     /// an earlier gate (e.g. window) rejects every frame before dims match.
     last_seen_gen: u64,
@@ -1262,6 +1270,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             pinned_slot: None,
             frozen_run: 0,
             frozen_tripped: false,
+            prearm_run: 0,
+            prearm_tripped: false,
             last_read_ok: true,
             first_arm_logged: false,
             depth_import_off_logged: false,
@@ -1349,6 +1359,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.last_armed_gen = 0;
         self.frozen_run = 0;
         self.frozen_tripped = false;
+        self.prearm_run = 0;
+        self.prearm_tripped = false;
     }
 
     fn acquire_swapchain_image(&mut self) {
@@ -1716,11 +1728,13 @@ impl<G: GraphicsBackend> FrameController<G> {
         // Receipt at end_frame entry: age measures handoff-minus-present
         // (sub-ms normally), maximizing flip discrimination.
         let receipt = now_mono_ns();
+        let prev_seen_gen: u64;
         let ctl = match self.depth_feed.as_ref().map(|f| f.read_control()) {
             Some(Ok(c)) => {
                 self.note_read_ok(true);
                 // Record before any gate: the heartbeat reports what the
                 // header actually contains even when a gate rejects it.
+                prev_seen_gen = self.last_seen_gen;
                 self.last_seen_gen = c.generation;
                 self.last_seen_epoch = c.epoch;
                 self.last_seen_w = c.w;
@@ -1748,6 +1762,30 @@ impl<G: GraphicsBackend> FrameController<G> {
         // tunes the gate. Zero-stamp and non-viable snapshots are excluded
         // so an unhealthy producer can't skew the phase picture.
         self.age_stats.sample(ctl.age_ns(receipt));
+        // Pre-arm stall note (logging only): before the first arm the repeat
+        // gate can't trip (`gen > 0 == last_armed` always passes), so a
+        // producer frozen from startup hides behind window rejects with a
+        // wall-clock-growing age. Count identical generations across viable
+        // reads here; same threshold as the post-arm detector.
+        if self.last_armed_gen == 0 {
+            if ctl.generation == prev_seen_gen {
+                self.prearm_run = self.prearm_run.saturating_add(1);
+                if self.prearm_run == DEPTH_FROZEN_TRIP_FRAMES && !self.prearm_tripped {
+                    self.prearm_tripped = true;
+                    warn!(
+                        "depth producer stalled (pre-arm): generation frozen at {} for {} frames (no depth armed yet)",
+                        ctl.generation, self.prearm_run,
+                    );
+                }
+            } else {
+                // Advance (or first sight): heal a tripped note.
+                if self.prearm_tripped {
+                    self.prearm_tripped = false;
+                    info!("depth producer publishing (generation {})", ctl.generation);
+                }
+                self.prearm_run = 0;
+            }
+        }
         if ctl.generation <= self.last_armed_gen {
             // Same generation re-sighted: present hasn't landed yet (flip
             // or late present) or the producer stalled. Never re-arm —
@@ -1802,13 +1840,22 @@ impl<G: GraphicsBackend> FrameController<G> {
         // Dims are authoritative per read: never stretch, skip the frame.
         let (cw, ch) = match self.swapchain_data.as_ref() {
             Some(c) => (c.info.width, c.info.height),
-            None => return DepthEnd::Plain,
+            None => {
+                // No color swapchain (transient recreate): depth can't size.
+                // Bucketed as swapchain setup incomplete, like depth creation
+                // failures below — every plain path counts exactly one.
+                self.hb_swapchain = self.hb_swapchain.saturating_add(1);
+                return DepthEnd::Plain;
+            }
         };
         if cw == 0 || ctl.w != cw * 2 || ctl.h != ch {
             self.hb_dims = self.hb_dims.saturating_add(1);
             if !self.depth_dims_logged {
                 self.depth_dims_logged = true;
-                debug!(
+                // Info (not debug): a dims mismatch is a persistent
+                // configuration-level stall, and the heartbeat carries only
+                // the counter — the actual values belong in the log.
+                info!(
                     "depth dims {}x{} vs color {cw}x{ch} — plain views until match",
                     ctl.w, ctl.h,
                 );
@@ -1832,6 +1879,9 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.depth_import_off_logged = true;
                 info!("depth off: GL FD import not viable (extensions or entry points)");
             }
+            // Persistent copy precondition failure: count per frame like any
+            // other plain path (the one-time line above names the cause).
+            self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
             return DepthEnd::Plain;
         }
         // At most one pin: a still-outstanding prior copy means the GPU is
@@ -1978,9 +2028,21 @@ impl<G: GraphicsBackend> FrameController<G> {
             return DepthEnd::Plain;
         }
         // Post-copy epoch re-read: a recreate raced the copy (stale FDs
-        // imported, wrong pixels). Discard rather than mislabel.
+        // imported, wrong pixels). Discard rather than mislabel. A
+        // successful re-read refreshes the header identity (the heartbeat's
+        // seen[] tracks every Ok read, including this staleness net).
         match self.depth_feed.as_ref().map(|f| f.read_control()) {
-            Some(Ok(fresh)) if fresh.epoch == ctl.epoch => {}
+            Some(Ok(fresh)) => {
+                self.last_seen_gen = fresh.generation;
+                self.last_seen_epoch = fresh.epoch;
+                self.last_seen_w = fresh.w;
+                self.last_seen_h = fresh.h;
+                if fresh.epoch != ctl.epoch {
+                    self.unpin_now();
+                    self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
+                    return DepthEnd::Plain;
+                }
+            }
             _ => {
                 self.unpin_now();
                 self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
@@ -1993,14 +2055,19 @@ impl<G: GraphicsBackend> FrameController<G> {
         let depth_data = match self.depth_swapchain.as_ref() {
             Some(d) => d,
             None => {
+                // Defensive: verified Some at acquire; single-threaded flow
+                // can't clear it. Bucketed so every plain path counts one.
                 self.unpin_now();
+                self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
                 return DepthEnd::Plain;
             }
         };
         let color_data = match self.swapchain_data.as_ref() {
             Some(c) => c,
             None => {
+                // Defensive: verified Some at the dims gate. Same bucket.
                 self.unpin_now();
+                self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
                 return DepthEnd::Plain;
             }
         };
@@ -2056,7 +2123,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             );
         }
         if color_subs.len() != 2 || depth_subs.len() != 2 {
+            // Defensive: the depth layer hardcodes two eyes. A runtime
+            // reporting any other view count can't chain depth; plain.
             self.unpin_now();
+            self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
             return DepthEnd::Plain;
         }
 
@@ -2106,6 +2176,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             Ok(()) => {
                 trace!("frame submitted (with depth)");
                 self.last_armed_gen = ctl.generation;
+                self.prearm_run = 0;
+                self.prearm_tripped = false;
                 self.depth_end_fail_warned = false;
                 if !self.first_arm_logged {
                     self.first_arm_logged = true;
@@ -2125,6 +2197,8 @@ impl<G: GraphicsBackend> FrameController<G> {
                 // advances — the pixels are superseded by newest-wins next
                 // frame either way.
                 self.last_armed_gen = ctl.generation;
+                self.prearm_run = 0;
+                self.prearm_tripped = false;
                 self.hb_end_fail = self.hb_end_fail.saturating_add(1);
                 if !self.depth_end_fail_warned {
                     self.depth_end_fail_warned = true;
@@ -3118,6 +3192,12 @@ mod tests {
         ctrl.hb_epoch_raced = 1;
         ctrl.hb_end_fail = 1;
         ctrl.hb_depth_swapchains = 2;
+        // Non-zero header identity: proves the seen[] format args flow and
+        // that the heartbeat never resets them (state, not counters).
+        ctrl.last_seen_gen = 42;
+        ctrl.last_seen_epoch = 7;
+        ctrl.last_seen_w = 20;
+        ctrl.last_seen_h = 10;
         ctrl.age_stats.sample(1_000_000);
         ctrl.age_stats.sample(-500_000);
         ctrl.sample_acquire_ns(2_000_000);
@@ -3154,6 +3234,16 @@ mod tests {
         assert_eq!(ctrl.hb_epoch_raced, 0);
         assert_eq!(ctrl.hb_end_fail, 0);
         assert_eq!(ctrl.hb_depth_swapchains, 0);
+        assert_eq!(
+            (
+                ctrl.last_seen_gen,
+                ctrl.last_seen_epoch,
+                ctrl.last_seen_w,
+                ctrl.last_seen_h
+            ),
+            (42, 7, 20, 10),
+            "seen[] identity survives the heartbeat (never reset)"
+        );
         assert_eq!(ctrl.age_stats.count(), 0);
         assert_eq!(ctrl.acq_count, 0);
         assert_eq!(ctrl.acq_sum_ns, 0);

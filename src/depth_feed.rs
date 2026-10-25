@@ -1171,7 +1171,7 @@ mod tests {
             "version 2 must miss"
         );
         // Future versions are equally foreign.
-        for v in [0u32, 3, 5, u32::MAX] {
+        for v in [0u32, 1, 3, 5, u32::MAX] {
             let name = format!("/xrizer-depth-test-{pid}-v{v}");
             let _seg = make_seg(&name, 8, 2, 1, |h| {
                 h.version = v;
@@ -1655,6 +1655,9 @@ mod tests {
         let mut buf = [0u8; 1];
         assert_eq!(unsafe { libc::read(r, buf.as_mut_ptr().cast(), 1) }, 1);
         assert_eq!(poll_fence_fd(r, 1), FencePoll::Timeout);
+        // Negative timeout clamps to zero (never infinite): the drained pipe
+        // still reports pending immediately instead of blocking.
+        assert_eq!(poll_fence_fd(r, -5), FencePoll::Timeout);
         unsafe {
             libc::close(r);
             libc::close(w);
