@@ -1159,6 +1159,14 @@ struct FrameController<G: GraphicsBackend> {
     poll_count: u64,
     poll_sum_ns: u64,
     poll_max_ns: u64,
+    /// Last observed header identity (updated on every successful SHM read,
+    /// before any gate). State, not a counter: never reset. Lets a heartbeat
+    /// answer "what dims/epoch/generation are we actually seeing" even when
+    /// an earlier gate (e.g. window) rejects every frame before dims match.
+    last_seen_gen: u64,
+    last_seen_epoch: u32,
+    last_seen_w: u32,
+    last_seen_h: u32,
 }
 supported_backends_enum!(enum DynFrameController: FrameController);
 
@@ -1296,6 +1304,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             poll_count: 0,
             poll_sum_ns: 0,
             poll_max_ns: 0,
+            last_seen_gen: 0,
+            last_seen_epoch: 0,
+            last_seen_w: 0,
+            last_seen_h: 0,
         }
     }
 
@@ -1707,6 +1719,12 @@ impl<G: GraphicsBackend> FrameController<G> {
         let ctl = match self.depth_feed.as_ref().map(|f| f.read_control()) {
             Some(Ok(c)) => {
                 self.note_read_ok(true);
+                // Record before any gate: the heartbeat reports what the
+                // header actually contains even when a gate rejects it.
+                self.last_seen_gen = c.generation;
+                self.last_seen_epoch = c.epoch;
+                self.last_seen_w = c.w;
+                self.last_seen_h = c.h;
                 c
             }
             Some(Err(e)) => {
@@ -2215,7 +2233,8 @@ impl<G: GraphicsBackend> FrameController<G> {
     }
 
     /// Throttled heartbeat: one status line per window with the depth/plain
-    /// split, every skip bucket, signed age stats, and acquire timing. Hot
+    /// split, every skip bucket, signed age stats, acquire/poll timing, and
+    /// the last observed header identity (gen/epoch/dims, never reset). Hot
     /// path pays counter increments only; formatting happens here.
     fn maybe_log_depth_heartbeat(&mut self) {
         let now = Instant::now();
@@ -2260,7 +2279,7 @@ impl<G: GraphicsBackend> FrameController<G> {
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
              copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
-             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms]",
+             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] seen[gen {} epoch {} {}x{}]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
             self.hb_depth,
@@ -2299,6 +2318,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.acq_max_ns as f64 / 1_000_000.0,
             poll_avg,
             self.poll_max_ns as f64 / 1_000_000.0,
+            self.last_seen_gen,
+            self.last_seen_epoch,
+            self.last_seen_w,
+            self.last_seen_h,
         );
         self.hb_start = now;
         self.hb_frames = 0;
