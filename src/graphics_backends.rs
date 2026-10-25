@@ -92,10 +92,11 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         false
     }
 
-    /// Ensure FD imports for (epoch, dims, format); GPU-copy both halves
-    /// of `generation` into `depth_image_index`. The caller holds the
-    /// slot's SHM pin across this call; the backend queues a GPU wait on
-    /// the slot semaphore before copying and fences its own completion.
+    /// Ensure memory-FD imports for (epoch, dims, format); GPU-copy both
+    /// halves of `generation` into `depth_image_index`. The caller holds the
+    /// slot's SHM pin across this call and has already polled the slot's
+    /// fence FD for producer-copy completion — no semaphore wait happens
+    /// here. The backend fences its own completion for deferred unpin.
     /// Default: unsupported (keeps other backends compiling untouched).
     fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
         let _ = req;
@@ -114,13 +115,15 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 
 /// One FD-mode frame for [`GraphicsBackend::import_and_copy_depth_fd`].
 /// Two slots (`generation % 2`); FDs are borrowed numbers, never closed.
+/// Fence sync_file FDs are deliberately NOT part of the request: the caller
+/// polls the current snapshot's fence number directly (they are single-use
+/// snapshots, never cached across frames).
 pub struct DepthFdRequest {
     pub epoch: u32,
     pub w: u32,
     pub h: u32,
     pub vk_format: i32,
     pub mem_fds: [i32; 2],
-    pub sem_fds: [i32; 2],
     pub generation: u64,
     pub depth_image_index: usize,
     pub eye_w: u32,

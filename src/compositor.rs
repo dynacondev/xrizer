@@ -2,8 +2,8 @@ use crate::{
     AtomicF64,
     clientcore::{Injected, Injector},
     depth_feed::{
-        AgeStats, DepthFeed, FORMAT_D32F, FORMAT_D32S8, MAX_DEPTH, MIN_DEPTH, ReadSkip,
-        depth_master_enabled, is_same_generation, now_mono_ns, validate_near_far,
+        AgeStats, DepthFeed, FORMAT_D32F, FORMAT_D32S8, FencePoll, MAX_DEPTH, MIN_DEPTH, ReadSkip,
+        depth_master_enabled, is_same_generation, now_mono_ns, poll_fence_fd, validate_near_far,
     },
     graphics_backends::{
         DepthFdRequest, GraphicsBackend, SupportedBackend, supported_backends_enum,
@@ -1073,6 +1073,10 @@ const DEPTH_MARGIN_NS: i64 = 2_000_000;
 /// Bounded depth-swapchain image acquisition: never stall the app thread
 /// on a wedged runtime. Durations are logged (avg/max) on the heartbeat.
 const DEPTH_ACQUIRE_TIMEOUT_NS: i64 = 5_000_000;
+/// Bounded fence-FD poll for producer-copy completion. Typical return is
+/// immediate (the copy completed microseconds after publish); the budget
+/// absorbs hitches. Durations are logged (avg/max) on the heartbeat.
+const DEPTH_FENCE_POLL_TIMEOUT_MS: libc::c_int = 5;
 /// Cooldown between depth swapchain creation retries after a failure.
 const DEPTH_SWAPCHAIN_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 /// Heartbeat interval for the depth status line.
@@ -1140,6 +1144,8 @@ struct FrameController<G: GraphicsBackend> {
     hb_acquire_fail: u64,
     hb_acquire_timeout: u64,
     hb_copy_fail: u64,
+    hb_poll_timeout: u64,
+    hb_poll_dead: u64,
     hb_pin_held: u64,
     hb_swapchain: u64,
     hb_epoch_raced: u64,
@@ -1149,6 +1155,9 @@ struct FrameController<G: GraphicsBackend> {
     acq_count: u64,
     acq_sum_ns: u64,
     acq_max_ns: u64,
+    poll_count: u64,
+    poll_sum_ns: u64,
+    poll_max_ns: u64,
 }
 supported_backends_enum!(enum DynFrameController: FrameController);
 
@@ -1271,6 +1280,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_acquire_fail: 0,
             hb_acquire_timeout: 0,
             hb_copy_fail: 0,
+            hb_poll_timeout: 0,
+            hb_poll_dead: 0,
             hb_pin_held: 0,
             hb_swapchain: 0,
             hb_epoch_raced: 0,
@@ -1280,6 +1291,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             acq_count: 0,
             acq_sum_ns: 0,
             acq_max_ns: 0,
+            poll_count: 0,
+            poll_sum_ns: 0,
+            poll_max_ns: 0,
         }
     }
 
@@ -1628,6 +1642,12 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.acq_max_ns = self.acq_max_ns.max(ns);
     }
 
+    fn sample_poll_ns(&mut self, ns: u64) {
+        self.poll_count = self.poll_count.saturating_add(1);
+        self.poll_sum_ns = self.poll_sum_ns.saturating_add(ns);
+        self.poll_max_ns = self.poll_max_ns.max(ns);
+    }
+
     /// Depth path for `end_frame`: single late copy of the newest published
     /// generation, chained as `CompositionLayerDepthInfoKHR` views. No waits
     /// beyond bounded swapchain acquisition: the semaphore wait is GPU-side
@@ -1859,33 +1879,59 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         };
         self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
-        // Pin FIRST (contract order: pin → wait → sample), from the
+        // Pin FIRST (contract order: pin → poll → sample), from the
         // generation just read. A vanished segment mid-frame fails here.
+        // The borrow ends immediately: later steps re-borrow, so `&mut`
+        // work (stats, backend, unpin) never fights it.
         let slot = ctl.slot();
         debug_assert!(self.pinned_slot.is_none());
-        let Some(feed) = self.depth_feed.as_ref() else {
-            Self::release_depth_image(&mut self.depth_swapchain);
-            return DepthEnd::Plain;
-        };
-        if !feed.pin_slot(slot) {
+        if !self
+            .depth_feed
+            .as_ref()
+            .is_some_and(|feed| feed.pin_slot(slot))
+        {
             Self::release_depth_image(&mut self.depth_swapchain);
             return DepthEnd::Plain;
         }
         self.pinned_slot = Some(slot);
-        // Import note: the backend reimports when this snapshot's key
-        // (epoch, dims, format) differs from its cache. No fresh read sits
-        // between the pin and the import — none is needed: we wait only on
-        // the generation just read (single-snapshot discipline), so a
-        // rebuild racing us can't produce a wait-new-G-on-stale-import
-        // hang; the post-copy epoch re-read below is the staleness net
-        // that discards a copy made from recycled FDs.
+        // Poll the slot's fence sync_file for producer-copy completion
+        // (bounded; the pin keeps the polled number stable — the producer
+        // closes and replaces fence FDs only on unpinned reuse, and a
+        // vanished segment reports Dead). No semaphore objects exist on
+        // either side: the FD snapshots exactly this publish, so skipped
+        // generations leave no sync debt behind.
+        let t1 = now_mono_ns();
+        let fence_fd = ctl.fence_fds[slot];
+        match poll_fence_fd(fence_fd, DEPTH_FENCE_POLL_TIMEOUT_MS) {
+            FencePoll::Ready => {}
+            FencePoll::Timeout => {
+                self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
+                self.unpin_now();
+                Self::release_depth_image(&mut self.depth_swapchain);
+                self.hb_poll_timeout = self.hb_poll_timeout.saturating_add(1);
+                return DepthEnd::Plain;
+            }
+            FencePoll::Dead => {
+                self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
+                self.unpin_now();
+                Self::release_depth_image(&mut self.depth_swapchain);
+                self.hb_poll_dead = self.hb_poll_dead.saturating_add(1);
+                return DepthEnd::Plain;
+            }
+        }
+        self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
+        // Import note: the backend reimports memory when this snapshot's
+        // key (epoch, dims, format) differs from its cache. No fresh read
+        // sits between the pin and the import — none is needed: we sample
+        // only the generation just read (single-snapshot discipline), and
+        // the post-copy epoch re-read below is the staleness net that
+        // discards a copy made from recycled FDs.
         let res = self.backend.import_and_copy_depth_fd(&DepthFdRequest {
             epoch: ctl.epoch,
             w: ctl.w,
             h: ctl.h,
             vk_format: ctl.format,
             mem_fds: ctl.mem_fds,
-            sem_fds: ctl.sem_fds,
             generation: ctl.generation,
             depth_image_index: idx,
             eye_w,
@@ -1904,8 +1950,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
         // Post-copy epoch re-read: a recreate raced the copy (stale FDs
         // imported, wrong pixels). Discard rather than mislabel.
-        match feed.read_control() {
-            Ok(fresh) if fresh.epoch == ctl.epoch => {}
+        match self.depth_feed.as_ref().map(|f| f.read_control()) {
+            Some(Ok(fresh)) if fresh.epoch == ctl.epoch => {}
             _ => {
                 self.unpin_now();
                 self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
@@ -2190,12 +2236,20 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.acq_sum_ns as f64 / self.acq_count as f64 / 1_000_000.0
             )
         };
+        let poll_avg = if self.poll_count == 0 {
+            "—".to_string()
+        } else {
+            format!(
+                "{:.3}ms",
+                self.poll_sum_ns as f64 / self.poll_count as f64 / 1_000_000.0
+            )
+        };
         info!(
             "depth {:.1}/s ({} frames, {} with depth, {} plain) \
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
-             copy[noctx {} acq_fail {} acq_timeout {} copyfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
-             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms]",
+             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} copyfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
+             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
             self.hb_depth,
@@ -2216,6 +2270,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_no_context,
             self.hb_acquire_fail,
             self.hb_acquire_timeout,
+            self.hb_poll_timeout,
+            self.hb_poll_dead,
             self.hb_copy_fail,
             self.hb_pin_held,
             self.hb_swapchain,
@@ -2229,6 +2285,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.age_stats.neg_rate() * 100.0,
             acq_avg,
             self.acq_max_ns as f64 / 1_000_000.0,
+            poll_avg,
+            self.poll_max_ns as f64 / 1_000_000.0,
         );
         self.hb_start = now;
         self.hb_frames = 0;
@@ -2249,6 +2307,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.hb_no_context = 0;
         self.hb_acquire_fail = 0;
         self.hb_acquire_timeout = 0;
+        self.hb_poll_timeout = 0;
+        self.hb_poll_dead = 0;
         self.hb_copy_fail = 0;
         self.hb_pin_held = 0;
         self.hb_swapchain = 0;
@@ -2259,6 +2319,9 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.acq_count = 0;
         self.acq_sum_ns = 0;
         self.acq_max_ns = 0;
+        self.poll_count = 0;
+        self.poll_sum_ns = 0;
+        self.poll_max_ns = 0;
     }
 }
 
@@ -3002,6 +3065,8 @@ mod tests {
         ctrl.hb_no_context = 1;
         ctrl.hb_acquire_fail = 1;
         ctrl.hb_acquire_timeout = 2;
+        ctrl.hb_poll_timeout = 1;
+        ctrl.hb_poll_dead = 1;
         ctrl.hb_copy_fail = 3;
         ctrl.hb_pin_held = 1;
         ctrl.hb_swapchain = 1;
@@ -3012,6 +3077,7 @@ mod tests {
         ctrl.age_stats.sample(-500_000);
         ctrl.sample_acquire_ns(2_000_000);
         ctrl.sample_acquire_ns(4_000_000);
+        ctrl.sample_poll_ns(500_000);
         // Backdate past the interval so the line fires (and would panic
         // the app thread on any format/args mismatch or div-zero).
         ctrl.hb_start = Instant::now() - Duration::from_secs(6);
@@ -3026,6 +3092,8 @@ mod tests {
         assert_eq!(ctrl.hb_no_context, 0);
         assert_eq!(ctrl.hb_acquire_fail, 0);
         assert_eq!(ctrl.hb_acquire_timeout, 0);
+        assert_eq!(ctrl.hb_poll_timeout, 0);
+        assert_eq!(ctrl.hb_poll_dead, 0);
         assert_eq!(ctrl.hb_copy_fail, 0);
         assert_eq!(ctrl.hb_pin_held, 0);
         assert_eq!(ctrl.hb_swapchain, 0);
@@ -3036,6 +3104,9 @@ mod tests {
         assert_eq!(ctrl.acq_count, 0);
         assert_eq!(ctrl.acq_sum_ns, 0);
         assert_eq!(ctrl.acq_max_ns, 0);
+        assert_eq!(ctrl.poll_count, 0);
+        assert_eq!(ctrl.poll_sum_ns, 0);
+        assert_eq!(ctrl.poll_max_ns, 0);
         // Immediate re-call is throttled: window counters survive.
         ctrl.hb_frames = 7;
         ctrl.maybe_log_depth_heartbeat();

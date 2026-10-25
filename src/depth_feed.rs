@@ -1,13 +1,13 @@
-//! SHM depth-feed reader: xrizer side of the reprojex v3 handoff.
+//! SHM depth-feed reader: xrizer side of the reprojex v4 handoff.
 //!
-//! Wire contract lives in `reprojex/src/shm.h` (`/xplane-depth-v3`, 96
+//! Wire contract lives in `reprojex/src/shm.h` (`/xplane-depth-v4`, 96
 //! bytes) with reader ordering in `reprojex/CONSUMER_CONTRACT.md`. This
 //! module owns only the parts reprojex dictates; xrizer policy (association
 //! window, logging, swapchain/import design) lives with callers.
 //!
 //! ```text
 //! +0  u32 magic       0x58504450 ('XPDP')
-//! +4  u32 version     3
+//! +4  u32 version     4
 //! +8  u32 seq         seqlock: odd = writer inside
 //! +12 u32 w, +16 u32 h   full side-by-side mirror dims (eye_w = w/2)
 //! +20 i32 format      126 = D32F (preferred), 130 = D32S8 (fallback)
@@ -15,7 +15,9 @@
 //! +28 u32 reserved0   zero
 //! +32 u64 generation  latest completed generation (0 = nothing published)
 //! +40 u64 time_mono_ns  CLOCK_MONOTONIC at copy completion
-//! +48 i32 mem_fds[2], +56 i32 sem_fds[2]  (-1 until published, valid only > 2)
+//! +48 i32 mem_fds[2]    dma-buf memory, imported once per epoch
+//! +56 i32 fence_fds[2]  one-shot sync_file snapshot per publish
+//!                         (-1 until published, valid only > 2)
 //! +64 u32 alloc_bytes import size must be <= this; 0 = unknown
 //! +68 f32 near_z, +72 f32 far_z  clip planes
 //! +76 u32 reserved_pad  keeps pinned 8-byte aligned as a pair
@@ -34,7 +36,7 @@
 //! logs only caller-invisible states (absent segment, exhausted retries),
 //! throttled to 1/5s at `debug!`; everything else is a returned reason.
 //! `pinned[]` are single atomic words written only by the consumer
-//! (`Release` store 1 before wait/sample, 0 after own fence) and read by
+//! (`Release` store 1 before poll/sample, 0 after own fence) and read by
 //! the producer; the logical snapshot excludes them (the physical copy
 //! reads the whole mapping but discards the pin words — they are outside
 //! the seqlock).
@@ -42,13 +44,20 @@
 //! must; holding both stalls all publishes. Pins are backpressure-skip
 //! hints, not acks: the producer skips a pinned slot and keeps the other
 //! moving, so a stuck pin costs half rate, never a wedge.
-//! Slot for generation `G` is `G % 2`. Semaphores are timeline semaphores
-//! signaled with value `G` and must be imported as timeline type.
+//! Slot for generation `G` is `G % 2`. Per-slot completion is a
+//! one-shot fence sync_file, exported fresh at every publish: poll it
+//! ([`poll_fence_fd`], bounded) instead of any semaphore wait — there is
+//! no semaphore object to import, cache, or re-wait, so skipped
+//! generations leave no sync debt behind by construction.
 //! `CLOCK_MONOTONIC` timestamps correlate frames: `age = receipt - header`.
 //!
-//! FDs are borrowed numbers used directly (no `SCM_RIGHTS`/re-open/close);
-//! valid only `> 2`, `-1` until published; (re)import all FDs on epoch
-//! change and never wait across one. `reserved0/reserved_pad/reserved`
+//! FDs are borrowed numbers used directly (no `SCM_RIGHTS`/re-open/close,
+//! never closed by the reader); valid only `> 2`, `-1` until published.
+//! Memory FDs are (re)imported on epoch change. Fence FDs are single-use
+//! snapshots: always use the current read's numbers, never a cached copy
+//! across frames — the producer closes and replaces a slot's fence FD on
+//! reuse, and reuse is gated on the slot being unpinned, so a held pin
+//! keeps polled numbers stable. `reserved0/reserved_pad/reserved`
 //! must be tolerated nonzero (forward-compat; never checked). Viability
 //! is `is_viable()` AND `alloc_covers(bpp)` AND `validate_near_far()` —
 //! none implies the others. `eye_w() == w/2` truncates; odd `w` is rejected
@@ -79,9 +88,9 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Fixed rendezvous. No env override: a rendezvous point must not be configurable.
-pub const SHM_NAME: &str = "/xplane-depth-v3";
+pub const SHM_NAME: &str = "/xplane-depth-v4";
 pub const SHM_MAGIC: u32 = 0x5850_4450; // 'XPDP'
-pub const SHM_VERSION: u32 = 3;
+pub const SHM_VERSION: u32 = 4;
 pub const HEADER_SIZE: usize = 96;
 pub const SLOTS: usize = 2;
 /// Byte offset of `pinned[0]`. Both words are consumer-written atomics.
@@ -91,7 +100,7 @@ pub const FORMAT_D32F: i32 = 126;
 /// Vulkan `VK_FORMAT_D32_SFLOAT_S8_UINT`. Accepted fallback. Mirror/copy
 /// are depth-aspect-only, so stencil never enters the feed.
 pub const FORMAT_D32S8: i32 = 130;
-/// Fixed depth mapping range. v3 carries no min/max fields; always [0, 1].
+/// Fixed depth mapping range. v4 carries no min/max fields; always [0, 1].
 pub const MIN_DEPTH: f32 = 0.0;
 pub const MAX_DEPTH: f32 = 1.0;
 /// Bounded seqlock retries in [`DepthFeed::read_control`]. The writer holds
@@ -101,57 +110,59 @@ pub const MAX_DEPTH: f32 = 1.0;
 /// compositor thread. Named so the tradeoff is reviewable.
 pub const READ_RETRIES: usize = 4;
 
-/// Mirror of the C `rx_shm_v3`. Must stay 96 bytes with the exact offsets
-/// below. Keep in sync with `reprojex/src/shm.h`.
+/// Mirror of the C `rx_shm_v4`. Must stay 96 bytes with the exact offsets
+/// below. Keep in sync with `reprojex/src/shm.h`. Offsets are unchanged
+/// from v3; only `version` and the `fence_fds` semantics changed (v3 used
+/// timeline semaphores, v4 exports one-shot fence sync_files).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub struct XdShmHeaderV3 {
-    pub magic: u32,         // +0
-    pub version: u32,       // +4
-    pub seq: u32,           // +8
-    pub w: u32,             // +12
-    pub h: u32,             // +16
-    pub format: i32,        // +20
-    pub epoch: u32,         // +24
-    pub reserved0: u32,     // +28
-    pub generation: u64,    // +32
-    pub time_mono_ns: u64,  // +40
-    pub mem_fds: [i32; 2],  // +48
-    pub sem_fds: [i32; 2],  // +56
-    pub alloc_bytes: u32,   // +64
-    pub near_z: f32,        // +68
-    pub far_z: f32,         // +72
-    pub reserved_pad: u32,  // +76
-    pub pinned: [u32; 2],   // +80 consumer-written, outside seqlock
-    pub reserved: [u32; 2], // +88
+pub struct XdShmHeaderV4 {
+    pub magic: u32,          // +0
+    pub version: u32,        // +4
+    pub seq: u32,            // +8
+    pub w: u32,              // +12
+    pub h: u32,              // +16
+    pub format: i32,         // +20
+    pub epoch: u32,          // +24
+    pub reserved0: u32,      // +28
+    pub generation: u64,     // +32
+    pub time_mono_ns: u64,   // +40
+    pub mem_fds: [i32; 2],   // +48 dma-buf memory
+    pub fence_fds: [i32; 2], // +56 one-shot sync_file per publish
+    pub alloc_bytes: u32,    // +64
+    pub near_z: f32,         // +68
+    pub far_z: f32,          // +72
+    pub reserved_pad: u32,   // +76
+    pub pinned: [u32; 2],    // +80 consumer-written, outside seqlock
+    pub reserved: [u32; 2],  // +88
 }
 
 // Pinned at build time, not just under test: a drifted offset is a
 // cross-process ABI break, not a test failure.
 const _: () = {
-    assert!(std::mem::size_of::<XdShmHeaderV3>() == HEADER_SIZE);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, magic) == 0);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, version) == 4);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, seq) == 8);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, w) == 12);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, h) == 16);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, format) == 20);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, epoch) == 24);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, reserved0) == 28);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, generation) == 32);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, time_mono_ns) == 40);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, mem_fds) == 48);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, sem_fds) == 56);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, alloc_bytes) == 64);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, near_z) == 68);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, far_z) == 72);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, reserved_pad) == 76);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, pinned) == PINNED_OFF);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, pinned) + 4 == 84);
-    assert!(std::mem::offset_of!(XdShmHeaderV3, reserved) == 88);
+    assert!(std::mem::size_of::<XdShmHeaderV4>() == HEADER_SIZE);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, magic) == 0);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, version) == 4);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, seq) == 8);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, w) == 12);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, h) == 16);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, format) == 20);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, epoch) == 24);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, reserved0) == 28);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, generation) == 32);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, time_mono_ns) == 40);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, mem_fds) == 48);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, fence_fds) == 56);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, alloc_bytes) == 64);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, near_z) == 68);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, far_z) == 72);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, reserved_pad) == 76);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, pinned) == PINNED_OFF);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, pinned) + 4 == 84);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, reserved) == 88);
 };
 
-/// Snapshot of the v3 control header. `pinned[]` is deliberately absent:
+/// Snapshot of the v4 control header. `pinned[]` is deliberately absent:
 /// those words live outside the seqlock and must be touched only through
 /// [`DepthFeed::pin_slot`]/[`DepthFeed::unpin_slot`]/[`DepthFeed::load_pin`].
 #[derive(Debug, Clone)]
@@ -164,7 +175,12 @@ pub struct DepthControl {
     pub generation: u64,
     pub time_ns: u64,
     pub mem_fds: [i32; 2],
-    pub sem_fds: [i32; 2],
+    /// One-shot fence sync_file for this generation's copy completion.
+    /// Use only the current read's numbers: the producer closes and replaces
+    /// a slot's fence FD on reuse (gated on the slot being unpinned), so a
+    /// cached copy across frames may name a closed or recycled FD. The held
+    /// pin keeps the polled numbers stable for this frame.
+    pub fence_fds: [i32; 2],
     pub near_z: f32,
     pub far_z: f32,
     /// Observed segment length; viable only when exactly 96.
@@ -207,9 +223,10 @@ impl DepthControl {
     }
 
     /// All four FDs must be real (stdin/stdout/stderr are never depth).
-    /// The producer's pre-publish sentinel is -1.
+    /// The producer's pre-publish sentinel is -1. Memory FDs persist per
+    /// epoch; fence FDs are single-use snapshots (see field docs).
     pub fn fds_valid(&self) -> bool {
-        self.mem_fds.iter().all(|&f| f > 2) && self.sem_fds.iter().all(|&f| f > 2)
+        self.mem_fds.iter().all(|&f| f > 2) && self.fence_fds.iter().all(|&f| f > 2)
     }
 
     /// Reader-policy gate: even `w` required for the SBS split. The wire
@@ -391,7 +408,7 @@ impl DepthFeed {
         }
     }
 
-    /// Seqlock-read of the v3 control header. `Ok` snapshot or `Err`
+    /// Seqlock-read of the v4 control header. `Ok` snapshot or `Err`
     /// [`ReadSkip`] reason — no logging in the loop beyond the mapper's
     /// throttled absent line and the exhaustion line below, so the caller
     /// aggregates counters for its heartbeat. Callers fall back to plain
@@ -430,7 +447,7 @@ impl DepthFeed {
                 return Err(ReadSkip::BadVersion);
             }
             // Copy under seq1; the closing seq check covers torn reads.
-            let h = unsafe { read_header_v3(ptr) };
+            let h = unsafe { read_header_v4(ptr) };
             let seq2 = unsafe { read_seq(ptr) };
             if seq1 != seq2 {
                 continue;
@@ -449,7 +466,7 @@ impl DepthFeed {
                 generation: h.generation,
                 time_ns: h.time_mono_ns,
                 mem_fds: h.mem_fds,
-                sem_fds: h.sem_fds,
+                fence_fds: h.fence_fds,
                 near_z: h.near_z,
                 far_z: h.far_z,
                 seg_len: map_len,
@@ -488,12 +505,13 @@ impl DepthFeed {
         })
     }
 
-    /// Pin `slot` before waiting/sampling it (`Release` store of 1).
-    /// Pass `slot = DepthControl::slot_for_generation(generation)` from the
-    /// generation just read (seqlock → epoch-reimport → pin → wait →
-    /// sample). At most one slot may be pinned at a time — unenforced
-    /// here; holding both stalls the producer. Returns false when the
-    /// segment is absent or `slot >= 2`.
+    /// Pin `slot` before polling/sampling it (`Release` store of 1).
+    /// Pass `slot` from the generation just read (seqlock → pin → poll →
+    /// sample; memory reimport on epoch change precedes the pin). At most
+    /// one slot may be pinned at a time — unenforced here; holding both
+    /// stalls the producer. The pin keeps the slot's fence FD stable: the
+    /// producer closes and replaces fence FDs only on unpinned reuse.
+    /// Returns false when the segment is absent or `slot >= 2`.
     pub fn pin_slot(&self, slot: usize) -> bool {
         let Ok(map) = map_segment(&self.name, true) else {
             return false;
@@ -564,11 +582,11 @@ unsafe fn read_u32(base: *mut libc::c_void, off: usize) -> u32 {
 /// Same as [`read_seq`]; the whole 96-byte object must be mapped.
 /// The copy spans the pin words; callers discard them (see
 /// [`DepthFeed::read_control`]).
-unsafe fn read_header_v3(base: *mut libc::c_void) -> XdShmHeaderV3 {
+unsafe fn read_header_v4(base: *mut libc::c_void) -> XdShmHeaderV4 {
     // Same seqlock idiom as above; torn copies are detected by the
     // closing seq check, never trusted directly.
-    debug_assert_eq!(base as usize % std::mem::align_of::<XdShmHeaderV3>(), 0);
-    unsafe { (base as *const XdShmHeaderV3).read_volatile() }
+    debug_assert_eq!(base as usize % std::mem::align_of::<XdShmHeaderV4>(), 0);
+    unsafe { (base as *const XdShmHeaderV4).read_volatile() }
 }
 
 /// Header near/far win — no xrizer-side defaults. Pure predicate: invalid
@@ -741,6 +759,60 @@ pub fn now_mono_ns() -> u64 {
         .saturating_add(ts.tv_nsec as u64)
 }
 
+/// Poll outcome for [`poll_fence_fd`]. `Copy` enum — the heartbeat buckets
+/// it with counter increments, no formatting on the frame path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FencePoll {
+    /// Fence signaled: the producer's copy for this generation completed.
+    Ready,
+    /// Still pending after `timeout_ms`: skip (plain), keep the pin only if
+    /// a later poll is planned, else unpin. Bounded cost by construction.
+    Timeout,
+    /// FD invalid (`<= 2`), closed under us (segment vanished), or poll
+    /// errored: the snapshot is dead — re-read, never wait on it.
+    Dead,
+}
+
+/// Poll one published fence sync_file for producer-copy completion.
+///
+/// `fd` is the pinned slot's current fence number, used directly (poll
+/// takes no ownership; same-process borrowed numbers). Returns when
+/// signaled or after `timeout_ms`, whichever comes first — never blocks
+/// indefinitely. Call only while holding the slot's pin: the producer
+/// closes and replaces fence FDs on unpinned reuse, so an unpinned poll
+/// can observe a closed or recycled number (reported as [`FencePoll::Dead`]
+/// via `POLLNVAL`/error, fail-safe to plain).
+pub fn poll_fence_fd(fd: i32, timeout_ms: libc::c_int) -> FencePoll {
+    if fd <= 2 {
+        return FencePoll::Dead;
+    }
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: pfd points to one valid local pollfd; timeout is bounded.
+    let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if r > 0 {
+        // IN = signaled (HUP may accompany it on a consumed file — still
+        // signaled). Anything else with r > 0 (NVAL = closed under us, ERR,
+        // HUP-alone) means the snapshot is unusable: never wait on it.
+        if pfd.revents & libc::POLLNVAL != 0 {
+            FencePoll::Dead
+        } else if pfd.revents & libc::POLLIN != 0 {
+            FencePoll::Ready
+        } else {
+            FencePoll::Dead
+        }
+    } else if r == 0 {
+        FencePoll::Timeout
+    } else {
+        // -1: EINTR (a signal stole the wait) or EBADF (raced close) —
+        // either way the snapshot is unusable; re-read next frame.
+        FencePoll::Dead
+    }
+}
+
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 
@@ -789,12 +861,12 @@ mod tests {
         }
     }
 
-    fn make_seg_v3(
+    fn make_seg(
         name: &str,
         w: u32,
         h: u32,
         generation: u64,
-        tweak: impl FnOnce(&mut XdShmHeaderV3),
+        tweak: impl FnOnce(&mut XdShmHeaderV4),
     ) -> TestSeg {
         let cname = CString::new(name).unwrap();
         unsafe { libc::shm_unlink(cname.as_ptr()) };
@@ -820,7 +892,7 @@ mod tests {
         };
         assert_ne!(ptr, libc::MAP_FAILED);
         unsafe { libc::close(fd) };
-        let mut hdr = XdShmHeaderV3 {
+        let mut hdr = XdShmHeaderV4 {
             magic: SHM_MAGIC,
             version: SHM_VERSION,
             seq: 1,
@@ -832,7 +904,7 @@ mod tests {
             generation,
             time_mono_ns: now_mono_ns(),
             mem_fds: [11, 12],
-            sem_fds: [21, 22],
+            fence_fds: [21, 22],
             alloc_bytes: 8 * 2 * 4,
             near_z: 0.00742,
             far_z: 10000.0,
@@ -842,7 +914,7 @@ mod tests {
         };
         tweak(&mut hdr);
         unsafe {
-            (ptr as *mut XdShmHeaderV3).write_unaligned(hdr);
+            (ptr as *mut XdShmHeaderV4).write_unaligned(hdr);
             (ptr as *mut u32).add(2).write_volatile(2);
         }
         TestSeg {
@@ -886,36 +958,36 @@ mod tests {
 
     #[test]
     fn header_layout_matches_wire_contract() {
-        // Byte-identical with reprojex/src/shm.h (v3, 96B).
-        assert_eq!(std::mem::size_of::<XdShmHeaderV3>(), 96);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, magic), 0);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, version), 4);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, seq), 8);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, w), 12);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, h), 16);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, format), 20);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, epoch), 24);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, reserved0), 28);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, generation), 32);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, time_mono_ns), 40);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, mem_fds), 48);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, sem_fds), 56);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, alloc_bytes), 64);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, near_z), 68);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, far_z), 72);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, reserved_pad), 76);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, pinned), PINNED_OFF);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, pinned) + 4, 84);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV3, reserved), 88);
+        // Byte-identical with reprojex/src/shm.h (v4, 96B).
+        assert_eq!(std::mem::size_of::<XdShmHeaderV4>(), 96);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, magic), 0);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, version), 4);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, seq), 8);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, w), 12);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, h), 16);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, format), 20);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, epoch), 24);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, reserved0), 28);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, generation), 32);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, time_mono_ns), 40);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, mem_fds), 48);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, fence_fds), 56);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, alloc_bytes), 64);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, near_z), 68);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, far_z), 72);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, reserved_pad), 76);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, pinned), PINNED_OFF);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, pinned) + 4, 84);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, reserved), 88);
     }
 
     #[test]
     fn wire_constants_pinned() {
         // A drifted rendezvous constant is a cross-process break; pin values.
         assert_eq!(READ_RETRIES, 4);
-        assert_eq!(SHM_NAME, "/xplane-depth-v3");
+        assert_eq!(SHM_NAME, "/xplane-depth-v4");
         assert_eq!(SHM_MAGIC, 0x5850_4450);
-        assert_eq!(SHM_VERSION, 3);
+        assert_eq!(SHM_VERSION, 4);
         assert_eq!(HEADER_SIZE, 96);
         assert_eq!(SLOTS, 2);
         assert_eq!(PINNED_OFF, 80);
@@ -927,14 +999,14 @@ mod tests {
     #[test]
     fn viable_snapshot_roundtrip() {
         let name = format!("/xrizer-depth-test-{}-1", std::process::id());
-        let _seg = make_seg_v3(&name, 8, 2, 42, |_| {});
+        let _seg = make_seg(&name, 8, 2, 42, |_| {});
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("should hit");
         assert_eq!((ctl.w, ctl.h, ctl.generation), (8, 2, 42), "dims+gen");
         assert_eq!(ctl.epoch, 7, "epoch");
         assert_eq!(ctl.mem_fds, [11, 12], "mem fds");
-        assert_eq!(ctl.sem_fds, [21, 22], "sem fds");
+        assert_eq!(ctl.fence_fds, [21, 22], "sem fds");
         assert_eq!(ctl.alloc_bytes, 8 * 2 * 4, "alloc");
         assert!((ctl.near_z - 0.00742).abs() < f32::EPSILON, "near");
         assert!((ctl.far_z - 10000.0).abs() < f32::EPSILON, "far");
@@ -957,7 +1029,7 @@ mod tests {
         // Forward-compat: reserved words are never checked.
         let pid = std::process::id();
         let name = format!("/xrizer-depth-test-{pid}-rsv");
-        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+        let _seg = make_seg(&name, 8, 2, 3, |h| {
             h.reserved0 = 0xdead_beef;
             h.reserved_pad = 1;
             h.reserved = [7, 8];
@@ -983,7 +1055,7 @@ mod tests {
         // undersized alloc is still is_viable()==true.
         let pid = std::process::id();
         let name = format!("/xrizer-depth-test-{pid}-split");
-        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+        let _seg = make_seg(&name, 8, 2, 3, |h| {
             h.near_z = 0.0;
             h.far_z = 0.0;
             h.alloc_bytes = 1;
@@ -1014,7 +1086,7 @@ mod tests {
         let pid = std::process::id();
         // Max publishable dims are viable.
         let name = format!("/xrizer-depth-test-{pid}-maxdims");
-        let _seg = make_seg_v3(&name, 16384, 16384, 3, |_| {});
+        let _seg = make_seg(&name, 16384, 16384, 3, |_| {});
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
@@ -1028,7 +1100,7 @@ mod tests {
             ("zero-w", 0u32, 8u32),
         ] {
             let name = format!("/xrizer-depth-test-{pid}-{tag}");
-            let _seg = make_seg_v3(&name, w, h, 3, |_| {});
+            let _seg = make_seg(&name, w, h, 3, |_| {});
             let ctl = DepthFeed::open_for_test(&name)
                 .read_control()
                 .expect("readable");
@@ -1036,7 +1108,7 @@ mod tests {
         }
         // Odd h is fine (only w must be even for the SBS split).
         let name = format!("/xrizer-depth-test-{pid}-oddh");
-        let _seg = make_seg_v3(&name, 8, 3, 3, |_| {});
+        let _seg = make_seg(&name, 8, 3, 3, |_| {});
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
@@ -1051,7 +1123,7 @@ mod tests {
             generation: 1,
             time_ns: 1,
             mem_fds: [11, 12],
-            sem_fds: [21, 22],
+            fence_fds: [21, 22],
             near_z: 0.01,
             far_z: 200.0,
             seg_len: HEADER_SIZE,
@@ -1083,7 +1155,7 @@ mod tests {
         );
         // 96-byte segment stamped version 2: wrong version.
         let name2 = format!("/xrizer-depth-test-{pid}-v2b");
-        let _seg2 = make_seg_v3(&name2, 8, 2, 1, |h| {
+        let _seg2 = make_seg(&name2, 8, 2, 1, |h| {
             h.version = 2;
         });
         assert_eq!(
@@ -1092,9 +1164,9 @@ mod tests {
             "version 2 must miss"
         );
         // Future versions are equally foreign.
-        for v in [0u32, 4, u32::MAX] {
+        for v in [0u32, 3, 5, u32::MAX] {
             let name = format!("/xrizer-depth-test-{pid}-v{v}");
-            let _seg = make_seg_v3(&name, 8, 2, 1, |h| {
+            let _seg = make_seg(&name, 8, 2, 1, |h| {
                 h.version = v;
             });
             assert_eq!(
@@ -1109,7 +1181,7 @@ mod tests {
     fn bad_magic_and_size_rejected() {
         let pid = std::process::id();
         let name = format!("/xrizer-depth-test-{pid}-mag");
-        let seg = make_seg_v3(&name, 8, 2, 1, |_| {});
+        let seg = make_seg(&name, 8, 2, 1, |_| {});
         unsafe {
             (seg.ptr as *mut u32).write_volatile(0xdead_beef);
             (seg.ptr as *mut u32).add(2).write_volatile(2);
@@ -1159,9 +1231,9 @@ mod tests {
         let cases: [(i32, i32); 5] = [(-1, 21), (0, 21), (1, 21), (2, 21), (11, 2)];
         for (i, (mem0, sem0)) in cases.iter().enumerate() {
             let name = format!("/xrizer-depth-test-{pid}-fd{i}");
-            let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+            let _seg = make_seg(&name, 8, 2, 3, |h| {
                 h.mem_fds[0] = *mem0;
-                h.sem_fds[0] = *sem0;
+                h.fence_fds[0] = *sem0;
             });
             let ctl = DepthFeed::open_for_test(&name)
                 .read_control()
@@ -1173,9 +1245,9 @@ mod tests {
         }
         // Second lane is checked too, plus the all-sentinel pre-publish.
         let name = format!("/xrizer-depth-test-{pid}-fd-slot1");
-        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+        let _seg = make_seg(&name, 8, 2, 3, |h| {
             h.mem_fds[1] = -1;
-            h.sem_fds[1] = -1;
+            h.fence_fds[1] = -1;
         });
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
@@ -1185,9 +1257,9 @@ mod tests {
             "slot-1 sentinel must not arm"
         );
         let name = format!("/xrizer-depth-test-{pid}-fd-allneg");
-        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+        let _seg = make_seg(&name, 8, 2, 3, |h| {
             h.mem_fds = [-1, -1];
-            h.sem_fds = [-1, -1];
+            h.fence_fds = [-1, -1];
         });
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
@@ -1200,7 +1272,7 @@ mod tests {
         let pid = std::process::id();
         // epoch 0 with live generation: never published (zero-init mapping).
         let name = format!("/xrizer-depth-test-{pid}-pre-epoch");
-        let _seg = make_seg_v3(&name, 8, 2, 42, |h| {
+        let _seg = make_seg(&name, 8, 2, 42, |h| {
             h.epoch = 0;
         });
         let ctl = DepthFeed::open_for_test(&name)
@@ -1209,29 +1281,29 @@ mod tests {
         assert!(!ctl.is_viable(), "epoch 0 must not arm");
         // generation 0 with live epoch: nothing completed yet.
         let name = format!("/xrizer-depth-test-{pid}-pre-gen");
-        let _seg = make_seg_v3(&name, 8, 2, 0, |_| {});
+        let _seg = make_seg(&name, 8, 2, 0, |_| {});
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
         assert!(!ctl.is_viable(), "generation 0 must not arm");
         // Bad dims / format.
         let name = format!("/xrizer-depth-test-{pid}-oddw");
-        let _seg = make_seg_v3(&name, 7, 2, 3, |_| {});
+        let _seg = make_seg(&name, 7, 2, 3, |_| {});
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
         assert!(!ctl.is_viable(), "odd width must not arm");
-        type Tweak = (&'static str, fn(&mut XdShmHeaderV3));
+        type Tweak = (&'static str, fn(&mut XdShmHeaderV4));
         let tweaks: [Tweak; 5] = [
-            ("zerow", |h: &mut XdShmHeaderV3| h.w = 0),
-            ("huge", |h: &mut XdShmHeaderV3| h.w = 16385),
-            ("fmt", |h: &mut XdShmHeaderV3| h.format = 96),
-            ("gen0", |h: &mut XdShmHeaderV3| h.generation = 0),
-            ("epoch0", |h: &mut XdShmHeaderV3| h.epoch = 0),
+            ("zerow", |h: &mut XdShmHeaderV4| h.w = 0),
+            ("huge", |h: &mut XdShmHeaderV4| h.w = 16385),
+            ("fmt", |h: &mut XdShmHeaderV4| h.format = 96),
+            ("gen0", |h: &mut XdShmHeaderV4| h.generation = 0),
+            ("epoch0", |h: &mut XdShmHeaderV4| h.epoch = 0),
         ];
         for (tag, tweak) in tweaks {
             let name = format!("/xrizer-depth-test-{pid}-{tag}");
-            let _seg = make_seg_v3(&name, 8, 2, 3, tweak);
+            let _seg = make_seg(&name, 8, 2, 3, tweak);
             let ctl = DepthFeed::open_for_test(&name)
                 .read_control()
                 .expect("readable");
@@ -1243,7 +1315,7 @@ mod tests {
     fn d32s8_fallback_is_viable() {
         let pid = std::process::id();
         let name = format!("/xrizer-depth-test-{pid}-s8");
-        let _seg = make_seg_v3(&name, 8, 2, 3, |h| {
+        let _seg = make_seg(&name, 8, 2, 3, |h| {
             h.format = FORMAT_D32S8;
         });
         let ctl = DepthFeed::open_for_test(&name)
@@ -1266,7 +1338,7 @@ mod tests {
             generation: 1,
             time_ns,
             mem_fds: [11, 12],
-            sem_fds: [21, 22],
+            fence_fds: [21, 22],
             near_z: 0.00742,
             far_z: 10000.0,
             seg_len: HEADER_SIZE,
@@ -1311,7 +1383,7 @@ mod tests {
         // staleness is decided by the caller from the signed age, not here.
         let name = format!("/xrizer-depth-test-{pid}-oldhdr");
         let now_setup = now_mono_ns();
-        let _seg = make_seg_v3(&name, 8, 2, 7, |h| {
+        let _seg = make_seg(&name, 8, 2, 7, |h| {
             h.time_mono_ns = now_setup.saturating_sub(500_000_000);
         });
         let ctl = DepthFeed::open_for_test(&name)
@@ -1324,7 +1396,7 @@ mod tests {
         assert!(age >= 499_000_000, "age >= ~500ms, got {age}");
         assert!(!is_same_generation(age, 11_111_111, 2_000_000));
         let name2 = format!("/xrizer-depth-test-{pid}-futhdr");
-        let _seg2 = make_seg_v3(&name2, 8, 2, 8, |h| {
+        let _seg2 = make_seg(&name2, 8, 2, 8, |h| {
             h.time_mono_ns = now_mono_ns().saturating_add(5_000_000_000);
         });
         let ctl2 = DepthFeed::open_for_test(&name2)
@@ -1339,7 +1411,7 @@ mod tests {
     #[test]
     fn pin_roundtrip_outside_seqlock() {
         let name = format!("/xrizer-depth-test-{}-pin", std::process::id());
-        let seg = make_seg_v3(&name, 8, 2, 42, |_| {});
+        let seg = make_seg(&name, 8, 2, 42, |_| {});
         // Independent raw view through the test's own mapping at hardcoded
         // +80/+84 (not via PINNED_OFF): proves the ABI offset, not just
         // self-consistency. Atomic loads — a plain read would race.
@@ -1383,7 +1455,7 @@ mod tests {
     #[test]
     fn stuck_odd_seqlock_returns_torn() {
         let name = format!("/xrizer-depth-test-{}-odd", std::process::id());
-        let seg = make_seg_v3(&name, 8, 2, 1, |_| {});
+        let seg = make_seg(&name, 8, 2, 1, |_| {});
         unsafe {
             (seg.ptr as *mut u32).add(2).write_volatile(3);
         }
@@ -1552,5 +1624,45 @@ mod tests {
         assert_eq!(s.max_ns(), Some(7));
         assert_eq!(s.min_ns(), Some(7));
         assert_eq!(s.neg_rate(), 0.0);
+    }
+
+    /// Fence-poll outcomes against real (pipe-backed) pollable FDs. Pipes
+    /// stand in for sync_file FDs: both signal `POLLIN`, time out empty,
+    /// and report dead when closed — the only three behaviors the caller
+    /// depends on.
+    #[test]
+    fn fence_poll_ready_timeout_dead() {
+        assert_eq!(poll_fence_fd(-1, 0), FencePoll::Dead);
+        assert_eq!(poll_fence_fd(0, 0), FencePoll::Dead);
+        assert_eq!(poll_fence_fd(2, 0), FencePoll::Dead);
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        // Empty pipe, zero timeout: pending.
+        assert_eq!(poll_fence_fd(r, 0), FencePoll::Timeout);
+        // One byte readable: signaled.
+        assert_eq!(unsafe { libc::write(w, [1u8].as_ptr().cast(), 1) }, 1);
+        assert_eq!(poll_fence_fd(r, 10), FencePoll::Ready);
+        // Drained pipe blocks again (bounded 1ms check, not zero, so a
+        // slow CI scheduler can't flake the direction).
+        let mut buf = [0u8; 1];
+        assert_eq!(unsafe { libc::read(r, buf.as_mut_ptr().cast(), 1) }, 1);
+        assert_eq!(poll_fence_fd(r, 1), FencePoll::Timeout);
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+        // Closed read end: dead, never waited on.
+        assert_eq!(poll_fence_fd(r, 10), FencePoll::Dead);
+    }
+
+    #[test]
+    fn fence_poll_copy_and_heartbeat_key() {
+        // Heartbeat bucketing relies on cheap discriminant compares.
+        let a = FencePoll::Ready;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(a, FencePoll::Timeout);
+        assert_ne!(a, FencePoll::Dead);
     }
 }

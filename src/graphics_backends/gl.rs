@@ -23,7 +23,8 @@ pub struct GlData {
     draw_fbo: u32,
     depth_images: Vec<u32>,
     depth_format: u32,
-    /// GL_EXT_memory_object(_fd) + GL_EXT_semaphore(_fd) all present.
+    /// GL_EXT_memory_object(_fd) present (fence sync_files are polled
+    /// with libc, never imported into GL).
     fd_import_viable: bool,
     depth_fd: Option<DepthFdCache>,
     /// Last FD key whose import failed + earliest retry time. A failed
@@ -40,7 +41,6 @@ const FD_IMPORT_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 struct DepthFdSlot {
     mem: u32,
     tex: u32,
-    sem: u32,
 }
 
 struct DepthFdCache {
@@ -50,25 +50,17 @@ struct DepthFdCache {
     vk_format: i32,
     alloc_bytes: u32,
     slots: [DepthFdSlot; 2],
-    /// (epoch, generation) of the last semaphore wait. Waits are issued
-    /// once per generation (binary-semaphore semantics); a re-copy of an
-    /// already-waited generation skips straight to the copy.
-    last_waited: Option<(u32, u64)>,
     /// In-flight copy completion fence: (fence bits, generation). At most
     /// one — the caller holds at most one SHM pin, so at most one copy is
     /// ever outstanding. Polled (zero timeout) before the next pin.
     pending: Option<(u64, u64)>,
 }
 
-/// Required GL extensions for the FD import path.
-const FD_IMPORT_EXTS: [&str; 4] = [
-    "GL_EXT_memory_object",
-    "GL_EXT_memory_object_fd",
-    "GL_EXT_semaphore",
-    "GL_EXT_semaphore_fd",
-];
+/// Required GL extensions for the FD import path (memory only: fence
+/// sync_files are polled with libc, never imported into GL).
+const FD_IMPORT_EXTS: [&str; 2] = ["GL_EXT_memory_object", "GL_EXT_memory_object_fd"];
 
-/// Opaque-fd handle type for memory/semaphore imports.
+/// Opaque-fd handle type for memory imports.
 const HANDLE_TYPE_OPAQUE_FD: u32 = 0x9586;
 
 type PfCreateMemoryObjects =
@@ -90,35 +82,14 @@ type PfTextureStorageMem2D = unsafe extern "system" fn(
     memory: gl::types::GLuint,
     offset: u64,
 );
-type PfGenSemaphores =
-    unsafe extern "system" fn(n: gl::types::GLsizei, semaphores: *mut gl::types::GLuint);
-type PfDeleteSemaphores =
-    unsafe extern "system" fn(n: gl::types::GLsizei, semaphores: *const gl::types::GLuint);
-type PfImportSemaphoreFd = unsafe extern "system" fn(
-    semaphore: gl::types::GLuint,
-    handle_type: gl::types::GLenum,
-    fd: libc::c_int,
-);
-type PfWaitSemaphore = unsafe extern "system" fn(
-    semaphore: gl::types::GLuint,
-    num_buffer_barriers: gl::types::GLuint,
-    buffers: *const gl::types::GLuint,
-    num_texture_barriers: gl::types::GLuint,
-    textures: *const gl::types::GLuint,
-    src_layouts: *const gl::types::GLenum,
-);
 
-/// EXT_memory_object(_fd) + EXT_semaphore(_fd) entry points. Loaded once;
+/// EXT_memory_object(_fd) entry points. Loaded once;
 /// any missing entry disables the FD path (never a partial import).
 struct DepthExtFns {
     create_memory: Option<PfCreateMemoryObjects>,
     delete_memory: Option<PfDeleteMemoryObjects>,
     import_memory_fd: Option<PfImportMemoryFd>,
     texture_storage_mem_2d: Option<PfTextureStorageMem2D>,
-    gen_semaphores: Option<PfGenSemaphores>,
-    delete_semaphores: Option<PfDeleteSemaphores>,
-    import_semaphore_fd: Option<PfImportSemaphoreFd>,
-    wait_semaphore: Option<PfWaitSemaphore>,
 }
 
 impl DepthExtFns {
@@ -127,10 +98,6 @@ impl DepthExtFns {
             && self.delete_memory.is_some()
             && self.import_memory_fd.is_some()
             && self.texture_storage_mem_2d.is_some()
-            && self.gen_semaphores.is_some()
-            && self.delete_semaphores.is_some()
-            && self.import_semaphore_fd.is_some()
-            && self.wait_semaphore.is_some()
     }
 }
 
@@ -165,10 +132,6 @@ static DEPTH_EXT: LazyLock<DepthExtFns> = LazyLock::new(|| {
         delete_memory: load_ext_fn(&glx, c"glDeleteMemoryObjectsEXT"),
         import_memory_fd: load_ext_fn(&glx, c"glImportMemoryFdEXT"),
         texture_storage_mem_2d: load_ext_fn(&glx, c"glTextureStorageMem2DEXT"),
-        gen_semaphores: load_ext_fn(&glx, c"glGenSemaphoresEXT"),
-        delete_semaphores: load_ext_fn(&glx, c"glDeleteSemaphoresEXT"),
-        import_semaphore_fd: load_ext_fn(&glx, c"glImportSemaphoreFdEXT"),
-        wait_semaphore: load_ext_fn(&glx, c"glWaitSemaphoreEXT"),
     }
 });
 
@@ -576,8 +539,9 @@ impl GraphicsBackend for GlData {
             return inert();
         }
         // Stdin/stdout/stderr are never valid depth FDs; the producer's
-        // pre-publish sentinel is -1.
-        if req.mem_fds.iter().any(|&f| f <= 2) || req.sem_fds.iter().any(|&f| f <= 2) {
+        // pre-publish sentinel is -1. (Fence FDs are validated by the
+        // caller's poll, not here — they are never imported.)
+        if req.mem_fds.iter().any(|&f| f <= 2) {
             return inert();
         }
         if self.depth_images.is_empty() || req.depth_image_index >= self.depth_images.len() {
@@ -646,7 +610,6 @@ impl GraphicsBackend for GlData {
                         vk_format: req.vk_format,
                         alloc_bytes: req.alloc_bytes,
                         slots,
-                        last_waited: None,
                         pending: None,
                     });
                     self.fd_failed_key = None;
@@ -662,53 +625,15 @@ impl GraphicsBackend for GlData {
         let Some(cache) = self.depth_fd.as_mut() else {
             return inert();
         };
-        // Wait once per generation (binary-semaphore semantics; skip on
-        // re-copy). Recorded only on a clean wait: a failed wait must not
-        // mark the generation consumed, or the next copy would skip its
-        // wait and risk tearing. The caller holds the slot's SHM pin across
-        // this call, so the slot cannot be recycled under the wait.
-        //
-        // Soundness note (binary wait over a timeline export): waits are
-        // deduped per (epoch, gen) and generations advance strictly, so no
-        // generation is ever waited twice — but skipped generations leave
-        // their signals unconsumed, and a later wait on the same slot can,
-        // under a strict binary reading, observe a stale signal and sample
-        // early (one torn frame, healed newest-wins next present). True
-        // timeline waits (GL_EXT_timeline_semaphore, value=G) would close
-        // this; they are deliberately not hand-declared here (signatures
-        // unverifiable in this tree, no GPU to validate against) and the
-        // v2 pattern ran live. Tripwire: copies never succeeding (no first
-        // arm, copy-fail climbing) with healthy SHM means investigate this
-        // wait first — the one-shot-fence redesign is specified and waiting.
+        // No GL-side sync here by design: the caller polled this
+        // generation's fence sync_file (bounded, while holding the slot's
+        // SHM pin) before calling, so the producer's copy completed. There
+        // is no semaphore object to wait on — fence FDs are single-use
+        // snapshots with no persistent state to go stale across skipped
+        // generations, which is what made the previous semaphore design
+        // unsound (stale-signal early sample, then a never-completing wait
+        // wedging the pin forever).
         let slot = (req.generation % 2) as usize;
-        if cache.last_waited != Some((req.epoch, req.generation)) {
-            let Some(wait) = DEPTH_EXT.wait_semaphore else {
-                return inert();
-            };
-            let waited_ok = unsafe {
-                wait(
-                    cache.slots[slot].sem,
-                    0,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                );
-                gl::GetError() == gl::NO_ERROR
-            };
-            if !waited_ok {
-                // Unsynchronized copy would risk tearing: skip the copy.
-                // Next frame re-waits properly. Debug-logged (not counted):
-                // a systematic wait failure here means the semaphore import
-                // doesn't satisfy the wait — investigate, don't tune around.
-                debug!(
-                    "depth FD semaphore wait failed (epoch {}, gen {})",
-                    req.epoch, req.generation,
-                );
-                return inert();
-            }
-            cache.last_waited = Some((req.epoch, req.generation));
-        }
         let ok = unsafe {
             for eye in 0..2u32 {
                 gl::CopyImageSubData(
@@ -793,9 +718,6 @@ impl GraphicsBackend for GlData {
                     gl::DeleteSync(bits as gl::types::GLsync);
                 }
                 for s in &cache.slots {
-                    if let Some(f) = DEPTH_EXT.delete_semaphores {
-                        f(1, &s.sem);
-                    }
                     gl::DeleteTextures(1, &s.tex);
                     if let Some(f) = DEPTH_EXT.delete_memory {
                         f(1, &s.mem);
@@ -807,7 +729,8 @@ impl GraphicsBackend for GlData {
 }
 
 impl GlData {
-    /// Import both mirror slots (memory + depth texture + semaphore each).
+    /// Import both mirror slots (memory + depth texture each; fence FDs
+    /// are polled by the caller, never imported).
     /// FD ownership across the import is driver-defined (dup-and-keep vs
     /// consume differ across the matrix), so each FD is `dup()`ed and the
     /// dup — never the producer's number — is handed over:
@@ -830,18 +753,14 @@ impl GlData {
             .saturating_mul(bpp);
         let size = want.max(req.alloc_bytes as u64);
         let import_mem = DEPTH_EXT.import_memory_fd?;
-        let import_sem = DEPTH_EXT.import_semaphore_fd?;
         let create_mem = DEPTH_EXT.create_memory?;
         let tex_storage = DEPTH_EXT.texture_storage_mem_2d?;
-        let gen_sem = DEPTH_EXT.gen_semaphores?;
         let mut slots = [DepthFdSlot::default(); 2];
         for i in 0..2 {
             let mut mem = 0;
             let mut tex = 0;
-            let mut sem = 0;
-            // Defensive dups (see fn docs): the import sees only our numbers.
+            // Defensive dup (see fn docs): the import sees only our number.
             let mem_fd = unsafe { libc::dup(req.mem_fds[i]) };
-            let sem_fd = unsafe { libc::dup(req.sem_fds[i]) };
             // Drain stale errors first so the step attribution below is
             // honest; bounded so a chatty driver can't stall us.
             for _ in 0..8 {
@@ -849,7 +768,7 @@ impl GlData {
                     break;
                 }
             }
-            let step = if mem_fd < 0 || sem_fd < 0 {
+            let step = if mem_fd < 0 {
                 "dup-fd"
             } else {
                 unsafe {
@@ -868,17 +787,7 @@ impl GlData {
                             if gl::GetError() != gl::NO_ERROR || tex == 0 {
                                 "texture-storage-mem"
                             } else {
-                                gen_sem(1, &mut sem);
-                                if gl::GetError() != gl::NO_ERROR || sem == 0 {
-                                    "gen-semaphore"
-                                } else {
-                                    import_sem(sem, HANDLE_TYPE_OPAQUE_FD, sem_fd);
-                                    if gl::GetError() != gl::NO_ERROR {
-                                        "import-semaphore-fd"
-                                    } else {
-                                        ""
-                                    }
-                                }
+                                ""
                             }
                         }
                     }
@@ -886,27 +795,25 @@ impl GlData {
             };
             if !step.is_empty() {
                 warn!(
-                    "depth FD import failed at {step} (slot {i}/2, epoch {}, {}x{} fmt {} memfd {} semfd {} size {})",
-                    req.epoch, req.w, req.h, req.vk_format, req.mem_fds[i], req.sem_fds[i], size,
+                    "depth FD import failed at {step} (slot {i}/2, epoch {}, {}x{} fmt {} memfd {} size {})",
+                    req.epoch, req.w, req.h, req.vk_format, req.mem_fds[i], size,
                 );
-                // Failed import took ownership of nothing: close our dups.
-                for fd in [mem_fd, sem_fd] {
-                    if fd >= 0 {
-                        unsafe {
-                            libc::close(fd);
-                        }
+                // Failed import took ownership of nothing: close our dup.
+                if mem_fd >= 0 {
+                    unsafe {
+                        libc::close(mem_fd);
                     }
                 }
                 unsafe {
-                    Self::delete_fd_slot(&DepthFdSlot { mem, tex, sem });
+                    Self::delete_fd_slot(&DepthFdSlot { mem, tex });
                     for s in slots.iter().take(i) {
                         Self::delete_fd_slot(s);
                     }
                 }
                 return None;
             }
-            // Success: dups intentionally left open (see fn docs).
-            slots[i] = DepthFdSlot { mem, tex, sem };
+            // Success: dup intentionally left open (see fn docs).
+            slots[i] = DepthFdSlot { mem, tex };
         }
         Some(slots)
     }
@@ -916,11 +823,6 @@ impl GlData {
     /// when nonzero; guard explicitly to never feed zeros).
     unsafe fn delete_fd_slot(s: &DepthFdSlot) {
         unsafe {
-            if s.sem != 0
-                && let Some(f) = DEPTH_EXT.delete_semaphores
-            {
-                f(1, &s.sem);
-            }
             if s.tex != 0 {
                 gl::DeleteTextures(1, &s.tex);
             }
