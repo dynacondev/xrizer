@@ -25,12 +25,18 @@
 //!
 //! Reader discipline: fresh `shm_open`+`mmap` per call (producer
 //! unlink/recreates on geometry change, so no fd is ever cached), `fstat`
-//! size must be exactly 96, seqlock retry (bounded, 4 tries) on odd/changed
-//! `seq`, `generation == 0` means nothing published yet. `pinned[]` are
-//! single atomic words written only by the consumer (`Release` store 1
-//! before wait/sample, 0 after own fence) and read by the producer; the
-//! logical snapshot excludes them (the physical copy reads the whole
-//! mapping but discards the pin words — they are outside the seqlock).
+//! size must be exactly 96, seqlock retry (bounded, [`READ_RETRIES`]
+//! tries) on odd/changed `seq`, `generation == 0` means nothing
+//! published yet. `read_control` returns [`ReadSkip`] on every miss so the
+//! compositor heartbeat can bucket skips with counter increments only —
+//! no formatting, no syscalls beyond the mapping itself. The wire module
+//! logs only caller-invisible states (absent segment, exhausted retries),
+//! throttled to 1/5s at `debug!`; everything else is a returned reason.
+//! `pinned[]` are single atomic words written only by the consumer
+//! (`Release` store 1 before wait/sample, 0 after own fence) and read by
+//! the producer; the logical snapshot excludes them (the physical copy
+//! reads the whole mapping but discards the pin words — they are outside
+//! the seqlock).
 //! At most one pin at a time — the API does not enforce this, the caller
 //! must; holding both stalls all publishes. Pins are backpressure-skip
 //! hints, not acks: the producer skips a pinned slot and keeps the other
@@ -50,6 +56,14 @@
 //! `pinned[]`; mappings are `munmap`ed+closed on drop with no caching, and
 //! disappearance is treated like generation 0 (drop imports, plain frame,
 //! re-open).
+//!
+//! Submission gating is [`is_same_generation`] on the signed
+//! frame-vs-depth age — there is deliberately no absolute-age "stale"
+//! gate. A tight per-frame window (period + small margin) subsumes
+//! liveness: same-generation success implies fresh, and a frozen
+//! `generation` across frames (not a clock comparison) is the stalled
+//! producer signal. Feed [`AgeStats`] with one sample per frame (hits
+//! and misses alike) and report it on the heartbeat to catch sync drift.
 //!
 //! No new crates: `libc` + `log` only.
 
@@ -78,8 +92,12 @@ pub const FORMAT_D32S8: i32 = 130;
 /// Fixed depth mapping range. v3 carries no min/max fields; always [0, 1].
 pub const MIN_DEPTH: f32 = 0.0;
 pub const MAX_DEPTH: f32 = 1.0;
-/// Default staleness bound (ms) when `XRIZER_DEPTH_MAX_AGE_MS` is unset.
-pub const DEFAULT_MAX_AGE_MS: u64 = 100;
+/// Bounded seqlock retries in [`DepthFeed::read_control`]. The writer holds
+/// odd for one 96-byte fill (nanoseconds, no syscalls inside), so a healthy
+/// read succeeds on try 1; the bound exists so a dead/stuck producer
+/// degrades to a [`ReadSkip::Torn`] (plain frame) instead of spinning the
+/// compositor thread. Named so the tradeoff is reviewable.
+pub const READ_RETRIES: usize = 4;
 
 /// Mirror of the C `rx_shm_v3`. Must stay 96 bytes with the exact offsets
 /// below. Keep in sync with `reprojex/src/shm.h`.
@@ -219,26 +237,32 @@ impl DepthControl {
             && self.fds_valid()
     }
 
-    /// Coarse liveness gate against the header timestamp. Zero and future
-    /// stamps are stale (never published / clock skew). Pass `now` sampled
-    /// at use (after the read), NOT a Submit-receipt timestamp: the
-    /// producer publishes at present, after Submit is woken, so a receipt
-    /// can legitimately predate the header by milliseconds — that
-    /// small-negative case is the freshest frame, not staleness, and is
-    /// handled by [`depth_age_ns`]/[`is_same_generation`], not here.
-    pub fn is_stale(&self, now_mono_ns: u64, max_age_ms: u64) -> bool {
-        if self.time_ns == 0 || self.time_ns > now_mono_ns {
-            return true;
-        }
-        now_mono_ns.saturating_sub(self.time_ns) > max_age_ms.saturating_mul(1_000_000)
-    }
-
     /// Signed age of this snapshot at Submit receipt: positive = header
     /// older than receipt (normal), negative = header newer (same frame
     /// arriving just after wakeup; Submit-before-Present ordering).
+    /// Feed every sample (submitted or skipped) into [`AgeStats`].
     pub fn age_ns(&self, receipt_mono_ns: u64) -> i64 {
         depth_age_ns(receipt_mono_ns, self.time_ns)
     }
+}
+
+/// Why a read missed, for heartbeat bucketing. `Copy` enum only — no
+/// strings, no formatting — so the hot path pays a discriminant move and
+/// the compositor aggregates counters for its periodic heartbeat line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadSkip {
+    /// Segment absent (open/fstat/mmap failed) — no layer installed or
+    /// torn down. Throttled `debug!` inside the mapper.
+    Absent,
+    /// Mapped but not exactly 96 bytes — foreign writer or mid-recreate.
+    WrongSize,
+    /// Seqlock never settled within [`READ_RETRIES`] (stuck odd or
+    /// repeated torn copies). Throttled `debug!` at exhaustion.
+    Torn,
+    /// Magic mismatch — foreign writer.
+    BadMagic,
+    /// Version mismatch — foreign or generation-skewed writer.
+    BadVersion,
 }
 
 /// Reader handle. Stateless across frames (open/mmap per call) so producer
@@ -280,7 +304,7 @@ unsafe impl Send for MappedSeg {}
 /// producer only ever unlink+recreates (never truncates live), and the
 /// double-`fstat` narrows the race to a best-effort window — a documented
 /// crash assumption shared with the previous generation, not a new risk.
-fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
+fn map_segment(name: &CString, write: bool) -> Result<MappedSeg, ReadSkip> {
     let oflag = (if write { libc::O_RDWR } else { libc::O_RDONLY }) | libc::O_CLOEXEC;
     // Mode is ignored without O_CREAT; kept explicit for readability.
     let fd = unsafe { libc::shm_open(name.as_ptr(), oflag, 0o600) };
@@ -293,38 +317,45 @@ fn map_segment(name: &CString, write: bool) -> Option<MappedSeg> {
             LAST_ABSENT_LOG_NS.store(now, Ordering::Relaxed);
             debug!("depth feed: shm_open failed (absent)");
         }
-        return None;
+        return Err(ReadSkip::Absent);
     }
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         unsafe { libc::close(fd) };
-        return None;
+        return Err(ReadSkip::Absent);
     }
     // `st_size` is signed; compare in-domain before casting (a negative
     // would wrap to a huge usize and only fail the equality anyway, but
     // be explicit).
     if stat.st_size != HEADER_SIZE as libc::off_t {
         unsafe { libc::close(fd) };
-        return None;
+        return Err(ReadSkip::WrongSize);
     }
     let map_len = HEADER_SIZE;
     let prot = libc::PROT_READ | (if write { libc::PROT_WRITE } else { 0 });
     let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, prot, libc::MAP_SHARED, fd, 0) };
     if ptr == libc::MAP_FAILED || ptr.is_null() {
         unsafe { libc::close(fd) };
-        return None;
+        return Err(ReadSkip::Absent);
     }
     // Re-check size after mapping: a recreate between the first fstat and
     // the mmap would otherwise leave a mapping over a replaced object.
     let mut stat2: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut stat2) } != 0 || stat2.st_size != HEADER_SIZE as libc::off_t {
+    if unsafe { libc::fstat(fd, &mut stat2) } != 0 {
         unsafe {
             libc::munmap(ptr, map_len);
             libc::close(fd);
         }
-        return None;
+        return Err(ReadSkip::Absent);
     }
-    Some(MappedSeg {
+    if stat2.st_size != HEADER_SIZE as libc::off_t {
+        unsafe {
+            libc::munmap(ptr, map_len);
+            libc::close(fd);
+        }
+        return Err(ReadSkip::WrongSize);
+    }
+    Ok(MappedSeg {
         fd,
         ptr,
         len: map_len,
@@ -354,27 +385,34 @@ impl DepthFeed {
         }
     }
 
-    /// Seqlock-read of the v3 control header. Returns `None` on
-    /// absent/wrong-size/torn/foreign data so callers fall back to plain
-    /// (color-only) views. The physical copy spans the whole mapping
-    /// (including the pin words, which are discarded, never interpreted);
-    /// the logical snapshot excludes `pinned[]` — those words live outside
-    /// the seqlock (see [`Self::pin_slot`]). Bounded: 4 tries, then `None`.
-    pub fn read_control(&self) -> Option<DepthControl> {
+    /// Seqlock-read of the v3 control header. `Ok` snapshot or `Err`
+    /// [`ReadSkip`] reason — no logging in the loop beyond the mapper's
+    /// throttled absent line and the exhaustion line below, so the caller
+    /// aggregates counters for its heartbeat. Callers fall back to plain
+    /// (color-only) views on every variant. The physical copy spans the
+    /// whole mapping (including the pin words, which are discarded, never
+    /// interpreted); the logical snapshot excludes `pinned[]` — those words
+    /// live outside the seqlock (see [`Self::pin_slot`]). Bounded:
+    /// [`READ_RETRIES`] tries, then [`ReadSkip::Torn`]. No delay between
+    /// tries: the writer holds odd for one fill (nanoseconds), so a miss
+    /// is either instantly retryable or a dead peer — sleeping would only
+    /// add Submit-path latency.
+    pub fn read_control(&self) -> Result<DepthControl, ReadSkip> {
         let map = map_segment(&self.name, false)?;
         let (ptr, map_len) = (map.ptr, map.len);
         debug_assert_eq!(map_len, HEADER_SIZE);
-        for _ in 0..4 {
+        for _ in 0..READ_RETRIES {
             let seq1 = unsafe { read_seq(ptr) };
             if seq1 & 1 == 1 {
+                // Writer inside (nanoseconds): pause-hint, not a sleep.
                 std::hint::spin_loop();
                 continue;
             }
             if unsafe { read_u32(ptr, 0) } != SHM_MAGIC {
-                return None;
+                return Err(ReadSkip::BadMagic);
             }
             if unsafe { read_u32(ptr, 4) } != SHM_VERSION {
-                return None;
+                return Err(ReadSkip::BadVersion);
             }
             // Copy under seq1; the closing seq check covers torn reads.
             let h = unsafe { read_header_v3(ptr) };
@@ -382,10 +420,13 @@ impl DepthFeed {
             if seq1 != seq2 {
                 continue;
             }
-            if h.magic != SHM_MAGIC || h.version != SHM_VERSION {
-                return None;
+            if h.magic != SHM_MAGIC {
+                return Err(ReadSkip::BadMagic);
             }
-            return Some(DepthControl {
+            if h.version != SHM_VERSION {
+                return Err(ReadSkip::BadVersion);
+            }
+            return Ok(DepthControl {
                 epoch: h.epoch,
                 w: h.w,
                 h: h.h,
@@ -400,7 +441,15 @@ impl DepthFeed {
                 alloc_bytes: h.alloc_bytes,
             });
         }
-        None
+        // Exhausted: caller-invisible (no snapshot to bucket), so throttled
+        // debug here like the absent path — never per-frame spam.
+        static LAST_TORN_LOG_NS: AtomicU64 = AtomicU64::new(0);
+        let now = now_mono_ns();
+        if now.saturating_sub(LAST_TORN_LOG_NS.load(Ordering::Relaxed)) > 5_000_000_000 {
+            LAST_TORN_LOG_NS.store(now, Ordering::Relaxed);
+            debug!("depth feed: seqlock retries exhausted (torn)");
+        }
+        Err(ReadSkip::Torn)
     }
 
     fn pin_addr(map: &MappedSeg, slot: usize) -> Option<*mut AtomicU32> {
@@ -431,7 +480,7 @@ impl DepthFeed {
     /// here; holding both stalls the producer. Returns false when the
     /// segment is absent or `slot >= 2`.
     pub fn pin_slot(&self, slot: usize) -> bool {
-        let Some(map) = map_segment(&self.name, true) else {
+        let Ok(map) = map_segment(&self.name, true) else {
             return false;
         };
         let Some(addr) = Self::pin_addr(&map, slot) else {
@@ -449,7 +498,7 @@ impl DepthFeed {
     /// Unpin `slot` after the sampler's own fence confirms completion
     /// (not after submit). Returns false when absent or out of range.
     pub fn unpin_slot(&self, slot: usize) -> bool {
-        let Some(map) = map_segment(&self.name, true) else {
+        let Ok(map) = map_segment(&self.name, true) else {
             return false;
         };
         let Some(addr) = Self::pin_addr(&map, slot) else {
@@ -463,7 +512,9 @@ impl DepthFeed {
 
     /// Single `Acquire` load of a pin word. `None` when absent/out of range.
     pub fn load_pin(&self, slot: usize) -> Option<u32> {
-        let map = map_segment(&self.name, false)?;
+        let Ok(map) = map_segment(&self.name, false) else {
+            return None;
+        };
         let addr = Self::pin_addr(&map, slot)?;
         Some(unsafe { (*addr).load(Ordering::Acquire) })
     }
@@ -534,13 +585,96 @@ pub fn depth_age_ns(receipt_mono_ns: u64, header_mono_ns: u64) -> i64 {
 /// period + margin`. A timestamp inside the last frame period before
 /// Submit is that frame's depth; a marginally newer stamp is the same
 /// frame arriving just after wakeup — freshest case, not an error.
+/// This is the ONLY submission gate: there is no absolute-age "stale"
+/// check. Same-generation success implies fresh (the window sits strictly
+/// inside any sane liveness bound); a stalled producer shows up as a
+/// frozen `generation` across frames, not a clock comparison.
 pub fn is_same_generation(age_ns: i64, frame_period_ns: i64, margin_ns: i64) -> bool {
     debug_assert!(margin_ns >= 0 && frame_period_ns >= 0);
     age_ns >= margin_ns.saturating_neg() && age_ns < frame_period_ns.saturating_add(margin_ns)
 }
 
+/// Running signed frame-vs-depth age stats for one heartbeat window.
+/// Feed one [`depth_age_ns`] sample per frame — submitted AND skipped
+/// (skipped ages are the desync signal). Integer state only (no float,
+/// no alloc); the heartbeat formats the summary. Reset with [`AgeStats::clear`]
+/// after each heartbeat line.
+#[derive(Debug, Default, Clone)]
+pub struct AgeStats {
+    count: u64,
+    sum: i64,
+    /// Most positive sample (stalest depth).
+    max: i64,
+    /// Most negative sample (furthest straddled present).
+    min: i64,
+    neg_count: u64,
+}
+
+impl AgeStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one signed age sample. Hot path: integer ops only.
+    pub fn sample(&mut self, age_ns: i64) {
+        if self.count == 0 {
+            self.max = age_ns;
+            self.min = age_ns;
+        } else {
+            self.max = self.max.max(age_ns);
+            self.min = self.min.min(age_ns);
+        }
+        self.sum = self.sum.saturating_add(age_ns);
+        self.count = self.count.saturating_add(1);
+        if age_ns < 0 {
+            self.neg_count = self.neg_count.saturating_add(1);
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Mean signed age in ns, or `None` when empty. Positive mean = receipt
+    /// consistently lags present (phase info); near-zero = aligned.
+    pub fn mean_ns(&self) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.sum as f64 / self.count as f64)
+    }
+
+    /// Most positive sample, or `None` when empty.
+    pub fn max_ns(&self) -> Option<i64> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.max)
+    }
+
+    /// Most negative sample, or `None` when empty.
+    pub fn min_ns(&self) -> Option<i64> {
+        if self.count == 0 {
+            return None;
+        }
+        Some(self.min)
+    }
+
+    /// Fraction of straddled-present (negative-age) samples in `[0, 1]`.
+    /// Validates the Submit-before-Present assumption empirically.
+    pub fn neg_rate(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.neg_count as f64 / self.count as f64
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+}
+
 static WARNED_MASTER: AtomicBool = AtomicBool::new(false);
-static WARNED_MAX_AGE: AtomicBool = AtomicBool::new(false);
 static FEED_OPEN_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn warn_once_flag(flag: &AtomicBool, msg: &str) {
@@ -571,29 +705,10 @@ pub fn depth_master_enabled() -> bool {
     }
 }
 
-/// Staleness bound in ms. Garbage/zero/negative/huge warns once and
-/// falls back to 100.
-pub fn max_age_ms() -> u64 {
-    match std::env::var("XRIZER_DEPTH_MAX_AGE_MS") {
-        Err(_) => DEFAULT_MAX_AGE_MS,
-        Ok(v) => match v.trim().parse::<i64>() {
-            Ok(n) if (1..=60_000).contains(&n) => n as u64,
-            _ => {
-                warn_once_flag(
-                    &WARNED_MAX_AGE,
-                    &format!("XRIZER_DEPTH_MAX_AGE_MS={v:?} invalid; defaulting 100"),
-                );
-                DEFAULT_MAX_AGE_MS
-            }
-        },
-    }
-}
-
 /// `CLOCK_MONOTONIC` in ns. Same clock the producer stamps `time_mono_ns`
-/// with, same machine. Returns 0 on `clock_gettime` failure, which every
-/// consumer treats as stale (see [`DepthControl::is_stale`]: any real
-/// header postdates 0; [`depth_age_ns`] maps it to a large negative that
-/// [`is_same_generation`] rejects).
+/// with, same machine. Returns 0 on `clock_gettime` failure; [`depth_age_ns`]
+/// maps 0 to a large negative age that [`is_same_generation`] rejects, so
+/// the failure direction is fail-safe to plain frames.
 pub fn now_mono_ns() -> u64 {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
@@ -804,7 +919,13 @@ mod tests {
         assert!(ctl.is_viable(), "viable");
         assert_eq!(ctl.eye_w(), 4, "eye_w = w/2");
         assert_eq!(ctl.slot(), 0, "42 % 2"); // 42 % 2
-        assert!(!ctl.is_stale(now_mono_ns(), 100), "fresh");
+        // Fresh snapshot: age near zero lands inside the same-generation
+        // window (90Hz period + 2ms margin).
+        let age = ctl.age_ns(now_mono_ns());
+        assert!(
+            is_same_generation(age, 11_111_111, 2_000_000),
+            "fresh age {age} in window"
+        );
         assert!(ctl.alloc_covers(4), "alloc covers bpp=4");
         assert!(!ctl.alloc_covers(4 * 1000), "alloc rejects huge want");
     }
@@ -933,8 +1054,9 @@ mod tests {
             (ptr as *mut u32).add(1).write_volatile(2);
             (ptr as *mut u32).add(2).write_volatile(2);
         });
-        assert!(
-            DepthFeed::open_for_test(&name).read_control().is_none(),
+        assert_eq!(
+            DepthFeed::open_for_test(&name).read_control().unwrap_err(),
+            ReadSkip::WrongSize,
             "v2 size must miss"
         );
         // 96-byte segment stamped version 2: wrong version.
@@ -942,8 +1064,9 @@ mod tests {
         let _seg2 = make_seg_v3(&name2, 8, 2, 1, |h| {
             h.version = 2;
         });
-        assert!(
-            DepthFeed::open_for_test(&name2).read_control().is_none(),
+        assert_eq!(
+            DepthFeed::open_for_test(&name2).read_control().unwrap_err(),
+            ReadSkip::BadVersion,
             "version 2 must miss"
         );
         // Future versions are equally foreign.
@@ -952,8 +1075,9 @@ mod tests {
             let _seg = make_seg_v3(&name, 8, 2, 1, |h| {
                 h.version = v;
             });
-            assert!(
-                DepthFeed::open_for_test(&name).read_control().is_none(),
+            assert_eq!(
+                DepthFeed::open_for_test(&name).read_control().unwrap_err(),
+                ReadSkip::BadVersion,
                 "version {v} must miss"
             );
         }
@@ -968,8 +1092,9 @@ mod tests {
             (seg.ptr as *mut u32).write_volatile(0xdead_beef);
             (seg.ptr as *mut u32).add(2).write_volatile(2);
         }
-        assert!(
-            DepthFeed::open_for_test(&name).read_control().is_none(),
+        assert_eq!(
+            DepthFeed::open_for_test(&name).read_control().unwrap_err(),
+            ReadSkip::BadMagic,
             "bad magic must miss"
         );
         // Oversized segment: foreign writer, not our 96B header.
@@ -980,8 +1105,9 @@ mod tests {
             (ptr as *mut u32).add(1).write_volatile(SHM_VERSION);
             (ptr as *mut u32).add(2).write_volatile(2);
         });
-        assert!(
-            DepthFeed::open_for_test(&name2).read_control().is_none(),
+        assert_eq!(
+            DepthFeed::open_for_test(&name2).read_control().unwrap_err(),
+            ReadSkip::WrongSize,
             "wrong size must miss"
         );
         // Truncated segments (mid-recreate races): same gate. (A 0-byte
@@ -997,8 +1123,9 @@ mod tests {
                     (ptr as *mut u32).add(2).write_volatile(2);
                 }
             });
-            assert!(
-                DepthFeed::open_for_test(&name).read_control().is_none(),
+            assert_eq!(
+                DepthFeed::open_for_test(&name).read_control().unwrap_err(),
+                ReadSkip::WrongSize,
                 "{tag} ({len}B) must miss"
             );
         }
@@ -1105,8 +1232,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_boundaries_and_zero_stamp() {
-        // Pure-gate boundaries without SHM timing flakes.
+    fn age_gate_is_symmetric_frame_vs_depth() {
+        // No absolute "stale" gate exists: submission is gated purely on the
+        // signed frame-vs-depth age. Old AND far-future headers both read
+        // fine (viable) — the tight same-generation window rejects them.
         let mk = |time_ns: u64| DepthControl {
             epoch: 1,
             w: 8,
@@ -1121,25 +1250,44 @@ mod tests {
             seg_len: HEADER_SIZE,
             alloc_bytes: 64,
         };
-        let now = 10_000_000_000u64;
-        assert!(mk(0).is_stale(now, 100), "zero stamp stale");
-        assert!(mk(now + 1).is_stale(now, 100), "future stale");
-        assert!(
-            !mk(now - 100_000_000).is_stale(now, 100),
-            "exactly max_age fresh"
-        );
-        assert!(
-            mk(now - 100_000_001).is_stale(now, 100),
-            "max_age+1ns stale"
-        );
+        // 90 Hz frame: 11_111_111ns period, 2ms margin.
+        let receipt = 10_000_000_000u64;
+        // 500ms-old depth: viable snapshot, rejected association.
+        let old = mk(receipt - 500_000_000);
+        assert!(old.is_viable());
+        let age = old.age_ns(receipt);
+        assert_eq!(age, 500_000_000);
+        assert!(!is_same_generation(age, 11_111_111, 2_000_000));
+        // Far-future depth (clock breakage): symmetric rejection.
+        let fut = mk(receipt + 5_000_000_000);
+        assert!(fut.is_viable(), "future still reads viable");
+        let age = fut.age_ns(receipt);
+        assert_eq!(age, -5_000_000_000);
+        assert!(!is_same_generation(age, 11_111_111, 2_000_000));
+        // Small-negative (straddled present, freshest case): accepted.
+        let fresh = mk(receipt + 1_000_000);
+        assert!(is_same_generation(
+            fresh.age_ns(receipt),
+            11_111_111,
+            2_000_000
+        ));
+        // Zero stamp: viable snapshot (time is not a viability input),
+        // but the huge age misses every window.
+        let zero = mk(0);
+        assert!(zero.is_viable(), "time is not viability-gated");
+        assert!(!is_same_generation(
+            zero.age_ns(receipt),
+            11_111_111,
+            2_000_000
+        ));
     }
 
     #[test]
-    fn stale_and_future_are_stale() {
+    fn old_and_future_headers_read_viable_with_signed_ages() {
         let pid = std::process::id();
-        // Sample `now` after the read: the header is stamped at setup, so
-        // post-read time can only be later — no slow-CI flake.
-        let name = format!("/xrizer-depth-test-{pid}-stale");
+        // Headers far outside any association window still snapshot fine:
+        // staleness is decided by the caller from the signed age, not here.
+        let name = format!("/xrizer-depth-test-{pid}-oldhdr");
         let now_setup = now_mono_ns();
         let _seg = make_seg_v3(&name, 8, 2, 7, |h| {
             h.time_mono_ns = now_setup.saturating_sub(500_000_000);
@@ -1147,19 +1295,24 @@ mod tests {
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
-        assert!(ctl.is_viable());
-        assert!(ctl.is_stale(now_mono_ns(), 100), "500ms old must be stale");
-        let name2 = format!("/xrizer-depth-test-{pid}-future");
+        assert!(ctl.is_viable(), "old header still viable snapshot");
+        let age = ctl.age_ns(now_mono_ns());
+        assert!(
+            age > 400_000_000 && age < 600_000_000,
+            "age ~= +500ms, got {age}"
+        );
+        assert!(!is_same_generation(age, 11_111_111, 2_000_000));
+        let name2 = format!("/xrizer-depth-test-{pid}-futhdr");
         let _seg2 = make_seg_v3(&name2, 8, 2, 8, |h| {
             h.time_mono_ns = now_mono_ns().saturating_add(5_000_000_000);
         });
         let ctl2 = DepthFeed::open_for_test(&name2)
             .read_control()
             .expect("readable");
-        assert!(
-            ctl2.is_stale(now_mono_ns(), 100),
-            "far-future stamp must be stale"
-        );
+        assert!(ctl2.is_viable(), "future header still viable snapshot");
+        let age2 = ctl2.age_ns(now_mono_ns());
+        assert!(age2 < -4_000_000_000, "age hugely negative, got {age2}");
+        assert!(!is_same_generation(age2, 11_111_111, 2_000_000));
     }
 
     #[test]
@@ -1182,14 +1335,14 @@ mod tests {
         assert_eq!(feed.load_pin(0), Some(0));
         assert_eq!(feed.load_pin(1), Some(0));
         assert_eq!((raw_pin(0), raw_pin(1)), (0, 0), "raw +80/+84 boot at 0");
-        assert!(feed.read_control().is_some());
+        assert!(feed.read_control().is_ok());
         // Pin slot 0: raw +80 flips to 1 while +84 stays 0.
         assert!(feed.pin_slot(0));
         assert_eq!(feed.load_pin(0), Some(1));
         assert_eq!(feed.load_pin(1), Some(0));
         assert_eq!((raw_pin(0), raw_pin(1)), (1, 0), "raw +80==1,+84==0");
         // Snapshot still clean while pinned (pins are outside the seqlock).
-        assert!(feed.read_control().is_some());
+        assert!(feed.read_control().is_ok());
         // Pin slot 1 as well (API permits; caller must hold at most one —
         // both set proves the words are independent).
         assert!(feed.pin_slot(1));
@@ -1214,13 +1367,13 @@ mod tests {
             (seg.ptr as *mut u32).add(2).write_volatile(3);
         }
         let feed = DepthFeed::open_for_test(&name);
-        assert!(feed.read_control().is_none());
+        assert_eq!(feed.read_control().unwrap_err(), ReadSkip::Torn);
     }
 
     #[test]
     fn absent_returns_none() {
         let feed = DepthFeed::open_for_test("/xrizer-depth-test-definitely-absent");
-        assert!(feed.read_control().is_none());
+        assert_eq!(feed.read_control().unwrap_err(), ReadSkip::Absent);
         assert!(!feed.pin_slot(0));
         assert!(!feed.unpin_slot(0));
         assert_eq!(feed.load_pin(0), None);
@@ -1270,7 +1423,6 @@ mod tests {
         let _lock = env_guard();
         let save = |key: &str| std::env::var(key).ok();
         let orig_master = save("XRIZER_DEPTH_SHM");
-        let orig_age = save("XRIZER_DEPTH_MAX_AGE_MS");
         let restore = |key: &str, val: Option<String>| match val {
             Some(v) => set_env_for_tests(key, &v),
             None => del_env_for_tests(key),
@@ -1290,21 +1442,6 @@ mod tests {
         set_env_for_tests("XRIZER_DEPTH_SHM", "bogus");
         assert!(depth_master_enabled(), "garbage defaults ON");
 
-        del_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS");
-        assert_eq!(max_age_ms(), DEFAULT_MAX_AGE_MS);
-        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "250");
-        assert_eq!(max_age_ms(), 250);
-        // Boundaries: 1 and 60000 valid (whitespace tolerated).
-        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "1");
-        assert_eq!(max_age_ms(), 1);
-        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", "60000");
-        assert_eq!(max_age_ms(), 60000);
-        set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", " 250 ");
-        assert_eq!(max_age_ms(), 250);
-        for v in ["abc", "0", "-5", "", "99999999", "60001"] {
-            set_env_for_tests("XRIZER_DEPTH_MAX_AGE_MS", v);
-            assert_eq!(max_age_ms(), DEFAULT_MAX_AGE_MS, "{v:?} defaults");
-        }
         // Master edge rows: empty and out-of-vocabulary default ON.
         set_env_for_tests("XRIZER_DEPTH_SHM", "");
         assert!(depth_master_enabled(), "empty defaults ON");
@@ -1312,13 +1449,12 @@ mod tests {
         assert!(depth_master_enabled(), "2 defaults ON");
 
         restore("XRIZER_DEPTH_SHM", orig_master);
-        restore("XRIZER_DEPTH_MAX_AGE_MS", orig_age);
     }
 
     #[test]
     fn open_respects_kill_switch() {
         // NOTE: env-mutating; serialized through the same guard. Any future
-        // test calling open()/max_age_ms() must hold env_guard() too.
+        // test calling open() must hold env_guard() too.
         let _lock = env_guard();
         let save = std::env::var("XRIZER_DEPTH_SHM").ok();
         set_env_for_tests("XRIZER_DEPTH_SHM", "0");
@@ -1331,5 +1467,67 @@ mod tests {
             Some(v) => set_env_for_tests("XRIZER_DEPTH_SHM", &v),
             None => del_env_for_tests("XRIZER_DEPTH_SHM"),
         }
+    }
+
+    #[test]
+    fn read_skip_variants_are_distinct_and_copy() {
+        // Heartbeat bucketing relies on cheap discriminant compares.
+        fn bucket(skip: ReadSkip) -> &'static str {
+            match skip {
+                ReadSkip::Absent => "absent",
+                ReadSkip::WrongSize => "size",
+                ReadSkip::Torn => "torn",
+                ReadSkip::BadMagic => "magic",
+                ReadSkip::BadVersion => "version",
+            }
+        }
+        assert_eq!(bucket(ReadSkip::Absent), "absent");
+        assert_eq!(bucket(ReadSkip::Torn), "torn");
+        let a = ReadSkip::WrongSize;
+        let b = a;
+        assert_eq!(a, b, "Copy semantics for counter keys");
+        assert_ne!(a, ReadSkip::BadMagic);
+    }
+
+    #[test]
+    fn age_stats_empty_mean_and_rates() {
+        let s = AgeStats::new();
+        assert_eq!(s.count(), 0);
+        assert_eq!(s.mean_ns(), None);
+        assert_eq!(s.max_ns(), None);
+        assert_eq!(s.min_ns(), None);
+        assert_eq!(s.neg_rate(), 0.0);
+    }
+
+    #[test]
+    fn age_stats_tracks_mean_max_min_and_neg_rate() {
+        let mut s = AgeStats::new();
+        for age in [5_000_000i64, -1_000_000, 9_000_000, -2_000_000, 4_000_000] {
+            s.sample(age);
+        }
+        assert_eq!(s.count(), 5);
+        // (5 - 1 + 9 - 2 + 4)ms / 5 = 3ms.
+        assert!((s.mean_ns().expect("nonempty") - 3_000_000.0).abs() < 1.0);
+        assert_eq!(s.max_ns(), Some(9_000_000), "stalest");
+        assert_eq!(s.min_ns(), Some(-2_000_000), "furthest straddle");
+        assert!((s.neg_rate() - 0.4).abs() < f64::EPSILON, "2/5 negative");
+    }
+
+    #[test]
+    fn age_stats_single_sample_and_clear() {
+        let mut s = AgeStats::new();
+        s.sample(-500);
+        assert_eq!(
+            (s.mean_ns(), s.max_ns(), s.min_ns()),
+            (Some(-500.0), Some(-500), Some(-500))
+        );
+        assert_eq!(s.neg_rate(), 1.0);
+        s.clear();
+        assert_eq!(s.count(), 0);
+        assert_eq!(s.mean_ns(), None);
+        s.sample(7);
+        assert_eq!(s.count(), 1);
+        assert_eq!(s.mean_ns(), Some(7.0));
+        assert_eq!(s.neg_rate(), 0.0);
     }
 }
