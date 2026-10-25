@@ -85,6 +85,13 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
         false
     }
 
+    /// Whether a graphics context is current on this thread for depth GL
+    /// work. Checked before acquiring any runtime buffer so no buffer is
+    /// ever stranded on a context-less thread.
+    fn depth_context_current(&self) -> bool {
+        false
+    }
+
     /// Ensure FD imports for (epoch, dims, format); GPU-copy both halves
     /// of `generation` into `depth_image_index`. The caller holds the
     /// slot's SHM pin across this call; the backend queues a GPU wait on
