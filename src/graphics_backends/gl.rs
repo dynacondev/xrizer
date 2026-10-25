@@ -756,6 +756,11 @@ impl GlData {
         let create_mem = DEPTH_EXT.create_memory?;
         let tex_storage = DEPTH_EXT.texture_storage_mem_2d?;
         let mut slots = [DepthFdSlot::default(); 2];
+        // Our dups, one per slot, for failure-path cleanup: success leaves
+        // them open by design (see fn docs), but failure must close
+        // everything opened so far — a throttled-but-unbounded retry would
+        // otherwise leak one fd per attempt toward exhaustion.
+        let mut open_dups = [-1 as libc::c_int; 2];
         for i in 0..2 {
             let mut mem = 0;
             let mut tex = 0;
@@ -798,10 +803,14 @@ impl GlData {
                     "depth FD import failed at {step} (slot {i}/2, epoch {}, {}x{} fmt {} memfd {} size {})",
                     req.epoch, req.w, req.h, req.vk_format, req.mem_fds[i], size,
                 );
-                // Failed import took ownership of nothing: close our dup.
-                if mem_fd >= 0 {
-                    unsafe {
-                        libc::close(mem_fd);
+                // Failed import took ownership of nothing: close this
+                // slot's dup plus every previously opened one.
+                open_dups[i] = mem_fd;
+                for fd in open_dups {
+                    if fd >= 0 {
+                        unsafe {
+                            libc::close(fd);
+                        }
                     }
                 }
                 unsafe {
@@ -813,6 +822,7 @@ impl GlData {
                 return None;
             }
             // Success: dup intentionally left open (see fn docs).
+            open_dups[i] = mem_fd;
             slots[i] = DepthFdSlot { mem, tex };
         }
         Some(slots)

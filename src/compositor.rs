@@ -1144,6 +1144,7 @@ struct FrameController<G: GraphicsBackend> {
     hb_acquire_fail: u64,
     hb_acquire_timeout: u64,
     hb_copy_fail: u64,
+    hb_pin_fail: u64,
     hb_poll_timeout: u64,
     hb_poll_dead: u64,
     hb_pin_held: u64,
@@ -1280,6 +1281,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_acquire_fail: 0,
             hb_acquire_timeout: 0,
             hb_copy_fail: 0,
+            hb_pin_fail: 0,
             hb_poll_timeout: 0,
             hb_poll_dead: 0,
             hb_pin_held: 0,
@@ -1650,8 +1652,11 @@ impl<G: GraphicsBackend> FrameController<G> {
 
     /// Depth path for `end_frame`: single late copy of the newest published
     /// generation, chained as `CompositionLayerDepthInfoKHR` views. No waits
-    /// beyond bounded swapchain acquisition: the semaphore wait is GPU-side
-    /// (queued, non-blocking for the CPU).
+    /// beyond bounded acquire (5ms) + bounded fence poll (5ms); the GL copy
+    /// itself is queued with its own FenceSync, never a semaphore wait (v4
+    /// fence-FD design). Worst case both bounds hit back-to-back (~10ms on
+    /// a wedged producer); typical is immediate. Lower the poll bound if
+    /// heartbeat `poll[avg]` ever shows pressure.
     fn try_end_frame_with_depth(
         &mut self,
         session_data: &SessionData,
@@ -1881,6 +1886,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
         // Pin FIRST (contract order: pin → poll → sample), from the
         // generation just read. A vanished segment mid-frame fails here.
+        // The pin lands late (after gates + bounded acquire), not at the
+        // read: holding it across the acquire would stall the producer for
+        // no benefit. A same-epoch advance inside that window only costs
+        // freshness (the snapshot stays valid and correctly labeled; the
+        // window/monotonic gates still apply to it) — never safety.
         // The borrow ends immediately: later steps re-borrow, so `&mut`
         // work (stats, backend, unpin) never fights it.
         let slot = ctl.slot();
@@ -1891,6 +1901,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             .is_some_and(|feed| feed.pin_slot(slot))
         {
             Self::release_depth_image(&mut self.depth_swapchain);
+            self.hb_pin_fail = self.hb_pin_fail.saturating_add(1);
             return DepthEnd::Plain;
         }
         self.pinned_slot = Some(slot);
@@ -2248,7 +2259,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             "depth {:.1}/s ({} frames, {} with depth, {} plain) \
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
-             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} copyfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
+             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
              swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
@@ -2273,6 +2284,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_poll_timeout,
             self.hb_poll_dead,
             self.hb_copy_fail,
+            self.hb_pin_fail,
             self.hb_pin_held,
             self.hb_swapchain,
             self.hb_epoch_raced,
@@ -2310,6 +2322,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.hb_poll_timeout = 0;
         self.hb_poll_dead = 0;
         self.hb_copy_fail = 0;
+        self.hb_pin_fail = 0;
         self.hb_pin_held = 0;
         self.hb_swapchain = 0;
         self.hb_epoch_raced = 0;
@@ -3058,16 +3071,25 @@ mod tests {
         ctrl.hb_frames = 100;
         ctrl.hb_depth = 60;
         ctrl.hb_read_absent = 5;
+        ctrl.hb_read_size = 1;
         ctrl.hb_read_torn = 2;
+        ctrl.hb_read_magic = 1;
+        ctrl.hb_read_version = 1;
         ctrl.hb_nonviable = 3;
+        ctrl.hb_time_zero = 1;
         ctrl.hb_repeat = 4;
+        ctrl.hb_alloc = 1;
+        ctrl.hb_clip = 1;
         ctrl.hb_window = 6;
+        ctrl.hb_dims = 1;
+        ctrl.hb_flip = 1;
         ctrl.hb_no_context = 1;
         ctrl.hb_acquire_fail = 1;
         ctrl.hb_acquire_timeout = 2;
         ctrl.hb_poll_timeout = 1;
         ctrl.hb_poll_dead = 1;
         ctrl.hb_copy_fail = 3;
+        ctrl.hb_pin_fail = 2;
         ctrl.hb_pin_held = 1;
         ctrl.hb_swapchain = 1;
         ctrl.hb_epoch_raced = 1;
@@ -3085,16 +3107,25 @@ mod tests {
         assert_eq!(ctrl.hb_frames, 0);
         assert_eq!(ctrl.hb_depth, 0);
         assert_eq!(ctrl.hb_read_absent, 0);
+        assert_eq!(ctrl.hb_read_size, 0);
         assert_eq!(ctrl.hb_read_torn, 0);
+        assert_eq!(ctrl.hb_read_magic, 0);
+        assert_eq!(ctrl.hb_read_version, 0);
         assert_eq!(ctrl.hb_nonviable, 0);
+        assert_eq!(ctrl.hb_time_zero, 0);
         assert_eq!(ctrl.hb_repeat, 0);
+        assert_eq!(ctrl.hb_alloc, 0);
+        assert_eq!(ctrl.hb_clip, 0);
         assert_eq!(ctrl.hb_window, 0);
+        assert_eq!(ctrl.hb_dims, 0);
+        assert_eq!(ctrl.hb_flip, 0);
         assert_eq!(ctrl.hb_no_context, 0);
         assert_eq!(ctrl.hb_acquire_fail, 0);
         assert_eq!(ctrl.hb_acquire_timeout, 0);
         assert_eq!(ctrl.hb_poll_timeout, 0);
         assert_eq!(ctrl.hb_poll_dead, 0);
         assert_eq!(ctrl.hb_copy_fail, 0);
+        assert_eq!(ctrl.hb_pin_fail, 0);
         assert_eq!(ctrl.hb_pin_held, 0);
         assert_eq!(ctrl.hb_swapchain, 0);
         assert_eq!(ctrl.hb_epoch_raced, 0);

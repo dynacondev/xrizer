@@ -225,6 +225,11 @@ impl DepthControl {
     /// All four FDs must be real (stdin/stdout/stderr are never depth).
     /// The producer's pre-publish sentinel is -1. Memory FDs persist per
     /// epoch; fence FDs are single-use snapshots (see field docs).
+    /// Intentionally strict (first publish after a build leaves the idle
+    /// slot at -1, forcing one plain frame): per-slot viability would arm
+    /// a frame earlier at the cost of a second gate shape for zero safety
+    /// gain — the snapshot's other-slot numbers are meaningless for the
+    /// sampled generation anyway.
     pub fn fds_valid(&self) -> bool {
         self.mem_fds.iter().all(|&f| f > 2) && self.fence_fds.iter().all(|&f| f > 2)
     }
@@ -778,14 +783,16 @@ pub enum FencePoll {
 /// `fd` is the pinned slot's current fence number, used directly (poll
 /// takes no ownership; same-process borrowed numbers). Returns when
 /// signaled or after `timeout_ms`, whichever comes first — never blocks
-/// indefinitely. Call only while holding the slot's pin: the producer
-/// closes and replaces fence FDs on unpinned reuse, so an unpinned poll
-/// can observe a closed or recycled number (reported as [`FencePoll::Dead`]
-/// via `POLLNVAL`/error, fail-safe to plain).
+/// indefinitely (`timeout_ms` is clamped at zero: negative would mean
+/// infinite per `poll(2)`). Call only while holding the slot's pin: the
+/// producer closes and replaces fence FDs on unpinned reuse, so an
+/// unpinned poll can observe a closed or recycled number (reported as
+/// [`FencePoll::Dead`] via `POLLNVAL`/error, fail-safe to plain).
 pub fn poll_fence_fd(fd: i32, timeout_ms: libc::c_int) -> FencePoll {
     if fd <= 2 {
         return FencePoll::Dead;
     }
+    let timeout_ms = timeout_ms.max(0);
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -1006,7 +1013,7 @@ mod tests {
         assert_eq!((ctl.w, ctl.h, ctl.generation), (8, 2, 42), "dims+gen");
         assert_eq!(ctl.epoch, 7, "epoch");
         assert_eq!(ctl.mem_fds, [11, 12], "mem fds");
-        assert_eq!(ctl.fence_fds, [21, 22], "sem fds");
+        assert_eq!(ctl.fence_fds, [21, 22], "fence fds");
         assert_eq!(ctl.alloc_bytes, 8 * 2 * 4, "alloc");
         assert!((ctl.near_z - 0.00742).abs() < f32::EPSILON, "near");
         assert!((ctl.far_z - 10000.0).abs() < f32::EPSILON, "far");
@@ -1229,18 +1236,18 @@ mod tests {
     fn sentinel_and_low_fds_rejected() {
         let pid = std::process::id();
         let cases: [(i32, i32); 5] = [(-1, 21), (0, 21), (1, 21), (2, 21), (11, 2)];
-        for (i, (mem0, sem0)) in cases.iter().enumerate() {
+        for (i, (mem0, fence0)) in cases.iter().enumerate() {
             let name = format!("/xrizer-depth-test-{pid}-fd{i}");
             let _seg = make_seg(&name, 8, 2, 3, |h| {
                 h.mem_fds[0] = *mem0;
-                h.fence_fds[0] = *sem0;
+                h.fence_fds[0] = *fence0;
             });
             let ctl = DepthFeed::open_for_test(&name)
                 .read_control()
                 .expect("header readable");
             assert!(
                 !ctl.fds_valid() && !ctl.is_viable(),
-                "fds ({mem0}, {sem0}) must not arm"
+                "fds ({mem0}, {fence0}) must not arm"
             );
         }
         // Second lane is checked too, plus the all-sentinel pre-publish.
@@ -1652,8 +1659,9 @@ mod tests {
             libc::close(r);
             libc::close(w);
         }
-        // Closed read end: dead, never waited on.
-        assert_eq!(poll_fence_fd(r, 10), FencePoll::Dead);
+        // Closed read end: dead, never waited on (timeout 0: the error
+        // returns immediately, no block window for a reuse race).
+        assert_eq!(poll_fence_fd(r, 0), FencePoll::Dead);
     }
 
     #[test]
