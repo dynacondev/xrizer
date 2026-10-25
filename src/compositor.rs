@@ -2,8 +2,8 @@ use crate::{
     AtomicF64,
     clientcore::{Injected, Injector},
     depth_feed::{
-        AgeStats, DepthControl, DepthFeed, FORMAT_D32F, FORMAT_D32S8, MAX_DEPTH, MIN_DEPTH,
-        ReadSkip, depth_master_enabled, is_same_generation, now_mono_ns, validate_near_far,
+        AgeStats, DepthFeed, FORMAT_D32F, FORMAT_D32S8, MAX_DEPTH, MIN_DEPTH, ReadSkip,
+        depth_master_enabled, is_same_generation, now_mono_ns, validate_near_far,
     },
     graphics_backends::{
         DepthFdRequest, GraphicsBackend, SupportedBackend, supported_backends_enum,
@@ -223,10 +223,15 @@ impl openxr_data::Compositor for Compositor {
             .unwrap()
             .get_or_insert_with(|| {
                 #[macros::any_graphics(DynFrameController)]
-                fn take<G: GraphicsBackend>(ctrl: FrameController<G>) -> AnyTempBackendData
+                fn take<G: GraphicsBackend>(mut ctrl: FrameController<G>) -> AnyTempBackendData
                 where
                     AnyTempBackendData: From<TempBackendData<G>>,
                 {
+                    // Release a held SHM pin before the controller (and its
+                    // feed) is dropped: otherwise the slot stays pinned
+                    // forever (silent permanent half-rate until the producer
+                    // rebuilds the segment).
+                    ctrl.drop_depth_state();
                     TempBackendData {
                         backend: ctrl.backend,
                         swapchain_create_info: ctrl.swapchain_data.map(|d| d.info),
@@ -1041,6 +1046,19 @@ struct SubmittedEye {
     flip_vertically: bool,
 }
 
+/// Depth submission outcome: distinguishes a failed runtime `end()`
+/// (frame is terminal — re-ending without a new `begin` is invalid and
+/// the plain path's `unwrap()` would panic) from ordinary gate misses
+/// (caller falls back to color-only `end()`).
+#[derive(PartialEq, Eq)]
+enum DepthEnd {
+    WithDepth,
+    Plain,
+    /// No regression test: fakexr's end() never fails, so this arm is
+    /// reachable only against a real rejecting runtime.
+    EndFailed,
+}
+
 struct SwapchainData<G: xr::Graphics> {
     swapchain: xr::Swapchain<G>,
     info: xr::SwapchainCreateInfo<G>,
@@ -1097,7 +1115,9 @@ struct FrameController<G: GraphicsBackend> {
     /// so cold-start absence (normal) stays silent.
     last_read_ok: bool,
     first_arm_logged: bool,
-    depth_off_logged: bool,
+    depth_import_off_logged: bool,
+    depth_format_off_logged: bool,
+    depth_dims_logged: bool,
     depth_end_fail_warned: bool,
     depth_next_retry: Option<Instant>,
     hb_start: Instant,
@@ -1117,13 +1137,14 @@ struct FrameController<G: GraphicsBackend> {
     hb_dims: u64,
     hb_flip: u64,
     hb_no_context: u64,
+    hb_acquire_fail: u64,
     hb_acquire_timeout: u64,
     hb_copy_fail: u64,
     hb_pin_held: u64,
     hb_swapchain: u64,
     hb_epoch_raced: u64,
     hb_end_fail: u64,
-    hb_epoch_reimports: u64,
+    hb_depth_swapchains: u64,
     age_stats: AgeStats,
     acq_count: u64,
     acq_sum_ns: u64,
@@ -1225,7 +1246,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             frozen_tripped: false,
             last_read_ok: true,
             first_arm_logged: false,
-            depth_off_logged: false,
+            depth_import_off_logged: false,
+            depth_format_off_logged: false,
+            depth_dims_logged: false,
             depth_end_fail_warned: false,
             depth_next_retry: None,
             hb_start: Instant::now(),
@@ -1245,13 +1268,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_dims: 0,
             hb_flip: 0,
             hb_no_context: 0,
+            hb_acquire_fail: 0,
             hb_acquire_timeout: 0,
             hb_copy_fail: 0,
             hb_pin_held: 0,
             hb_swapchain: 0,
             hb_epoch_raced: 0,
             hb_end_fail: 0,
-            hb_epoch_reimports: 0,
+            hb_depth_swapchains: 0,
             age_stats: AgeStats::new(),
             acq_count: 0,
             acq_sum_ns: 0,
@@ -1296,6 +1320,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.depth_swapchain = None;
         self.last_armed_gen = 0;
         self.frozen_run = 0;
+        self.frozen_tripped = false;
     }
 
     fn acquire_swapchain_image(&mut self) {
@@ -1451,7 +1476,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         // on frames that go plain, so a slow GPU never wedges the feed.
         self.poll_prior_depth_pin();
 
-        let with_depth = self.try_end_frame_with_depth(
+        let depth_end = self.try_end_frame_with_depth(
             session_data,
             system,
             display_time,
@@ -1460,11 +1485,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             overlays,
         );
         self.hb_frames = self.hb_frames.saturating_add(1);
-        if with_depth {
+        if depth_end == DepthEnd::WithDepth {
             self.hb_depth = self.hb_depth.saturating_add(1);
         }
         self.maybe_log_depth_heartbeat();
-        if with_depth {
+        if depth_end != DepthEnd::Plain {
+            // WithDepth: submitted. EndFailed: the failed end() already
+            // concluded the frame — re-ending without a new begin is
+            // invalid (and the plain path unwraps), so stop here.
             return;
         }
 
@@ -1601,11 +1629,9 @@ impl<G: GraphicsBackend> FrameController<G> {
     }
 
     /// Depth path for `end_frame`: single late copy of the newest published
-    /// generation, chained as `CompositionLayerDepthInfoKHR` views. Returns
-    /// true when the frame was submitted with depth; false on any gate
-    /// failure (caller falls back to the plain path, which re-ends
-    /// color-only). No waits beyond bounded swapchain acquisition: the
-    /// semaphore wait is GPU-side (queued, non-blocking for the CPU).
+    /// generation, chained as `CompositionLayerDepthInfoKHR` views. No waits
+    /// beyond bounded swapchain acquisition: the semaphore wait is GPU-side
+    /// (queued, non-blocking for the CPU).
     fn try_end_frame_with_depth(
         &mut self,
         session_data: &SessionData,
@@ -1614,7 +1640,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         display_period: i64,
         depth_enabled: bool,
         overlays: Option<&OverlayMan>,
-    ) -> bool
+    ) -> DepthEnd
     where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
@@ -1628,19 +1654,27 @@ impl<G: GraphicsBackend> FrameController<G> {
             && !self.submitting_null
             && self.eyes_submitted.iter().all(|eye| eye.is_some()))
         {
-            return false;
+            return DepthEnd::Plain;
         }
         if !depth_enabled || !G::supports_depth() {
-            return false;
+            return DepthEnd::Plain;
         }
         if !session_data.is_real_session() {
-            return false;
+            return DepthEnd::Plain;
         }
         if !depth_master_enabled() {
-            return false;
+            return DepthEnd::Plain;
         }
-        if self.depth_feed.is_none() {
-            self.depth_feed = DepthFeed::open();
+        if self.depth_feed.is_none()
+            && let Some(feed) = DepthFeed::open()
+        {
+            // Heal pins leaked by a crashed predecessor or an unclean
+            // restart: a fresh controller holds no pin, so any set word
+            // is stale. Releasing backpressure is always fail-safe
+            // toward full rate (worst case we unpin a slot nobody held).
+            feed.unpin_slot(0);
+            feed.unpin_slot(1);
+            self.depth_feed = Some(feed);
         }
         // Receipt at end_frame entry: age measures handoff-minus-present
         // (sub-ms normally), maximizing flip discrimination.
@@ -1653,22 +1687,24 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Err(e)) => {
                 self.note_read_skip(e);
                 self.note_read_ok(false);
-                return false;
+                return DepthEnd::Plain;
             }
-            None => return false,
+            None => return DepthEnd::Plain,
         };
-        // Age sample on every successful read (hits and window-misses
-        // alike): the distribution, not just submissions, tunes the gate.
-        self.age_stats.sample(ctl.age_ns(receipt));
         // Cheap gates first: all pure predicates, no GL, no acquires.
         if !ctl.is_viable() {
             self.hb_nonviable = self.hb_nonviable.saturating_add(1);
-            return false;
+            return DepthEnd::Plain;
         }
         if ctl.time_ns == 0 {
             self.hb_time_zero = self.hb_time_zero.saturating_add(1);
-            return false;
+            return DepthEnd::Plain;
         }
+        // Age sample on every viable, timestamped read (hits and
+        // window-misses alike): the distribution, not just submissions,
+        // tunes the gate. Zero-stamp and non-viable snapshots are excluded
+        // so an unhealthy producer can't skew the phase picture.
+        self.age_stats.sample(ctl.age_ns(receipt));
         if ctl.generation <= self.last_armed_gen {
             // Same generation re-sighted: present hasn't landed yet (flip
             // or late present) or the producer stalled. Never re-arm —
@@ -1683,12 +1719,12 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.last_armed_gen, self.frozen_run,
                 );
             }
-            return false;
+            return DepthEnd::Plain;
         }
         self.frozen_run = 0;
         if self.frozen_tripped {
             self.frozen_tripped = false;
-            info!("depth producer alive (generation {})", ctl.generation);
+            info!("depth producer publishing (generation {})", ctl.generation);
         }
         let bpp: u64 = match ctl.format {
             FORMAT_D32F => 4,
@@ -1697,18 +1733,18 @@ impl<G: GraphicsBackend> FrameController<G> {
                 // Unreachable via is_viable, but never trust a snapshot
                 // twice: re-check rather than mis-size an import.
                 self.hb_nonviable = self.hb_nonviable.saturating_add(1);
-                return false;
+                return DepthEnd::Plain;
             }
         };
         if !ctl.alloc_covers(bpp) {
             self.hb_alloc = self.hb_alloc.saturating_add(1);
-            return false;
+            return DepthEnd::Plain;
         }
         let (near_z, far_z) = match validate_near_far(ctl.near_z, ctl.far_z) {
             Some(v) => v,
             None => {
                 self.hb_clip = self.hb_clip.saturating_add(1);
-                return false;
+                return DepthEnd::Plain;
             }
         };
         let period = if display_period > 0 {
@@ -1718,21 +1754,25 @@ impl<G: GraphicsBackend> FrameController<G> {
         };
         if !is_same_generation(ctl.age_ns(receipt), period, DEPTH_MARGIN_NS) {
             self.hb_window = self.hb_window.saturating_add(1);
-            return false;
+            return DepthEnd::Plain;
         }
         // Dims are authoritative per read: never stretch, skip the frame.
         let (cw, ch) = match self.swapchain_data.as_ref() {
             Some(c) => (c.info.width, c.info.height),
-            None => return false,
+            None => return DepthEnd::Plain,
         };
         if cw == 0 || ctl.w != cw * 2 || ctl.h != ch {
             self.hb_dims = self.hb_dims.saturating_add(1);
-            debug!(
-                "depth dims {}x{} vs color {cw}x{ch} — plain views this frame",
-                ctl.w, ctl.h,
-            );
-            return false;
+            if !self.depth_dims_logged {
+                self.depth_dims_logged = true;
+                debug!(
+                    "depth dims {}x{} vs color {cw}x{ch} — plain views until match",
+                    ctl.w, ctl.h,
+                );
+            }
+            return DepthEnd::Plain;
         }
+        self.depth_dims_logged = false;
         // Conservative starter: depth halves are full-eye renders with no
         // flip of their own; flipped color submits would misalign.
         if self
@@ -1742,39 +1782,51 @@ impl<G: GraphicsBackend> FrameController<G> {
             .any(|s| s.flip_vertically)
         {
             self.hb_flip = self.hb_flip.saturating_add(1);
-            return false;
+            return DepthEnd::Plain;
         }
         if !self.backend.depth_fd_import_viable() {
-            if !self.depth_off_logged {
-                self.depth_off_logged = true;
+            if !self.depth_import_off_logged {
+                self.depth_import_off_logged = true;
                 info!("depth off: GL FD import not viable (extensions or entry points)");
             }
-            return false;
+            return DepthEnd::Plain;
+        }
+        // At most one pin: a still-outstanding prior copy means the GPU is
+        // behind, so skip (plain) rather than stall it further. Checked
+        // before any runtime or GL work below.
+        if self.pinned_slot.is_some() {
+            self.hb_pin_held = self.hb_pin_held.saturating_add(1);
+            return DepthEnd::Plain;
+        }
+        // Context check before acquire: never strand a runtime buffer on a
+        // thread that cannot issue GL. Also before swapchain creation so a
+        // context-less frame isn't misbucketed as a swapchain failure.
+        if !self.backend.depth_context_current() {
+            self.hb_no_context = self.hb_no_context.saturating_add(1);
+            return DepthEnd::Plain;
         }
         let eye_w = ctl.eye_w();
         let eye_h = ctl.h;
         if !self.ensure_depth_swapchain(session_data, eye_w, eye_h, ctl.format) {
             self.hb_swapchain = self.hb_swapchain.saturating_add(1);
-            return false;
-        }
-        // At most one pin: a still-outstanding prior copy means the GPU is
-        // behind, so skip (plain) rather than stall it further.
-        if self.pinned_slot.is_some() {
-            self.hb_pin_held = self.hb_pin_held.saturating_add(1);
-            return false;
-        }
-        // Context check before acquire: never strand a runtime buffer on a
-        // thread that cannot issue GL.
-        if !self.backend.depth_context_current() {
-            self.hb_no_context = self.hb_no_context.saturating_add(1);
-            return false;
+            return DepthEnd::Plain;
         }
         // Acquire (bounded): the only CPU-blocking depth call on this path.
         // Timed for the heartbeat avg/max.
         let t0 = now_mono_ns();
-        let idx: usize = match (|| {
+        enum Acquire {
+            Done(usize),
+            NoImage,
+            TimedOut,
+        }
+        let acquired = (|| {
             let data = self.depth_swapchain.as_mut()?;
-            let idx = data.swapchain.acquire_image().ok()? as usize;
+            let idx = match data.swapchain.acquire_image().ok() {
+                Some(i) => i as usize,
+                // Pool exhausted (nothing acquired, nothing to release) —
+                // distinct from a wedged wait below.
+                None => return Some(Acquire::NoImage),
+            };
             if data
                 .swapchain
                 .wait_image(xr::Duration::from_nanos(DEPTH_ACQUIRE_TIMEOUT_NS))
@@ -1784,36 +1836,49 @@ impl<G: GraphicsBackend> FrameController<G> {
                 // event permanently consumes one swapchain image until the
                 // feed latches off instead of skipping a tick.
                 let _ = data.swapchain.release_image();
-                return None;
+                return Some(Acquire::TimedOut);
             }
-            Some(idx)
-        })() {
-            Some(i) => i,
-            None => {
+            Some(Acquire::Done(idx))
+        })();
+        let idx: usize = match acquired {
+            Some(Acquire::Done(i)) => i,
+            Some(Acquire::NoImage) => {
+                self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
+                self.hb_acquire_fail = self.hb_acquire_fail.saturating_add(1);
+                return DepthEnd::Plain;
+            }
+            Some(Acquire::TimedOut) => {
                 self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
                 self.hb_acquire_timeout = self.hb_acquire_timeout.saturating_add(1);
-                return false;
+                return DepthEnd::Plain;
+            }
+            None => {
+                self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
+                self.hb_acquire_fail = self.hb_acquire_fail.saturating_add(1);
+                return DepthEnd::Plain;
             }
         };
         self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
         // Pin FIRST (contract order: pin → wait → sample), from the
         // generation just read. A vanished segment mid-frame fails here.
-        let slot = DepthControl::slot_for_generation(ctl.generation);
+        let slot = ctl.slot();
         debug_assert!(self.pinned_slot.is_none());
         let Some(feed) = self.depth_feed.as_ref() else {
-            Self::release_depth_image(&mut self.depth_swapchain, idx);
-            return false;
+            Self::release_depth_image(&mut self.depth_swapchain);
+            return DepthEnd::Plain;
         };
         if !feed.pin_slot(slot) {
-            Self::release_depth_image(&mut self.depth_swapchain, idx);
-            return false;
+            Self::release_depth_image(&mut self.depth_swapchain);
+            return DepthEnd::Plain;
         }
         self.pinned_slot = Some(slot);
-        // Epoch re-check against the snapshot: a rebuild between the read
-        // and the pin would wait a new generation on a stale import
-        // (blocks forever — old counter max < new G). The backend reimports
-        // on key change, but only the pin makes the wait safe, so the pin
-        // above deliberately precedes it.
+        // Import note: the backend reimports when this snapshot's key
+        // (epoch, dims, format) differs from its cache. No fresh read sits
+        // between the pin and the import — none is needed: we wait only on
+        // the generation just read (single-snapshot discipline), so a
+        // rebuild racing us can't produce a wait-new-G-on-stale-import
+        // hang; the post-copy epoch re-read below is the staleness net
+        // that discards a copy made from recycled FDs.
         let res = self.backend.import_and_copy_depth_fd(&DepthFdRequest {
             epoch: ctl.epoch,
             w: ctl.w,
@@ -1829,13 +1894,13 @@ impl<G: GraphicsBackend> FrameController<G> {
         });
         // Release before end (color path releases before end too). Scope
         // discipline: every post-acquire path releases exactly once.
-        Self::release_depth_image(&mut self.depth_swapchain, idx);
+        Self::release_depth_image(&mut self.depth_swapchain);
         if !res.copied {
             // No GPU work outstanding: drop the pin immediately rather than
             // holding a slot for nothing.
             self.unpin_now();
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
-            return false;
+            return DepthEnd::Plain;
         }
         // Post-copy epoch re-read: a recreate raced the copy (stale FDs
         // imported, wrong pixels). Discard rather than mislabel.
@@ -1844,7 +1909,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             _ => {
                 self.unpin_now();
                 self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
-                return false;
+                return DepthEnd::Plain;
             }
         }
         // Armed by this call: both halves were copied atomically, so this
@@ -1854,14 +1919,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(d) => d,
             None => {
                 self.unpin_now();
-                return false;
+                return DepthEnd::Plain;
             }
         };
         let color_data = match self.swapchain_data.as_ref() {
             Some(c) => c,
             None => {
                 self.unpin_now();
-                return false;
+                return DepthEnd::Plain;
             }
         };
         let crate::system::ViewData { flags, views } =
@@ -1917,7 +1982,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
         if color_subs.len() != 2 || depth_subs.len() != 2 {
             self.unpin_now();
-            return false;
+            return DepthEnd::Plain;
         }
 
         let depth_infos: Vec<xr::sys::CompositionLayerDepthInfoKHR> = (0..2)
@@ -1974,36 +2039,38 @@ impl<G: GraphicsBackend> FrameController<G> {
                         ctl.format,
                     );
                 }
-                true
+                DepthEnd::WithDepth
             }
             Err(e) => {
                 // The copy completed (fence still governs the pin), but the
-                // runtime rejected the frame: fall back to plain views.
-                // Throttled: a persistently rejecting runtime must not warn
-                // per frame. last_armed_gen still advances — the pixels are
-                // superseded by newest-wins next frame either way.
+                // runtime rejected the frame: terminal, do NOT re-end (the
+                // failed end() concluded the frame; the plain path below
+                // must not run). Throttled: a persistently rejecting
+                // runtime must not warn per frame. last_armed_gen still
+                // advances — the pixels are superseded by newest-wins next
+                // frame either way.
                 self.last_armed_gen = ctl.generation;
                 self.hb_end_fail = self.hb_end_fail.saturating_add(1);
                 if !self.depth_end_fail_warned {
                     self.depth_end_fail_warned = true;
-                    warn!("depth frame end failed ({e}); retrying plain views");
+                    warn!("depth frame end failed ({e}); frame dropped");
                 }
-                false
+                DepthEnd::EndFailed
             }
         }
     }
 
-    /// Release a depth swapchain image by index. Best-effort: failures are
-    /// debug-logged (the buffer Heals via acquire cycling, and every path
-    /// after this one ends the frame either way).
-    fn release_depth_image(depth_swapchain: &mut Option<SwapchainData<G::Api>>, idx: usize) {
-        if let Some(data) = depth_swapchain.as_mut() {
-            // Index is informational only: OpenXR releases the oldest
-            // acquired image; the assert documents single-acquire discipline.
-            debug_assert!(idx < usize::MAX);
-            if data.swapchain.release_image().is_err() {
-                debug!("depth release_image failed");
-            }
+    /// Release the depth swapchain image acquired for this frame.
+    /// Best-effort: failures are debug-logged (the buffer heals via acquire
+    /// cycling, and every path after this one ends the frame either way).
+    /// OpenXR releases the oldest acquired image; single-acquire discipline
+    /// (exactly one acquire per end_frame, unconditional release below)
+    /// makes that ours.
+    fn release_depth_image(depth_swapchain: &mut Option<SwapchainData<G::Api>>) {
+        if let Some(data) = depth_swapchain.as_mut()
+            && data.swapchain.release_image().is_err()
+        {
+            debug!("depth release_image failed");
         }
     }
 
@@ -2039,8 +2106,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
         // No fallback: a remapped color format as depth would be garbage.
         if !session_data.has_swapchain_format::<G::Api>(want_fmt) {
-            if !self.depth_off_logged {
-                self.depth_off_logged = true;
+            if !self.depth_format_off_logged {
+                self.depth_format_off_logged = true;
                 info!("depth off: preferred depth format not advertised; color-only");
             }
             return false;
@@ -2086,7 +2153,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             initial_format: want_fmt,
         });
         self.depth_next_retry = None;
-        self.hb_epoch_reimports = self.hb_epoch_reimports.saturating_add(1);
+        self.hb_depth_swapchains = self.hb_depth_swapchains.saturating_add(1);
         true
     }
 
@@ -2127,8 +2194,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             "depth {:.1}/s ({} frames, {} with depth, {} plain) \
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
-             copy[noctx {} acq_timeout {} copyfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
-             reimports {} age[avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms]",
+             copy[noctx {} acq_fail {} acq_timeout {} copyfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
+             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
             self.hb_depth,
@@ -2147,13 +2214,15 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_dims,
             self.hb_flip,
             self.hb_no_context,
+            self.hb_acquire_fail,
             self.hb_acquire_timeout,
             self.hb_copy_fail,
             self.hb_pin_held,
             self.hb_swapchain,
             self.hb_epoch_raced,
             self.hb_end_fail,
-            self.hb_epoch_reimports,
+            self.hb_depth_swapchains,
+            self.age_stats.count(),
             mean_age,
             max_age,
             min_age,
@@ -2178,13 +2247,14 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.hb_dims = 0;
         self.hb_flip = 0;
         self.hb_no_context = 0;
+        self.hb_acquire_fail = 0;
         self.hb_acquire_timeout = 0;
         self.hb_copy_fail = 0;
         self.hb_pin_held = 0;
         self.hb_swapchain = 0;
         self.hb_epoch_raced = 0;
         self.hb_end_fail = 0;
-        self.hb_epoch_reimports = 0;
+        self.hb_depth_swapchains = 0;
         self.age_stats.clear();
         self.acq_count = 0;
         self.acq_sum_ns = 0;
@@ -2829,9 +2899,10 @@ mod tests {
     }
 
     /// Without a depth feed present, every end_frame stays plain: nothing
-    /// arms, nothing pins, and the frame still submits color-only. Holds
-    /// regardless of whether fakexr advertises the depth extension (ext
-    /// off skips before any SHM work; ext on buckets read misses).
+    /// arms, nothing pins, and the frame still submits color-only. Note
+    /// fakexr does not advertise the depth extension, so this exercises the
+    /// ext-off early return; the ext-on read-miss bucketing path is covered
+    /// by the wire-level tests plus live heartbeat review.
     #[test]
     fn depth_stays_plain_without_feed() {
         let f = Fixture::new();
@@ -2854,11 +2925,20 @@ mod tests {
     }
 
     /// Kill-switch off: no feed handle is opened and frames stay plain.
-    /// Serialized through the depth env guard (process-global env).
+    /// Serialized through the depth env guard (process-global env); env is
+    /// restored by a Drop guard so a mid-test panic can't leak `=0` into
+    /// other tests.
     #[test]
     fn depth_off_with_kill_switch() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
+            }
+        }
         let _lock = crate::depth_feed::env_guard();
         crate::depth_feed::set_env_for_tests("XRIZER_DEPTH_SHM", "0");
+        let _restore = Restore;
         let f = Fixture::new();
         f.comp.SetExplicitTimingMode(
             vr::EVRCompositorTimingMode::Explicit_ApplicationPerformsPostPresentHandoff,
@@ -2873,12 +2953,12 @@ mod tests {
         assert!(ctrl.depth_feed.is_none(), "kill-switch opens no feed");
         assert_eq!(ctrl.hb_depth, 0);
         assert_eq!(ctrl.last_armed_gen, 0);
-        crate::depth_feed::del_env_for_tests("XRIZER_DEPTH_SHM");
     }
 
-    /// Fake backend (and Vulkan) carry no depth: the capability gate fails
-    /// before any SHM work, so even a present feed would stay plain. The
-    /// trait defaults keep non-GL backends compiling untouched.
+    /// Fake backend (and Vulkan) carry no depth via trait defaults, which is
+    /// what this pins: capability gate fails before any SHM work. (It does
+    /// not prove a present feed would stay plain — that needs a
+    /// depth-capable seam plus SHM, still open.)
     #[test]
     fn depth_unsupported_on_fake_backend() {
         use crate::graphics_backends::GraphicsBackend;
@@ -2897,5 +2977,68 @@ mod tests {
         assert!(!ctrl.backend.depth_fd_import_viable());
         assert!(!ctrl.backend.depth_context_current());
         assert_eq!(ctrl.hb_depth, 0);
+    }
+
+    /// Heartbeat formats a fabricated window and resets every counter.
+    /// No SHM/GL/runtime needed: same-module access drives the method
+    /// directly with a backdated window start.
+    #[test]
+    fn depth_heartbeat_formats_and_resets_window() {
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+
+        let data = f.comp.openxr.session_data.get();
+        let mut lock = data.comp_data.0.lock().unwrap();
+        let DynFrameController::Fake(ctrl) = lock.as_mut().unwrap() else {
+            panic!("Frame controller was not set up or not faked!");
+        };
+        ctrl.hb_frames = 100;
+        ctrl.hb_depth = 60;
+        ctrl.hb_read_absent = 5;
+        ctrl.hb_read_torn = 2;
+        ctrl.hb_nonviable = 3;
+        ctrl.hb_repeat = 4;
+        ctrl.hb_window = 6;
+        ctrl.hb_no_context = 1;
+        ctrl.hb_acquire_fail = 1;
+        ctrl.hb_acquire_timeout = 2;
+        ctrl.hb_copy_fail = 3;
+        ctrl.hb_pin_held = 1;
+        ctrl.hb_swapchain = 1;
+        ctrl.hb_epoch_raced = 1;
+        ctrl.hb_end_fail = 1;
+        ctrl.hb_depth_swapchains = 2;
+        ctrl.age_stats.sample(1_000_000);
+        ctrl.age_stats.sample(-500_000);
+        ctrl.sample_acquire_ns(2_000_000);
+        ctrl.sample_acquire_ns(4_000_000);
+        // Backdate past the interval so the line fires (and would panic
+        // the app thread on any format/args mismatch or div-zero).
+        ctrl.hb_start = Instant::now() - Duration::from_secs(6);
+        ctrl.maybe_log_depth_heartbeat();
+        assert_eq!(ctrl.hb_frames, 0);
+        assert_eq!(ctrl.hb_depth, 0);
+        assert_eq!(ctrl.hb_read_absent, 0);
+        assert_eq!(ctrl.hb_read_torn, 0);
+        assert_eq!(ctrl.hb_nonviable, 0);
+        assert_eq!(ctrl.hb_repeat, 0);
+        assert_eq!(ctrl.hb_window, 0);
+        assert_eq!(ctrl.hb_no_context, 0);
+        assert_eq!(ctrl.hb_acquire_fail, 0);
+        assert_eq!(ctrl.hb_acquire_timeout, 0);
+        assert_eq!(ctrl.hb_copy_fail, 0);
+        assert_eq!(ctrl.hb_pin_held, 0);
+        assert_eq!(ctrl.hb_swapchain, 0);
+        assert_eq!(ctrl.hb_epoch_raced, 0);
+        assert_eq!(ctrl.hb_end_fail, 0);
+        assert_eq!(ctrl.hb_depth_swapchains, 0);
+        assert_eq!(ctrl.age_stats.count(), 0);
+        assert_eq!(ctrl.acq_count, 0);
+        assert_eq!(ctrl.acq_sum_ns, 0);
+        assert_eq!(ctrl.acq_max_ns, 0);
+        // Immediate re-call is throttled: window counters survive.
+        ctrl.hb_frames = 7;
+        ctrl.maybe_log_depth_heartbeat();
+        assert_eq!(ctrl.hb_frames, 7);
     }
 }

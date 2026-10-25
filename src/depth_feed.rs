@@ -74,11 +74,6 @@
 //!
 //! No new crates: `libc` + `log` only.
 
-// Slice 1 is wire-only with no callers yet; compositor/import slices will
-// consume every helper below. Silence dead-code until then.
-// TODO(depth-prod-3 slice 2): remove once compositor/import callers land.
-#![allow(dead_code)]
-
 use log::{debug, info, warn};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -244,11 +239,12 @@ impl DepthControl {
             && self.fds_valid()
     }
 
-    /// Signed age of this snapshot at Submit receipt: positive = header
-    /// older than receipt (normal), negative = header newer (same frame
-    /// arriving just after wakeup; Submit-before-Present ordering).
-    /// Feed every successful read into [`AgeStats`]; read misses have no
-    /// timestamp and are bucketed by [`ReadSkip`] instead.
+    /// Signed age of this snapshot at end_frame-entry receipt: positive
+    /// = header older than receipt (normal: present landed just before the
+    /// handoff), negative = header newer (same frame arriving just after
+    /// wakeup; Submit-before-Present ordering). Feed every successful read
+    /// into [`AgeStats`]; read misses have no timestamp and are bucketed
+    /// by [`ReadSkip`] instead.
     pub fn age_ns(&self, receipt_mono_ns: u64) -> i64 {
         depth_age_ns(receipt_mono_ns, self.time_ns)
     }
@@ -530,6 +526,9 @@ impl DepthFeed {
     }
 
     /// Single `Acquire` load of a pin word. `None` when absent/out of range.
+    /// Diagnostic/foreground use (pin-state asserts, future heartbeat
+    /// inspection); the hot path pins/unpins without reading back.
+    #[allow(dead_code)]
     pub fn load_pin(&self, slot: usize) -> Option<u32> {
         let Ok(map) = map_segment(&self.name, false) else {
             return None;
