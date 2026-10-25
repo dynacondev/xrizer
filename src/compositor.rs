@@ -1073,10 +1073,12 @@ const DEPTH_MARGIN_NS: i64 = 2_000_000;
 /// Bounded depth-swapchain image acquisition: never stall the app thread
 /// on a wedged runtime. Durations are logged (avg/max) on the heartbeat.
 const DEPTH_ACQUIRE_TIMEOUT_NS: i64 = 5_000_000;
-/// Bounded fence-FD poll for producer-copy completion. Typical return is
-/// immediate (the copy completed microseconds after publish); the budget
-/// absorbs hitches. Durations are logged (avg/max) on the heartbeat.
-const DEPTH_FENCE_POLL_TIMEOUT_MS: libc::c_int = 5;
+/// Bounded fence-FD poll for producer-copy completion. EXPERIMENTAL 20ms
+/// (up from 5ms): under heavy scene load the copy retires in milliseconds,
+/// not microseconds — queue backlog, not bytes — and 5ms starved every
+/// frame in-aircraft while the bay flowed at ~3.4ms avg. Re-tune from
+/// heartbeat poll[avg/max] data; see the copy-latency discussion.
+const DEPTH_FENCE_POLL_TIMEOUT_MS: libc::c_int = 20;
 /// Cooldown between depth swapchain creation retries after a failure.
 const DEPTH_SWAPCHAIN_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 /// Heartbeat interval for the depth status line.
@@ -1726,9 +1728,10 @@ impl<G: GraphicsBackend> FrameController<G> {
 
     /// Depth path for `end_frame`: single late copy of the newest published
     /// generation, chained as `CompositionLayerDepthInfoKHR` views. No waits
-    /// beyond bounded acquire (5ms) + bounded fence poll (5ms); the GL copy
+    /// beyond bounded acquire (5ms) + bounded fence poll (20ms, experimental;
+    /// see const); the GL copy
     /// itself is queued with its own FenceSync, never a semaphore wait (v4
-    /// fence-FD design). Worst case both bounds hit back-to-back (~10ms on
+    /// fence-FD design). Worst case both bounds hit back-to-back (~25ms on
     /// a wedged producer); typical is immediate. Lower the poll bound if
     /// heartbeat `poll[avg]` ever shows pressure.
     fn try_end_frame_with_depth(
