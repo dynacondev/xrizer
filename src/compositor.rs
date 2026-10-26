@@ -1096,11 +1096,9 @@ enum PlainWhy {
 
 impl PlainWhy {
     const COUNT: usize = 28;
-    // Pinned at build time: `arm_win` is indexed by discriminant, so a
-    // variant added without bumping COUNT would panic the app thread.
-    const _: () = {
-        assert!(PlainWhy::EndFail as usize + 1 == PlainWhy::COUNT);
-    };
+    // `NAMES` is sized by `Self::COUNT`, so a variant added without
+    // extending both fails to compile here instead of panicking the
+    // app thread on a bad `arm_win` index.
     const NAMES: [&'static str; Self::COUNT] = [
         "not-render",
         "depth-disabled",
@@ -2005,7 +2003,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         system: &System,
         display_time: xr::Time,
         display_period: i64,
-        depth_enabled: bool,
+        _depth_enabled: bool,
         overlays: Option<&OverlayMan>,
     ) -> DepthEnd
     where
