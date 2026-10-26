@@ -103,7 +103,10 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
     /// Default: unsupported (keeps other backends compiling untouched).
     fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
         let _ = req;
-        DepthFdResult { copied: false }
+        DepthFdResult {
+            copied: false,
+            src_app: false,
+        }
     }
 
     /// True once a previous [`Self::import_and_copy_depth_fd`] fence has
@@ -149,6 +152,10 @@ pub struct DepthFdRequest {
 pub struct DepthFdResult {
     /// Both halves copied (queued) this call; end_frame may chain depth.
     pub copied: bool,
+    /// Copy source was the app's own block (true) or the slot mirror
+    /// (false). Heartbeat/bookkeeping only — same fence discipline either
+    /// way. Always false when `copied` is false.
+    pub src_app: bool,
 }
 
 #[derive(macros::Backends, TryInto, From)]

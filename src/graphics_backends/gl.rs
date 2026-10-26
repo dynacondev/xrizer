@@ -553,7 +553,10 @@ impl GraphicsBackend for GlData {
     }
 
     fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
-        let inert = || DepthFdResult { copied: false };
+        let inert = || DepthFdResult {
+            copied: false,
+            src_app: false,
+        };
         if !self.depth_fd_import_viable() {
             return inert();
         }
@@ -672,6 +675,17 @@ impl GraphicsBackend for GlData {
                             req.app_off,
                             req.app_size,
                         );
+                    } else if use_app {
+                        info!(
+                            "depth FD app import live (epoch {}, {}x{} fmt {} fd {} off {} size {})",
+                            req.epoch,
+                            req.w,
+                            req.h,
+                            req.vk_format,
+                            req.app_fd,
+                            req.app_off,
+                            req.app_size,
+                        );
                     }
                     self.depth_fd = Some(DepthFdCache {
                         epoch: req.epoch,
@@ -701,9 +715,9 @@ impl GraphicsBackend for GlData {
         // slot mirror written by the producer's copy. No GL-side sync
         // here by design (see below).
         let slot = (req.generation % 2) as usize;
-        let (src_tex, src_label) = match cache.app {
-            Some(a) => (a.tex, "app"),
-            None => (cache.slots[slot].tex, "slot"),
+        let (src_tex, src_label, src_app) = match cache.app {
+            Some(a) => (a.tex, "app", true),
+            None => (cache.slots[slot].tex, "slot", false),
         };
         // No GL-side sync here by design: the caller samples torn-tolerant
         // (UNFENCED single-copy or timeout-0 unsync probe) instead of any
@@ -748,7 +762,10 @@ impl GraphicsBackend for GlData {
                 "depth FD fence creation failed (generation {})",
                 req.generation
             );
-            return DepthFdResult { copied: true };
+            return DepthFdResult {
+                copied: true,
+                src_app,
+            };
         }
         if let Some((old_bits, old_gen)) = cache.pending.replace((sync as u64, req.generation)) {
             // Previous copy still untracked (caller only pins one slot, so
@@ -758,7 +775,10 @@ impl GraphicsBackend for GlData {
             debug!("depth FD fence superseded (was gen {old_gen})");
         }
         unsafe { gl::Flush() };
-        DepthFdResult { copied: true }
+        DepthFdResult {
+            copied: true,
+            src_app,
+        }
     }
 
     fn poll_depth_copy_complete(&mut self) -> bool {

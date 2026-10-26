@@ -1192,6 +1192,8 @@ struct FrameController<G: GraphicsBackend> {
     hb_poll_timeout: u64,
     hb_poll_dead: u64,
     hb_unsync: u64,
+    hb_src_app: u64,
+    hb_src_slot: u64,
     hb_pin_held: u64,
     hb_swapchain: u64,
     hb_epoch_raced: u64,
@@ -1349,6 +1351,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_poll_timeout: 0,
             hb_poll_dead: 0,
             hb_unsync: 0,
+            hb_src_app: 0,
+            hb_src_slot: 0,
             hb_pin_held: 0,
             hb_swapchain: 0,
             hb_epoch_raced: 0,
@@ -2189,15 +2193,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         // only the generation just read (single-snapshot discipline), and
         // the post-copy epoch re-read below is the staleness net that
         // discards a copy made from recycled FDs.
-        if DEPTH_SAMPLE_LOG_ON {
-            let tc_ns = now_mono_ns();
-            info!(
-                "[xrizer] depth sample gen {} tc {}.{:03}",
-                ctl.generation,
-                tc_ns / 1_000_000_000,
-                (tc_ns / 1_000_000) % 1000,
-            );
-        }
+        let tc_ns = now_mono_ns();
         let res = self.backend.import_and_copy_depth_fd(&DepthFdRequest {
             epoch: ctl.epoch,
             w: ctl.w,
@@ -2227,6 +2223,20 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.evt_depth_streak = 0;
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
             return DepthEnd::Plain;
+        }
+        if DEPTH_SAMPLE_LOG_ON {
+            info!(
+                "[xrizer] depth sample gen {} tc {}.{:03} src {}",
+                ctl.generation,
+                tc_ns / 1_000_000_000,
+                (tc_ns / 1_000_000) % 1000,
+                if res.src_app { "app" } else { "slot" },
+            );
+        }
+        if res.src_app {
+            self.hb_src_app = self.hb_src_app.saturating_add(1);
+        } else {
+            self.hb_src_slot = self.hb_src_slot.saturating_add(1);
         }
         // Post-copy epoch re-read: a recreate raced the copy (stale FDs
         // imported, wrong pixels). Discard rather than mislabel. A
@@ -2572,7 +2582,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             "depth {:.1}/s ({} frames, {} with depth, {} plain) \
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
-             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} unsync {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
+             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} unsync {} src_app {} src_slot {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
              swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] seen[gen {} epoch {} {}x{}]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
@@ -2597,6 +2607,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_poll_timeout,
             self.hb_poll_dead,
             self.hb_unsync,
+            self.hb_src_app,
+            self.hb_src_slot,
             self.hb_copy_fail,
             self.hb_pin_fail,
             self.hb_pin_held,
@@ -2640,6 +2652,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.hb_poll_timeout = 0;
         self.hb_poll_dead = 0;
         self.hb_unsync = 0;
+        self.hb_src_app = 0;
+        self.hb_src_slot = 0;
         self.hb_copy_fail = 0;
         self.hb_pin_fail = 0;
         self.hb_pin_held = 0;
@@ -3424,6 +3438,8 @@ mod tests {
         ctrl.hb_poll_timeout = 1;
         ctrl.hb_poll_dead = 1;
         ctrl.hb_unsync = 7;
+        ctrl.hb_src_app = 5;
+        ctrl.hb_src_slot = 2;
         ctrl.hb_copy_fail = 3;
         ctrl.hb_pin_fail = 2;
         ctrl.hb_pin_held = 1;
@@ -3467,6 +3483,8 @@ mod tests {
         assert_eq!(ctrl.hb_poll_timeout, 0);
         assert_eq!(ctrl.hb_poll_dead, 0);
         assert_eq!(ctrl.hb_unsync, 0);
+        assert_eq!(ctrl.hb_src_app, 0);
+        assert_eq!(ctrl.hb_src_slot, 0);
         assert_eq!(ctrl.hb_copy_fail, 0);
         assert_eq!(ctrl.hb_pin_fail, 0);
         assert_eq!(ctrl.hb_pin_held, 0);
