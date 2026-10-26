@@ -2,8 +2,8 @@ use crate::{
     AtomicF64,
     clientcore::{Injected, Injector},
     depth_feed::{
-        AgeStats, DepthFeed, FORMAT_D32F, FORMAT_D32S8, FencePoll, MAX_DEPTH, MIN_DEPTH, ReadSkip,
-        depth_master_enabled, is_same_generation, now_mono_ns, poll_fence_fd, validate_near_far,
+        AgeStats, DepthFeed, FORMAT_D32F, FORMAT_D32S8, MAX_DEPTH, MIN_DEPTH, ReadSkip,
+        depth_master_enabled, is_same_generation, now_mono_ns, validate_near_far,
     },
     graphics_backends::{
         DepthFdRequest, GraphicsBackend, SupportedBackend, supported_backends_enum,
@@ -1073,17 +1073,6 @@ const DEPTH_MARGIN_NS: i64 = 2_000_000;
 /// Bounded depth-swapchain image acquisition: never stall the app thread
 /// on a wedged runtime. Durations are logged (avg/max) on the heartbeat.
 const DEPTH_ACQUIRE_TIMEOUT_NS: i64 = 5_000_000;
-/// Bounded fence-FD poll for producer-copy completion. EXPERIMENTAL 20ms
-/// (up from 5ms): under heavy scene load the copy retires in milliseconds,
-/// not microseconds — queue backlog, not bytes — and 5ms starved every
-/// frame in-aircraft while the bay flowed at ~3.4ms avg. Re-tune from
-/// heartbeat poll[avg/max] data; see the copy-latency discussion.
-const DEPTH_FENCE_POLL_TIMEOUT_MS: libc::c_int = 20;
-/// EXP12 unsync consumer sample (E12 payoff, torn-tolerant): after the pin,
-/// probe the fence with a timeout-0 poll first. If PENDING on a fresh
-/// generation, skip the 20ms wait and import_and_copy immediately (GPU-side
-/// sample of the GENERAL slot). Hardcoded ON for this experiment; no envs.
-const DEPTH_UNSYNC_ON: bool = true;
 /// Cooldown between depth swapchain creation retries after a failure.
 const DEPTH_SWAPCHAIN_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 /// Heartbeat interval for the depth status line.
@@ -1198,8 +1187,6 @@ struct FrameController<G: GraphicsBackend> {
     hb_swapchain: u64,
     hb_epoch_raced: u64,
     hb_end_fail: u64,
-    evt_timeout_logged: bool,
-    evt_dead_logged: bool,
     evt_unsync_logged: bool,
     evt_pinheld_logged: bool,
     evt_copyfail_logged: bool,
@@ -1357,8 +1344,6 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_swapchain: 0,
             hb_epoch_raced: 0,
             hb_end_fail: 0,
-            evt_timeout_logged: false,
-            evt_dead_logged: false,
             evt_unsync_logged: false,
             evt_pinheld_logged: false,
             evt_copyfail_logged: false,
@@ -2100,91 +2085,27 @@ impl<G: GraphicsBackend> FrameController<G> {
         // first-available A, gpu dt) per generation; pairing offline by
         // gen gives clean (Tc > A) / certain-overlap (Tc < R) / hazard.
         const DEPTH_SAMPLE_LOG_ON: bool = true;
-        // EXP12 unsync fast path: timeout-0 probe first. READY proceeds as
-        // today; PENDING on a fresh generation skips the 20ms wait and
-        // samples immediately (torn-tolerant GPU-side sample). Repeat gens
-        // never unsync (repeat gate above guarantees ctl.gen > last_armed
-        // here, re-checked defensively). Dims/epoch viability already gated
-        // above; the post-copy epoch re-read stays the staleness net.
+        // Single-copy UNFENCED: the producer publishes fence -1 (the inbatch
+        // copy retires with the app batch, so no fence exists). Sample
+        // immediately, torn-tolerant, after the pin. A fenced publish
+        // would be a contract violation — fail safe to plain.
         let t1 = now_mono_ns();
         let fence_fd = ctl.fence_fds[slot];
-        let mut unsync_sampled = false;
-        if fence_fd <= 2 {
-            // UNFENCED single-copy publish (fence -1): the inbatch copy
-            // retires with the app batch, so no fence exists to wait on.
-            // Sample immediately, torn-tolerant — same steady state as
-            // the unsync probe path below, minus the probe.
-            unsync_sampled = true;
-            self.hb_unsync = self.hb_unsync.saturating_add(1);
-            if !self.evt_unsync_logged {
-                self.evt_unsync_logged = true;
-                info!(
-                    "[xrizer] exp12 unfenced: sampling gen {} with no fence (single-copy)",
-                    ctl.generation
-                );
-            }
-        } else {
-        match poll_fence_fd(fence_fd, 0) {
-            FencePoll::Ready => {}
-            FencePoll::Timeout => {
-                let fresh = ctl.generation > self.last_armed_gen;
-                if DEPTH_UNSYNC_ON && fresh {
-                    unsync_sampled = true;
-                    self.hb_unsync = self.hb_unsync.saturating_add(1);
-                    if !self.evt_unsync_logged {
-                        self.evt_unsync_logged = true;
-                        info!(
-                            "[xrizer] exp12 unsync: sampling PENDING gen {}",
-                            ctl.generation
-                        );
-                    }
-                }
-            }
-            FencePoll::Dead => {
-                self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
-                self.unpin_now();
-                Self::release_depth_image(&mut self.depth_swapchain);
-                if !self.evt_dead_logged {
-                    self.evt_dead_logged = true;
-                    warn!("depth fence FD dead (first since last with-depth frame)");
-                }
-                self.evt_depth_streak = 0;
-                self.hb_poll_dead = self.hb_poll_dead.saturating_add(1);
-                return DepthEnd::Plain;
-            }
+        if fence_fd > 2 {
+            self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
+            self.unpin_now();
+            Self::release_depth_image(&mut self.depth_swapchain);
+            warn!("depth fenced publish (contract violation, expected unfenced)");
+            self.evt_depth_streak = 0;
+            return DepthEnd::Plain;
         }
-        } // end fenced timeout-0 probe (unfenced skips both polls)
-        if !unsync_sampled {
-            match poll_fence_fd(fence_fd, DEPTH_FENCE_POLL_TIMEOUT_MS) {
-                FencePoll::Ready => {}
-                FencePoll::Timeout => {
-                    self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
-                    self.unpin_now();
-                    Self::release_depth_image(&mut self.depth_swapchain);
-                    if !self.evt_timeout_logged {
-                        self.evt_timeout_logged = true;
-                        warn!(
-                            "depth fence poll timed out after {}ms (first since last with-depth frame)",
-                            DEPTH_FENCE_POLL_TIMEOUT_MS
-                        );
-                    }
-                    self.evt_depth_streak = 0;
-                    self.hb_poll_timeout = self.hb_poll_timeout.saturating_add(1);
-                    return DepthEnd::Plain;
-                }
-                FencePoll::Dead => {
-                    self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
-                    self.unpin_now();
-                    Self::release_depth_image(&mut self.depth_swapchain);
-                    if !self.evt_dead_logged {
-                        self.evt_dead_logged = true;
-                        warn!("depth fence FD dead (first since last with-depth frame)");
-                    }
-                    self.evt_depth_streak = 0;
-                    self.hb_poll_dead = self.hb_poll_dead.saturating_add(1);
-                    return DepthEnd::Plain;
-                }
-            }
+        self.hb_unsync = self.hb_unsync.saturating_add(1);
+        if !self.evt_unsync_logged {
+            self.evt_unsync_logged = true;
+            info!(
+                "[xrizer] unfenced: sampling gen {} with no fence (single-copy)",
+                ctl.generation
+            );
         }
         self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
         // Import note: the backend reimports memory when this snapshot's
@@ -2403,8 +2324,6 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.depth_end_fail_warned = false;
                 self.evt_depth_streak = self.evt_depth_streak.saturating_add(1);
                 if self.evt_depth_streak >= 5 {
-                    self.evt_timeout_logged = false;
-                    self.evt_dead_logged = false;
                     self.evt_pinheld_logged = false;
                     self.evt_copyfail_logged = false;
                     self.evt_epochrace_logged = false;

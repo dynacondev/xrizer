@@ -45,11 +45,9 @@
 //! must; holding both stalls all publishes. Pins are backpressure-skip
 //! hints, not acks: the producer skips a pinned slot and keeps the other
 //! moving, so a stuck pin costs half rate, never a wedge.
-//! Slot for generation `G` is `G % 2`. Per-slot completion is a
-//! one-shot fence sync_file, exported fresh at every publish: poll it
-//! ([`poll_fence_fd`], bounded) instead of any semaphore wait — there is
-//! no semaphore object to import, cache, or re-wait, so skipped
-//! generations leave no sync debt behind by construction.
+//! Slot for generation `G` is `G % 2`. Single-copy UNFENCED: no per-slot
+//! completion object exists — sample immediately after the pin,
+//! torn-tolerant. Skipped generations publish nothing.
 //! `CLOCK_MONOTONIC` timestamps correlate frames: `age = receipt - header`.
 //!
 //! FDs are borrowed numbers used directly (no `SCM_RIGHTS`/re-open/close,
@@ -788,61 +786,10 @@ pub fn now_mono_ns() -> u64 {
         .saturating_add(ts.tv_nsec as u64)
 }
 
-/// Poll outcome for [`poll_fence_fd`]. `Copy` enum — the heartbeat buckets
-/// it with counter increments, no formatting on the frame path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FencePoll {
-    /// Fence signaled: the producer's copy for this generation completed.
-    Ready,
-    /// Still pending after `timeout_ms`: skip (plain), keep the pin only if
-    /// a later poll is planned, else unpin. Bounded cost by construction.
-    Timeout,
-    /// FD invalid (`<= 2`), closed under us (segment vanished), or poll
-    /// errored: the snapshot is dead — re-read, never wait on it.
-    Dead,
-}
-
-/// Poll one published fence sync_file for producer-copy completion.
-///
-/// `fd` is the pinned slot's current fence number, used directly (poll
-/// takes no ownership; same-process borrowed numbers). Returns when
-/// signaled or after `timeout_ms`, whichever comes first — never blocks
-/// indefinitely (`timeout_ms` is clamped at zero: negative would mean
-/// infinite per `poll(2)`). Call only while holding the slot's pin: the
-/// producer closes and replaces fence FDs on unpinned reuse, so an
-/// unpinned poll can observe a closed or recycled number (reported as
-/// [`FencePoll::Dead`] via `POLLNVAL`/error, fail-safe to plain).
-pub fn poll_fence_fd(fd: i32, timeout_ms: libc::c_int) -> FencePoll {
-    if fd <= 2 {
-        return FencePoll::Dead;
-    }
-    let timeout_ms = timeout_ms.max(0);
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: pfd points to one valid local pollfd; timeout is bounded.
-    let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    if r > 0 {
-        // IN = signaled (HUP may accompany it on a consumed file — still
-        // signaled). Anything else with r > 0 (NVAL = closed under us, ERR,
-        // HUP-alone) means the snapshot is unusable: never wait on it.
-        if pfd.revents & libc::POLLNVAL != 0 {
-            FencePoll::Dead
-        } else if pfd.revents & libc::POLLIN != 0 {
-            FencePoll::Ready
-        } else {
-            FencePoll::Dead
-        }
-    } else if r == 0 {
-        FencePoll::Timeout
-    } else {
-        // -1: EINTR (a signal stole the wait) or EBADF (raced close) —
-        // either way the snapshot is unusable; re-read next frame.
-        FencePoll::Dead
-    }
-}
+/// Unfenced single-copy: the producer publishes fence -1 (no fence exists).
+/// The consumer samples immediately after the pin, torn-tolerant, with no
+/// poll. `fence_fds` words are always -1; a value > 2 is a contract
+/// violation (fail safe to plain).
 
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
@@ -1735,49 +1682,5 @@ mod tests {
         assert_eq!(s.max_ns(), Some(7));
         assert_eq!(s.min_ns(), Some(7));
         assert_eq!(s.neg_rate(), 0.0);
-    }
-
-    /// Fence-poll outcomes against real (pipe-backed) pollable FDs. Pipes
-    /// stand in for sync_file FDs: both signal `POLLIN`, time out empty,
-    /// and report dead when closed — the only three behaviors the caller
-    /// depends on.
-    #[test]
-    fn fence_poll_ready_timeout_dead() {
-        assert_eq!(poll_fence_fd(-1, 0), FencePoll::Dead);
-        assert_eq!(poll_fence_fd(0, 0), FencePoll::Dead);
-        assert_eq!(poll_fence_fd(2, 0), FencePoll::Dead);
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (r, w) = (fds[0], fds[1]);
-        // Empty pipe, zero timeout: pending.
-        assert_eq!(poll_fence_fd(r, 0), FencePoll::Timeout);
-        // One byte readable: signaled.
-        assert_eq!(unsafe { libc::write(w, [1u8].as_ptr().cast(), 1) }, 1);
-        assert_eq!(poll_fence_fd(r, 10), FencePoll::Ready);
-        // Drained pipe blocks again (bounded 1ms check, not zero, so a
-        // slow CI scheduler can't flake the direction).
-        let mut buf = [0u8; 1];
-        assert_eq!(unsafe { libc::read(r, buf.as_mut_ptr().cast(), 1) }, 1);
-        assert_eq!(poll_fence_fd(r, 1), FencePoll::Timeout);
-        // Negative timeout clamps to zero (never infinite): the drained pipe
-        // still reports pending immediately instead of blocking.
-        assert_eq!(poll_fence_fd(r, -5), FencePoll::Timeout);
-        unsafe {
-            libc::close(r);
-            libc::close(w);
-        }
-        // Closed read end: dead, never waited on (timeout 0: the error
-        // returns immediately, no block window for a reuse race).
-        assert_eq!(poll_fence_fd(r, 0), FencePoll::Dead);
-    }
-
-    #[test]
-    fn fence_poll_copy_and_heartbeat_key() {
-        // Heartbeat bucketing relies on cheap discriminant compares.
-        let a = FencePoll::Ready;
-        let b = a;
-        assert_eq!(a, b);
-        assert_ne!(a, FencePoll::Timeout);
-        assert_ne!(a, FencePoll::Dead);
     }
 }
