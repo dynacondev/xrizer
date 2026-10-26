@@ -1190,6 +1190,11 @@ struct FrameController<G: GraphicsBackend> {
     hb_swapchain: u64,
     hb_epoch_raced: u64,
     hb_end_fail: u64,
+    evt_timeout_logged: bool,
+    evt_dead_logged: bool,
+    evt_pinheld_logged: bool,
+    evt_copyfail_logged: bool,
+    evt_epochrace_logged: bool,
     hb_depth_swapchains: u64,
     age_stats: AgeStats,
     acq_count: u64,
@@ -1339,6 +1344,11 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_swapchain: 0,
             hb_epoch_raced: 0,
             hb_end_fail: 0,
+            evt_timeout_logged: false,
+            evt_dead_logged: false,
+            evt_pinheld_logged: false,
+            evt_copyfail_logged: false,
+            evt_epochrace_logged: false,
             hb_depth_swapchains: 0,
             age_stats: AgeStats::new(),
             acq_count: 0,
@@ -1937,6 +1947,12 @@ impl<G: GraphicsBackend> FrameController<G> {
         // behind, so skip (plain) rather than stall it further. Checked
         // before any runtime or GL work below.
         if self.pinned_slot.is_some() {
+            if !self.evt_pinheld_logged {
+                self.evt_pinheld_logged = true;
+                warn!(
+                    "depth sample skipped: prior copy still outstanding (first since last with-depth frame)"
+                );
+            }
             self.hb_pin_held = self.hb_pin_held.saturating_add(1);
             return DepthEnd::Plain;
         }
@@ -2056,6 +2072,13 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
                 self.unpin_now();
                 Self::release_depth_image(&mut self.depth_swapchain);
+                if !self.evt_timeout_logged {
+                    self.evt_timeout_logged = true;
+                    warn!(
+                        "depth fence poll timed out after {}ms (first since last with-depth frame)",
+                        DEPTH_FENCE_POLL_TIMEOUT_MS
+                    );
+                }
                 self.hb_poll_timeout = self.hb_poll_timeout.saturating_add(1);
                 return DepthEnd::Plain;
             }
@@ -2063,6 +2086,10 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
                 self.unpin_now();
                 Self::release_depth_image(&mut self.depth_swapchain);
+                if !self.evt_dead_logged {
+                    self.evt_dead_logged = true;
+                    warn!("depth fence FD dead (first since last with-depth frame)");
+                }
                 self.hb_poll_dead = self.hb_poll_dead.saturating_add(1);
                 return DepthEnd::Plain;
             }
@@ -2093,6 +2120,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             // No GPU work outstanding: drop the pin immediately rather than
             // holding a slot for nothing.
             self.unpin_now();
+            if !self.evt_copyfail_logged {
+                self.evt_copyfail_logged = true;
+                warn!("depth GL copy failed (first since last with-depth frame)");
+            }
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
             return DepthEnd::Plain;
         }
@@ -2108,6 +2139,12 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.last_seen_h = fresh.h;
                 if fresh.epoch != ctl.epoch {
                     self.unpin_now();
+                    if !self.evt_epochrace_logged {
+                        self.evt_epochrace_logged = true;
+                        warn!(
+                            "depth epoch raced the copy; discarded (first since last with-depth frame)"
+                        );
+                    }
                     self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
                     return DepthEnd::Plain;
                 }
@@ -2248,6 +2285,11 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.prearm_run = 0;
                 self.prearm_tripped = false;
                 self.depth_end_fail_warned = false;
+                self.evt_timeout_logged = false;
+                self.evt_dead_logged = false;
+                self.evt_pinheld_logged = false;
+                self.evt_copyfail_logged = false;
+                self.evt_epochrace_logged = false;
                 if !self.first_arm_logged {
                     self.first_arm_logged = true;
                     info!(
