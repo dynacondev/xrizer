@@ -1195,6 +1195,7 @@ struct FrameController<G: GraphicsBackend> {
     evt_pinheld_logged: bool,
     evt_copyfail_logged: bool,
     evt_epochrace_logged: bool,
+    evt_depth_streak: u32,
     hb_depth_swapchains: u64,
     age_stats: AgeStats,
     acq_count: u64,
@@ -1349,6 +1350,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             evt_pinheld_logged: false,
             evt_copyfail_logged: false,
             evt_epochrace_logged: false,
+            evt_depth_streak: 0,
             hb_depth_swapchains: 0,
             age_stats: AgeStats::new(),
             acq_count: 0,
@@ -1940,6 +1942,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             // Persistent copy precondition failure: count per frame like any
             // other plain path (the one-time line above names the cause).
+            self.evt_depth_streak = 0;
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
             return DepthEnd::Plain;
         }
@@ -1953,6 +1956,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     "depth sample skipped: prior copy still outstanding (first since last with-depth frame)"
                 );
             }
+            self.evt_depth_streak = 0;
             self.hb_pin_held = self.hb_pin_held.saturating_add(1);
             return DepthEnd::Plain;
         }
@@ -2055,6 +2059,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             );
             Self::release_depth_image(&mut self.depth_swapchain);
             self.unpin_now();
+            self.evt_depth_streak = 0;
             self.hb_pin_held = self.hb_pin_held.saturating_add(1);
             return DepthEnd::Plain;
         }
@@ -2079,6 +2084,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                         DEPTH_FENCE_POLL_TIMEOUT_MS
                     );
                 }
+                self.evt_depth_streak = 0;
                 self.hb_poll_timeout = self.hb_poll_timeout.saturating_add(1);
                 return DepthEnd::Plain;
             }
@@ -2090,6 +2096,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.evt_dead_logged = true;
                     warn!("depth fence FD dead (first since last with-depth frame)");
                 }
+                self.evt_depth_streak = 0;
                 self.hb_poll_dead = self.hb_poll_dead.saturating_add(1);
                 return DepthEnd::Plain;
             }
@@ -2124,6 +2131,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.evt_copyfail_logged = true;
                 warn!("depth GL copy failed (first since last with-depth frame)");
             }
+            self.evt_depth_streak = 0;
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
             return DepthEnd::Plain;
         }
@@ -2145,12 +2153,14 @@ impl<G: GraphicsBackend> FrameController<G> {
                             "depth epoch raced the copy; discarded (first since last with-depth frame)"
                         );
                     }
+                    self.evt_depth_streak = 0;
                     self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
                     return DepthEnd::Plain;
                 }
             }
             _ => {
                 self.unpin_now();
+                self.evt_depth_streak = 0;
                 self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
                 return DepthEnd::Plain;
             }
@@ -2164,6 +2174,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 // Defensive: verified Some at acquire; single-threaded flow
                 // can't clear it. Bucketed so every plain path counts one.
                 self.unpin_now();
+                self.evt_depth_streak = 0;
                 self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
                 return DepthEnd::Plain;
             }
@@ -2173,6 +2184,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             None => {
                 // Defensive: verified Some at the dims gate. Same bucket.
                 self.unpin_now();
+                self.evt_depth_streak = 0;
                 self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
                 return DepthEnd::Plain;
             }
@@ -2232,6 +2244,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             // Defensive: the depth layer hardcodes two eyes. A runtime
             // reporting any other view count can't chain depth; plain.
             self.unpin_now();
+            self.evt_depth_streak = 0;
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
             return DepthEnd::Plain;
         }
@@ -2285,11 +2298,14 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.prearm_run = 0;
                 self.prearm_tripped = false;
                 self.depth_end_fail_warned = false;
-                self.evt_timeout_logged = false;
-                self.evt_dead_logged = false;
-                self.evt_pinheld_logged = false;
-                self.evt_copyfail_logged = false;
-                self.evt_epochrace_logged = false;
+                self.evt_depth_streak = self.evt_depth_streak.saturating_add(1);
+                if self.evt_depth_streak >= 5 {
+                    self.evt_timeout_logged = false;
+                    self.evt_dead_logged = false;
+                    self.evt_pinheld_logged = false;
+                    self.evt_copyfail_logged = false;
+                    self.evt_epochrace_logged = false;
+                }
                 if !self.first_arm_logged {
                     self.first_arm_logged = true;
                     info!(
