@@ -1059,6 +1059,90 @@ enum DepthEnd {
     EndFailed,
 }
 
+/// One bucket charged per non-WithDepth frame (see `plain`): the
+/// arming-loss window names the dominant gate instead of "no apparent
+/// reason". Order is display order only; discriminants index `arm_win`.
+#[derive(Copy, Clone, Debug)]
+enum PlainWhy {
+    NotRender,
+    DepthDisabled,
+    NotReal,
+    MasterOff,
+    NoFeed,
+    ReadAbsent,
+    ReadSize,
+    ReadTorn,
+    ReadMagic,
+    ReadVersion,
+    Nonviable,
+    TimeZero,
+    Repeat,
+    Alloc,
+    Clip,
+    Window,
+    Dims,
+    Flip,
+    ImportOff,
+    PinHeld,
+    NoContext,
+    Swapchain,
+    AcquireFail,
+    AcquireTimeout,
+    PinFail,
+    CopyFail,
+    EpochRaced,
+    EndFail,
+}
+
+impl PlainWhy {
+    const COUNT: usize = 28;
+    // Pinned at build time: `arm_win` is indexed by discriminant, so a
+    // variant added without bumping COUNT would panic the app thread.
+    const _: () = {
+        assert!(PlainWhy::EndFail as usize + 1 == PlainWhy::COUNT);
+    };
+    const NAMES: [&'static str; Self::COUNT] = [
+        "not-render",
+        "depth-disabled",
+        "not-real-session",
+        "master-off",
+        "no-feed",
+        "read-absent",
+        "read-size",
+        "read-torn",
+        "read-magic",
+        "read-version",
+        "nonviable",
+        "time-zero",
+        "repeat",
+        "alloc",
+        "clip",
+        "window",
+        "dims",
+        "flip",
+        "import-off",
+        "pin-held",
+        "no-context",
+        "swapchain",
+        "acquire-fail",
+        "acquire-timeout",
+        "pin-fail",
+        "copy-fail",
+        "epoch-raced",
+        "end-fail",
+    ];
+
+    fn from_skip(skip: ReadSkip) -> Self {
+        match skip {
+            ReadSkip::Absent => Self::ReadAbsent,
+            ReadSkip::WrongSize => Self::ReadSize,
+            ReadSkip::Torn => Self::ReadTorn,
+            ReadSkip::BadMagic => Self::ReadMagic,
+            ReadSkip::BadVersion => Self::ReadVersion,
+        }
+    }
+}
+
 struct SwapchainData<G: xr::Graphics> {
     swapchain: xr::Swapchain<G>,
     info: xr::SwapchainCreateInfo<G>,
@@ -1081,6 +1165,10 @@ const DEPTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Frame-counted (not clocked) so hitches and pauses can't trip it.
 /// Logging only — never a control input.
 const DEPTH_FROZEN_TRIP_FRAMES: u32 = 30;
+/// Consecutive non-WithDepth end_frames before the arming-loss warn.
+/// Same order as the frozen trip so a silent stop names its killer
+/// within ~1/3s at 90Hz. Logging only — never a control input.
+const DEPTH_ARM_LOSS_TRIP_FRAMES: u32 = 30;
 /// Bound on a held depth pin, in end_frames (~1s at 90Hz). A GL copy fence
 /// that never completes past this releases its pin anyway (one torn frame
 /// at most): liveness over the pin, consistent with the
@@ -1190,6 +1278,26 @@ struct FrameController<G: GraphicsBackend> {
     evt_copyfail_logged: bool,
     evt_epochrace_logged: bool,
     evt_depth_streak: u32,
+    /// Consecutive end_frames without depth (Plain or EndFailed).
+    /// Declares arming loss once at [`DEPTH_ARM_LOSS_TRIP_FRAMES`];
+    /// reset on WithDepth and on `drop_depth_state` (same per-geometry
+    /// lifetime as `last_armed_gen`).
+    arm_plain_run: u32,
+    /// Trip log emitted for the current plain run; the next WithDepth
+    /// then logs recovery. Latched so a long stop warns once.
+    arm_loss_logged: bool,
+    /// Exactly one bucket charged per non-WithDepth frame (see `plain`).
+    /// Reset on WithDepth only (never on the heartbeat) so a loss
+    /// spanning windows still reports its full-run dominant gate.
+    arm_win: [u64; PlainWhy::COUNT],
+    /// Per-end_frame depth-path wall time in ns (outer wrapper samples
+    /// every attempted frame: SHM reads, gates, bounded acquire, GL
+    /// copy, epoch re-read, layer build, end()). Heartbeat stats like
+    /// the acquire/poll timings; reset per window.
+    dw_count: u64,
+    dw_sum_ns: u64,
+    dw_max_ns: u64,
+    dw_min_ns: u64,
     hb_depth_swapchains: u64,
     age_stats: AgeStats,
     acq_count: u64,
@@ -1345,6 +1453,13 @@ impl<G: GraphicsBackend> FrameController<G> {
             evt_copyfail_logged: false,
             evt_epochrace_logged: false,
             evt_depth_streak: 0,
+            arm_plain_run: 0,
+            arm_loss_logged: false,
+            arm_win: [0; PlainWhy::COUNT],
+            dw_count: 0,
+            dw_sum_ns: 0,
+            dw_max_ns: 0,
+            dw_min_ns: u64::MAX,
             hb_depth_swapchains: 0,
             age_stats: AgeStats::new(),
             acq_count: 0,
@@ -1401,6 +1516,12 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.frozen_tripped = false;
         self.prearm_run = 0;
         self.prearm_tripped = false;
+        // Arming-loss window is per-geometry state like last_armed_gen:
+        // a recreate explains the re-arm, so don't let stale buckets
+        // blame the next run.
+        self.arm_plain_run = 0;
+        self.arm_loss_logged = false;
+        self.arm_win = [0; PlainWhy::COUNT];
     }
 
     fn acquire_swapchain_image(&mut self) {
@@ -1569,6 +1690,24 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_depth = self.hb_depth.saturating_add(1);
         }
         self.maybe_log_depth_heartbeat();
+        // Arming-transition detector (logging only): N consecutive
+        // non-WithDepth frames declare loss once; the next WithDepth logs
+        // recovery with the same dominant-gate summary. The window resets
+        // on WithDepth, never on the heartbeat.
+        if depth_end == DepthEnd::WithDepth {
+            if self.arm_loss_logged {
+                self.log_arming_recovery();
+            }
+            self.arm_plain_run = 0;
+            self.arm_loss_logged = false;
+            self.arm_win = [0; PlainWhy::COUNT];
+        } else {
+            self.arm_plain_run = self.arm_plain_run.saturating_add(1);
+            if self.arm_plain_run == DEPTH_ARM_LOSS_TRIP_FRAMES && !self.arm_loss_logged {
+                self.arm_loss_logged = true;
+                self.log_arming_loss();
+            }
+        }
         if depth_end != DepthEnd::Plain {
             // WithDepth: submitted. EndFailed: the failed end() already
             // concluded the frame — re-ending without a new begin is
@@ -1732,11 +1871,88 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.poll_max_ns = self.poll_max_ns.max(ns);
     }
 
+    fn sample_depth_wall(&mut self, ns: u64) {
+        self.dw_count = self.dw_count.saturating_add(1);
+        self.dw_sum_ns = self.dw_sum_ns.saturating_add(ns);
+        self.dw_max_ns = self.dw_max_ns.max(ns);
+        self.dw_min_ns = self.dw_min_ns.min(ns);
+    }
+
+    /// Charge one arming-loss window bucket and fall back to plain.
+    /// Counter increment only — no logging, no control effect.
+    fn plain(&mut self, why: PlainWhy) -> DepthEnd {
+        self.note_plain(why);
+        DepthEnd::Plain
+    }
+
+    /// Charge one arming-loss window bucket without changing the outcome
+    /// (for non-Plain exits such as EndFailed, which also end a WithDepth
+    /// streak).
+    fn note_plain(&mut self, why: PlainWhy) {
+        let c = &mut self.arm_win[why as usize];
+        *c = c.saturating_add(1);
+    }
+
+    /// Dominant bucket over the current plain window: (top name, top
+    /// count, runner-up name, runner-up count, total). Ties keep the
+    /// earlier (lower-discriminant) bucket; an empty window reports
+    /// the first bucket at 0/0.
+    fn arm_window_top(&self) -> (&'static str, u64, &'static str, u64, u64) {
+        let mut top = (0usize, 0u64);
+        let mut second = (0usize, 0u64);
+        let mut total = 0u64;
+        for (i, &c) in self.arm_win.iter().enumerate() {
+            total = total.saturating_add(c);
+            if c > top.1 {
+                second = top;
+                top = (i, c);
+            } else if c > second.1 {
+                second = (i, c);
+            }
+        }
+        (
+            PlainWhy::NAMES[top.0],
+            top.1,
+            PlainWhy::NAMES[second.0],
+            second.1,
+            total,
+        )
+    }
+
+    /// Transition-only warn: WithDepth stopped for
+    /// [`DEPTH_ARM_LOSS_TRIP_FRAMES`] consecutive frames. Names the
+    /// dominant gate over the window so the next silent stop arrives
+    /// with a cause attached.
+    fn log_arming_loss(&self) {
+        let (top, top_n, next, next_n, total) = self.arm_window_top();
+        if self.first_arm_logged {
+            warn!(
+                "depth arming lost: {total} plain frames without depth (dominant {top} {top_n}/{total}, next {next} {next_n}/{total})"
+            );
+        } else {
+            warn!(
+                "depth never armed: {total} plain frames since start (dominant {top} {top_n}/{total}, next {next} {next_n}/{total})"
+            );
+        }
+    }
+
+    /// Transition-only info: WithDepth resumed after a declared loss.
+    /// Same dominant-gate summary, so loss and recovery pair up in the log.
+    fn log_arming_recovery(&self) {
+        let (top, top_n, next, next_n, total) = self.arm_window_top();
+        info!(
+            "depth arming recovered after {total} plain frames (dominant {top} {top_n}/{total}, next {next} {next_n}/{total})"
+        );
+    }
+
     /// Depth path for `end_frame`: single late copy of the newest published
     /// generation, chained as `CompositionLayerDepthInfoKHR` views. No waits
     /// beyond bounded acquire (5ms); the GL copy
     /// itself is queued with its own FenceSync, never an SHM fence (+56
     /// reserved words are ignored). Worst case the acquire bound hits (5ms on a wedged producer); typical is immediate.
+    /// Timing-only wrapper: the static guards below cost nothing, so the
+    /// wall sample covers every attempted frame (SHM reads, gates,
+    /// bounded acquire, GL copy, epoch re-read, layer build, end()).
     fn try_end_frame_with_depth(
         &mut self,
         session_data: &SessionData,
@@ -1759,17 +1975,48 @@ impl<G: GraphicsBackend> FrameController<G> {
             && !self.submitting_null
             && self.eyes_submitted.iter().all(|eye| eye.is_some()))
         {
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::NotRender);
         }
         if !depth_enabled || !G::supports_depth() {
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::DepthDisabled);
         }
         if !session_data.is_real_session() {
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::NotReal);
         }
         if !depth_master_enabled() {
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::MasterOff);
         }
+        let t0 = now_mono_ns();
+        let end = self.try_end_frame_with_depth_inner(
+            session_data,
+            system,
+            display_time,
+            display_period,
+            depth_enabled,
+            overlays,
+        );
+        self.sample_depth_wall(now_mono_ns().saturating_sub(t0));
+        end
+    }
+
+    fn try_end_frame_with_depth_inner(
+        &mut self,
+        session_data: &SessionData,
+        system: &System,
+        display_time: xr::Time,
+        display_period: i64,
+        depth_enabled: bool,
+        overlays: Option<&OverlayMan>,
+    ) -> DepthEnd
+    where
+        for<'b> &'b crate::overlay::AnySwapchainMap:
+            TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
+        for<'a> &'a openxr_data::GraphicalSession:
+            TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
+        <G::Api as xr::Graphics>::Format: PartialEq + Clone + std::fmt::Debug,
+    {
+        // Guards already checked by the wrapper; the feed open below is
+        // the first real work (and the wall clock starts there).
         if self.depth_feed.is_none()
             && let Some(feed) = DepthFeed::open()
         {
@@ -1800,18 +2047,18 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Err(e)) => {
                 self.note_read_skip(e);
                 self.note_read_ok(false);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::from_skip(e));
             }
-            None => return DepthEnd::Plain,
+            None => return self.plain(PlainWhy::NoFeed),
         };
         // Cheap gates first: all pure predicates, no GL, no acquires.
         if !ctl.is_viable() {
             self.hb_nonviable = self.hb_nonviable.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Nonviable);
         }
         if ctl.time_ns == 0 {
             self.hb_time_zero = self.hb_time_zero.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::TimeZero);
         }
         // Age sample on every viable, timestamped read (hits and
         // window-misses alike): the distribution, not just submissions,
@@ -1856,7 +2103,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.last_armed_gen, self.frozen_run,
                 );
             }
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Repeat);
         }
         self.frozen_run = 0;
         if self.frozen_tripped {
@@ -1870,12 +2117,12 @@ impl<G: GraphicsBackend> FrameController<G> {
                 // Unreachable via is_viable, but never trust a snapshot
                 // twice: re-check rather than mis-size an import.
                 self.hb_nonviable = self.hb_nonviable.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::Nonviable);
             }
         };
         if !ctl.alloc_covers(bpp) {
             self.hb_alloc = self.hb_alloc.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Alloc);
         }
         // Zero-copy app import bound: when the producer publishes its own
         // block, the import covers app_off + w*h*bpp — the block must hold
@@ -1888,19 +2135,19 @@ impl<G: GraphicsBackend> FrameController<G> {
                 > u64::from(ctl.app_size)
         {
             self.hb_alloc = self.hb_alloc.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Alloc);
         }
         let (near_z, far_z) = match validate_near_far(ctl.near_z, ctl.far_z) {
             Some(v) => v,
             None => {
                 self.hb_clip = self.hb_clip.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::Clip);
             }
         };
         let period = depth_window_period(display_period);
         if !is_same_generation(ctl.age_ns(receipt), period, DEPTH_MARGIN_NS) {
             self.hb_window = self.hb_window.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Window);
         }
         // Dims are authoritative per read: never stretch, skip the frame.
         let (cw, ch) = match self.swapchain_data.as_ref() {
@@ -1910,7 +2157,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 // Bucketed as swapchain setup incomplete, like depth creation
                 // failures below — every plain path counts exactly one.
                 self.hb_swapchain = self.hb_swapchain.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::Swapchain);
             }
         };
         if cw == 0 || ctl.w != cw * 2 || ctl.h != ch {
@@ -1925,7 +2172,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                     ctl.w, ctl.h,
                 );
             }
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Dims);
         }
         self.depth_dims_logged = false;
         // Conservative starter: depth halves are full-eye renders with no
@@ -1937,7 +2184,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             .any(|s| s.flip_vertically)
         {
             self.hb_flip = self.hb_flip.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Flip);
         }
         if !self.backend.depth_fd_import_viable() {
             if !self.depth_import_off_logged {
@@ -1948,7 +2195,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             // other plain path (the one-time line above names the cause).
             self.evt_depth_streak = 0;
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::ImportOff);
         }
         // At most one pin: a still-outstanding prior copy means the GPU is
         // behind, so skip (plain) rather than stall it further. Checked
@@ -1962,20 +2209,20 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             self.evt_depth_streak = 0;
             self.hb_pin_held = self.hb_pin_held.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::PinHeld);
         }
         // Context check before acquire: never strand a runtime buffer on a
         // thread that cannot issue GL. Also before swapchain creation so a
         // context-less frame isn't misbucketed as a swapchain failure.
         if !self.backend.depth_context_current() {
             self.hb_no_context = self.hb_no_context.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::NoContext);
         }
         let eye_w = ctl.eye_w();
         let eye_h = ctl.h;
         if !self.ensure_depth_swapchain(session_data, eye_w, eye_h, ctl.format) {
             self.hb_swapchain = self.hb_swapchain.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::Swapchain);
         }
         // Acquire (bounded): the only CPU-blocking depth call on this path.
         // Timed for the heartbeat avg/max.
@@ -2011,17 +2258,17 @@ impl<G: GraphicsBackend> FrameController<G> {
             Some(Acquire::NoImage) => {
                 self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
                 self.hb_acquire_fail = self.hb_acquire_fail.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::AcquireFail);
             }
             Some(Acquire::TimedOut) => {
                 self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
                 self.hb_acquire_timeout = self.hb_acquire_timeout.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::AcquireTimeout);
             }
             None => {
                 self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
                 self.hb_acquire_fail = self.hb_acquire_fail.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::AcquireFail);
             }
         };
         self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
@@ -2043,7 +2290,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         {
             Self::release_depth_image(&mut self.depth_swapchain);
             self.hb_pin_fail = self.hb_pin_fail.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::PinFail);
         }
         self.pinned_slot = Some(slot);
         self.pin_hold_run = 0;
@@ -2065,7 +2312,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.unpin_now();
             self.evt_depth_streak = 0;
             self.hb_pin_held = self.hb_pin_held.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::PinHeld);
         }
         // Unfenced sample: no SHM fence exists (+56 reserved words are
         // never read). The pin keeps the slot stable across the sample.
@@ -2122,7 +2369,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
             self.evt_depth_streak = 0;
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::CopyFail);
         }
         if DEPTH_SAMPLE_LOG_ON {
             info!(
@@ -2158,14 +2405,14 @@ impl<G: GraphicsBackend> FrameController<G> {
                     }
                     self.evt_depth_streak = 0;
                     self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
-                    return DepthEnd::Plain;
+                    return self.plain(PlainWhy::EpochRaced);
                 }
             }
             _ => {
                 self.unpin_now();
                 self.evt_depth_streak = 0;
                 self.hb_epoch_raced = self.hb_epoch_raced.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::EpochRaced);
             }
         }
         // Armed by this call: both halves were copied atomically, so this
@@ -2179,7 +2426,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.unpin_now();
                 self.evt_depth_streak = 0;
                 self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::CopyFail);
             }
         };
         let color_data = match self.swapchain_data.as_ref() {
@@ -2189,7 +2436,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.unpin_now();
                 self.evt_depth_streak = 0;
                 self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
-                return DepthEnd::Plain;
+                return self.plain(PlainWhy::CopyFail);
             }
         };
         let crate::system::ViewData { flags, views } =
@@ -2249,7 +2496,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.unpin_now();
             self.evt_depth_streak = 0;
             self.hb_copy_fail = self.hb_copy_fail.saturating_add(1);
-            return DepthEnd::Plain;
+            return self.plain(PlainWhy::CopyFail);
         }
 
         let depth_infos: Vec<xr::sys::CompositionLayerDepthInfoKHR> = (0..2)
@@ -2328,6 +2575,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.prearm_run = 0;
                 self.prearm_tripped = false;
                 self.hb_end_fail = self.hb_end_fail.saturating_add(1);
+                self.note_plain(PlainWhy::EndFail);
                 if !self.depth_end_fail_warned {
                     self.depth_end_fail_warned = true;
                     warn!("depth frame end failed ({e}); frame dropped");
@@ -2476,12 +2724,25 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.poll_sum_ns as f64 / self.poll_count as f64 / 1_000_000.0
             )
         };
+        let wall_avg = if self.dw_count == 0 {
+            "—".to_string()
+        } else {
+            format!(
+                "{:.3}ms",
+                self.dw_sum_ns as f64 / self.dw_count as f64 / 1_000_000.0
+            )
+        };
+        let wall_min_ms = if self.dw_count == 0 {
+            0.0
+        } else {
+            self.dw_min_ns as f64 / 1_000_000.0
+        };
         info!(
             "depth {:.1}/s ({} frames, {} with depth, {} plain) \
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
              copy[noctx {} acq_fail {} acq_timeout {} unsync {} src_app {} src_slot {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
-             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] seen[gen {} epoch {} {}x{}]",
+             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] wall[avg {} max {:.3}ms min {:.3}ms] seen[gen {} epoch {} {}x{}]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
             self.hb_depth,
@@ -2521,6 +2782,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.acq_max_ns as f64 / 1_000_000.0,
             poll_avg,
             self.poll_max_ns as f64 / 1_000_000.0,
+            wall_avg,
+            self.dw_max_ns as f64 / 1_000_000.0,
+            wall_min_ms,
             self.last_seen_gen,
             self.last_seen_epoch,
             self.last_seen_w,
@@ -2562,6 +2826,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.poll_count = 0;
         self.poll_sum_ns = 0;
         self.poll_max_ns = 0;
+        self.dw_count = 0;
+        self.dw_sum_ns = 0;
+        self.dw_max_ns = 0;
+        self.dw_min_ns = u64::MAX;
     }
 }
 
