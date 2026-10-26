@@ -1079,6 +1079,11 @@ const DEPTH_ACQUIRE_TIMEOUT_NS: i64 = 5_000_000;
 /// frame in-aircraft while the bay flowed at ~3.4ms avg. Re-tune from
 /// heartbeat poll[avg/max] data; see the copy-latency discussion.
 const DEPTH_FENCE_POLL_TIMEOUT_MS: libc::c_int = 20;
+/// EXP12 unsync consumer sample (E12 payoff, torn-tolerant): after the pin,
+/// probe the fence with a timeout-0 poll first. If PENDING on a fresh
+/// generation, skip the 20ms wait and import_and_copy immediately (GPU-side
+/// sample of the GENERAL slot). Hardcoded ON for this experiment; no envs.
+const DEPTH_UNSYNC_ON: bool = true;
 /// Cooldown between depth swapchain creation retries after a failure.
 const DEPTH_SWAPCHAIN_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
 /// Heartbeat interval for the depth status line.
@@ -1186,12 +1191,14 @@ struct FrameController<G: GraphicsBackend> {
     hb_pin_fail: u64,
     hb_poll_timeout: u64,
     hb_poll_dead: u64,
+    hb_unsync: u64,
     hb_pin_held: u64,
     hb_swapchain: u64,
     hb_epoch_raced: u64,
     hb_end_fail: u64,
     evt_timeout_logged: bool,
     evt_dead_logged: bool,
+    evt_unsync_logged: bool,
     evt_pinheld_logged: bool,
     evt_copyfail_logged: bool,
     evt_epochrace_logged: bool,
@@ -1341,12 +1348,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_pin_fail: 0,
             hb_poll_timeout: 0,
             hb_poll_dead: 0,
+            hb_unsync: 0,
             hb_pin_held: 0,
             hb_swapchain: 0,
             hb_epoch_raced: 0,
             hb_end_fail: 0,
             evt_timeout_logged: false,
             evt_dead_logged: false,
+            evt_unsync_logged: false,
             evt_pinheld_logged: false,
             evt_copyfail_logged: false,
             evt_epochrace_logged: false,
@@ -2069,24 +2078,30 @@ impl<G: GraphicsBackend> FrameController<G> {
         // vanished segment reports Dead). No semaphore objects exist on
         // either side: the FD snapshots exactly this publish, so skipped
         // generations leave no sync debt behind.
+        // EXP12 unsync fast path: timeout-0 probe first. READY proceeds as
+        // today; PENDING on a fresh generation skips the 20ms wait and
+        // samples immediately (torn-tolerant GPU-side sample). Repeat gens
+        // never unsync (repeat gate above guarantees ctl.gen > last_armed
+        // here, re-checked defensively). Dims/epoch viability already gated
+        // above; the post-copy epoch re-read stays the staleness net.
         let t1 = now_mono_ns();
         let fence_fd = ctl.fence_fds[slot];
-        match poll_fence_fd(fence_fd, DEPTH_FENCE_POLL_TIMEOUT_MS) {
+        let mut unsync_sampled = false;
+        match poll_fence_fd(fence_fd, 0) {
             FencePoll::Ready => {}
             FencePoll::Timeout => {
-                self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
-                self.unpin_now();
-                Self::release_depth_image(&mut self.depth_swapchain);
-                if !self.evt_timeout_logged {
-                    self.evt_timeout_logged = true;
-                    warn!(
-                        "depth fence poll timed out after {}ms (first since last with-depth frame)",
-                        DEPTH_FENCE_POLL_TIMEOUT_MS
-                    );
+                let fresh = ctl.generation > self.last_armed_gen;
+                if DEPTH_UNSYNC_ON && fresh {
+                    unsync_sampled = true;
+                    self.hb_unsync = self.hb_unsync.saturating_add(1);
+                    if !self.evt_unsync_logged {
+                        self.evt_unsync_logged = true;
+                        info!(
+                            "[xrizer] exp12 unsync: sampling PENDING gen {}",
+                            ctl.generation
+                        );
+                    }
                 }
-                self.evt_depth_streak = 0;
-                self.hb_poll_timeout = self.hb_poll_timeout.saturating_add(1);
-                return DepthEnd::Plain;
             }
             FencePoll::Dead => {
                 self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
@@ -2099,6 +2114,38 @@ impl<G: GraphicsBackend> FrameController<G> {
                 self.evt_depth_streak = 0;
                 self.hb_poll_dead = self.hb_poll_dead.saturating_add(1);
                 return DepthEnd::Plain;
+            }
+        }
+        if !unsync_sampled {
+            match poll_fence_fd(fence_fd, DEPTH_FENCE_POLL_TIMEOUT_MS) {
+                FencePoll::Ready => {}
+                FencePoll::Timeout => {
+                    self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
+                    self.unpin_now();
+                    Self::release_depth_image(&mut self.depth_swapchain);
+                    if !self.evt_timeout_logged {
+                        self.evt_timeout_logged = true;
+                        warn!(
+                            "depth fence poll timed out after {}ms (first since last with-depth frame)",
+                            DEPTH_FENCE_POLL_TIMEOUT_MS
+                        );
+                    }
+                    self.evt_depth_streak = 0;
+                    self.hb_poll_timeout = self.hb_poll_timeout.saturating_add(1);
+                    return DepthEnd::Plain;
+                }
+                FencePoll::Dead => {
+                    self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
+                    self.unpin_now();
+                    Self::release_depth_image(&mut self.depth_swapchain);
+                    if !self.evt_dead_logged {
+                        self.evt_dead_logged = true;
+                        warn!("depth fence FD dead (first since last with-depth frame)");
+                    }
+                    self.evt_depth_streak = 0;
+                    self.hb_poll_dead = self.hb_poll_dead.saturating_add(1);
+                    return DepthEnd::Plain;
+                }
             }
         }
         self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
@@ -2479,7 +2526,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             "depth {:.1}/s ({} frames, {} with depth, {} plain) \
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
-             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
+             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} unsync {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
              swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] seen[gen {} epoch {} {}x{}]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
@@ -2503,6 +2550,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_acquire_timeout,
             self.hb_poll_timeout,
             self.hb_poll_dead,
+            self.hb_unsync,
             self.hb_copy_fail,
             self.hb_pin_fail,
             self.hb_pin_held,
@@ -2545,6 +2593,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.hb_acquire_timeout = 0;
         self.hb_poll_timeout = 0;
         self.hb_poll_dead = 0;
+        self.hb_unsync = 0;
         self.hb_copy_fail = 0;
         self.hb_pin_fail = 0;
         self.hb_pin_held = 0;
@@ -3328,6 +3377,7 @@ mod tests {
         ctrl.hb_acquire_timeout = 2;
         ctrl.hb_poll_timeout = 1;
         ctrl.hb_poll_dead = 1;
+        ctrl.hb_unsync = 7;
         ctrl.hb_copy_fail = 3;
         ctrl.hb_pin_fail = 2;
         ctrl.hb_pin_held = 1;
@@ -3370,6 +3420,7 @@ mod tests {
         assert_eq!(ctrl.hb_acquire_timeout, 0);
         assert_eq!(ctrl.hb_poll_timeout, 0);
         assert_eq!(ctrl.hb_poll_dead, 0);
+        assert_eq!(ctrl.hb_unsync, 0);
         assert_eq!(ctrl.hb_copy_fail, 0);
         assert_eq!(ctrl.hb_pin_fail, 0);
         assert_eq!(ctrl.hb_pin_held, 0);
