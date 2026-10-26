@@ -1178,8 +1178,6 @@ struct FrameController<G: GraphicsBackend> {
     hb_acquire_timeout: u64,
     hb_copy_fail: u64,
     hb_pin_fail: u64,
-    hb_poll_timeout: u64,
-    hb_poll_dead: u64,
     hb_unsync: u64,
     hb_src_app: u64,
     hb_src_slot: u64,
@@ -1335,8 +1333,6 @@ impl<G: GraphicsBackend> FrameController<G> {
             hb_acquire_timeout: 0,
             hb_copy_fail: 0,
             hb_pin_fail: 0,
-            hb_poll_timeout: 0,
-            hb_poll_dead: 0,
             hb_unsync: 0,
             hb_src_app: 0,
             hb_src_slot: 0,
@@ -1738,12 +1734,9 @@ impl<G: GraphicsBackend> FrameController<G> {
 
     /// Depth path for `end_frame`: single late copy of the newest published
     /// generation, chained as `CompositionLayerDepthInfoKHR` views. No waits
-    /// beyond bounded acquire (5ms) + bounded fence poll (20ms, experimental;
-    /// see const); the GL copy
+    /// beyond bounded acquire (5ms); the GL copy
     /// itself is queued with its own FenceSync, never a semaphore wait (v4
-    /// fence-FD design). Worst case both bounds hit back-to-back (~25ms on
-    /// a wedged producer); typical is immediate. Lower the poll bound if
-    /// heartbeat `poll[avg]` ever shows pressure.
+    /// fence-FD design). Worst case the acquire bound hits (5ms on a wedged producer); typical is immediate.
     fn try_end_frame_with_depth(
         &mut self,
         session_data: &SessionData,
@@ -2032,7 +2025,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         };
         self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
-        // Pin FIRST (contract order: pin → poll → sample), from the
+        // Pin FIRST (contract order: pin → sample), from the
         // generation just read. A vanished segment mid-frame fails here.
         // The pin lands late (after gates + bounded acquire), not at the
         // read: holding it across the acquire would stall the producer for
@@ -2074,12 +2067,8 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_pin_held = self.hb_pin_held.saturating_add(1);
             return DepthEnd::Plain;
         }
-        // Poll the slot's fence sync_file for producer-copy completion
-        // (bounded; the pin keeps the polled number stable — the producer
-        // closes and replaces fence FDs only on unpinned reuse, and a
-        // vanished segment reports Dead). No semaphore objects exist on
-        // either side: the FD snapshots exactly this publish, so skipped
-        // generations leave no sync debt behind.
+        // Unfenced sample: no fence exists (producer publishes -1).
+        // The pin keeps the slot stable across the sample.
         // Tear-verdict sample stamp (experiment, hardcoded on): log the
         // queue time Tc per WithDepth sample. The producer logs (rec R,
         // first-available A, gpu dt) per generation; pairing offline by
@@ -2501,7 +2490,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             "depth {:.1}/s ({} frames, {} with depth, {} plain) \
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
-             copy[noctx {} acq_fail {} acq_timeout {} poll_timeout {} poll_dead {} unsync {} src_app {} src_slot {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
+             copy[noctx {} acq_fail {} acq_timeout {} unsync {} src_app {} src_slot {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
              swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] seen[gen {} epoch {} {}x{}]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
@@ -2523,8 +2512,6 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_no_context,
             self.hb_acquire_fail,
             self.hb_acquire_timeout,
-            self.hb_poll_timeout,
-            self.hb_poll_dead,
             self.hb_unsync,
             self.hb_src_app,
             self.hb_src_slot,
@@ -2568,8 +2555,6 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.hb_no_context = 0;
         self.hb_acquire_fail = 0;
         self.hb_acquire_timeout = 0;
-        self.hb_poll_timeout = 0;
-        self.hb_poll_dead = 0;
         self.hb_unsync = 0;
         self.hb_src_app = 0;
         self.hb_src_slot = 0;
@@ -3354,8 +3339,6 @@ mod tests {
         ctrl.hb_no_context = 1;
         ctrl.hb_acquire_fail = 1;
         ctrl.hb_acquire_timeout = 2;
-        ctrl.hb_poll_timeout = 1;
-        ctrl.hb_poll_dead = 1;
         ctrl.hb_unsync = 7;
         ctrl.hb_src_app = 5;
         ctrl.hb_src_slot = 2;
@@ -3399,8 +3382,7 @@ mod tests {
         assert_eq!(ctrl.hb_no_context, 0);
         assert_eq!(ctrl.hb_acquire_fail, 0);
         assert_eq!(ctrl.hb_acquire_timeout, 0);
-        assert_eq!(ctrl.hb_poll_timeout, 0);
-        assert_eq!(ctrl.hb_poll_dead, 0);
+
         assert_eq!(ctrl.hb_unsync, 0);
         assert_eq!(ctrl.hb_src_app, 0);
         assert_eq!(ctrl.hb_src_slot, 0);

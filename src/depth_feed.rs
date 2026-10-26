@@ -37,7 +37,7 @@
 //! logs only caller-invisible states (absent segment, exhausted retries),
 //! throttled to 1/5s at `debug!`; everything else is a returned reason.
 //! `pinned[]` are single atomic words written only by the consumer
-//! (`Release` store 1 before poll/sample, 0 after own fence) and read by
+//! (`Release` store 1 before sample, 0 after own fence) and read by
 //! the producer; the logical snapshot excludes them (the physical copy
 //! reads the whole mapping but discards the pin words — they are outside
 //! the seqlock).
@@ -52,12 +52,9 @@
 //!
 //! FDs are borrowed numbers used directly (no `SCM_RIGHTS`/re-open/close,
 //! never closed by the reader); mem FDs valid only `> 2`, fence FDs valid
-//! only `> 2` or `== -1` (UNFENCED single-copy: sample without waiting).
+//! only `> 2` or `== -1` (UNFENCED: sample without waiting).
 //! `-1` until published. Memory FDs are (re)imported on epoch change.
-//! Fence FDs are single-use snapshots: always use the current read's
-//! numbers, never a cached copy across frames — the producer closes and
-//! replaces a slot's fence FD on reuse, and reuse is gated on the slot
-//! being unpinned, so a held pin keeps polled numbers stable. The app
+//! `fence_fds` are always -1 in production. The app
 //! words (`app_fd`/`app_off`/`app_size`) are additive: old producers leave
 //! them zeroed (absent), new readers use them when `app_fd > 2`.
 //! Viability is `is_viable()` AND `alloc_covers(bpp)` AND
@@ -177,13 +174,9 @@ pub struct DepthControl {
     pub generation: u64,
     pub time_ns: u64,
     pub mem_fds: [i32; 2],
-    /// One-shot fence sync_file for this generation's copy completion.
-    /// Use only the current read's numbers: the producer closes and replaces
-    /// a slot's fence FD on reuse (gated on the slot being unpinned), so a
-    /// cached copy across frames may name a closed or recycled FD. The held
-    /// pin keeps the polled numbers stable for this frame.
-    /// -1 entries mean UNFENCED (single-copy regime): no fence exists to
-    /// wait on — sample torn-tolerant with no wait.
+    /// Always -1 (UNFENCED single-copy): no fence exists — sample
+    /// torn-tolerant with no wait. A value > 2 is a contract violation
+    /// (fail safe to plain).
     pub fence_fds: [i32; 2],
     /// Zero-copy app block (whole-block OPAQUE_FD export of the app's
     /// own depth memory, -1 = absent this publish). When valid, the
@@ -532,12 +525,11 @@ impl DepthFeed {
         })
     }
 
-    /// Pin `slot` before polling/sampling it (`Release` store of 1).
-    /// Pass `slot` from the generation just read (seqlock → pin → poll →
+    /// Pin `slot` before sampling it (`Release` store of 1).
+    /// Pass `slot` from the generation just read (seqlock → pin →
     /// sample; memory reimport on epoch change precedes the pin). At most
     /// one slot may be pinned at a time — unenforced here; holding both
-    /// stalls the producer. The pin keeps the slot's fence FD stable: the
-    /// producer closes and replaces fence FDs only on unpinned reuse.
+    /// stalls the producer.
     /// Returns false when the segment is absent or `slot >= 2`.
     pub fn pin_slot(&self, slot: usize) -> bool {
         let Ok(map) = map_segment(&self.name, true) else {
