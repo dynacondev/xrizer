@@ -2091,6 +2091,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         // vanished segment reports Dead). No semaphore objects exist on
         // either side: the FD snapshots exactly this publish, so skipped
         // generations leave no sync debt behind.
+        // Tear-verdict sample stamp (experiment, hardcoded on): log the
+        // queue time Tc per WithDepth sample. The producer logs (rec R,
+        // first-available A, gpu dt) per generation; pairing offline by
+        // gen gives clean (Tc > A) / certain-overlap (Tc < R) / hazard.
+        const DEPTH_SAMPLE_LOG_ON: bool = true;
         // EXP12 unsync fast path: timeout-0 probe first. READY proceeds as
         // today; PENDING on a fresh generation skips the 20ms wait and
         // samples immediately (torn-tolerant GPU-side sample). Repeat gens
@@ -2184,6 +2189,15 @@ impl<G: GraphicsBackend> FrameController<G> {
         // only the generation just read (single-snapshot discipline), and
         // the post-copy epoch re-read below is the staleness net that
         // discards a copy made from recycled FDs.
+        if DEPTH_SAMPLE_LOG_ON {
+            let tc_ns = now_mono_ns();
+            info!(
+                "[xrizer] depth sample gen {} tc {}.{:03}",
+                ctl.generation,
+                tc_ns / 1_000_000_000,
+                (tc_ns / 1_000_000) % 1000,
+            );
+        }
         let res = self.backend.import_and_copy_depth_fd(&DepthFdRequest {
             epoch: ctl.epoch,
             w: ctl.w,
