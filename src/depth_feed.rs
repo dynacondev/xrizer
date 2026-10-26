@@ -12,17 +12,18 @@
 //! +12 u32 w, +16 u32 h   full side-by-side mirror dims (eye_w = w/2)
 //! +20 i32 format      126 = D32F (preferred), 130 = D32S8 (fallback)
 //! +24 u32 epoch       bumped per mirror rebuild; reimport all FDs on change
-//! +28 u32 reserved0   zero
+//! +28 i32 app_fd      app depth block FD (-1 = none this publish)
 //! +32 u64 generation  latest completed generation (0 = nothing published)
 //! +40 u64 time_mono_ns  CLOCK_MONOTONIC at copy completion
 //! +48 i32 mem_fds[2]    dma-buf memory, imported once per epoch
 //! +56 i32 fence_fds[2]  one-shot sync_file snapshot per publish
-//!                         (-1 until published, valid only > 2)
+//!                         (-1 until published or UNFENCED single-copy,
+//!                         valid only > 2 or == -1)
 //! +64 u32 alloc_bytes import size must be <= this; 0 = unknown
 //! +68 f32 near_z, +72 f32 far_z  clip planes
-//! +76 u32 reserved_pad  keeps pinned 8-byte aligned as a pair
+//! +76 u32 app_size    app block size (import size; 0 = unknown)
 //! +80 u32 pinned[2]   consumer-written only, OUTSIDE the seqlock
-//! +88 u32 reserved[2] zero
+//! +88 u64 app_off     app image offset within app_fd block
 //! ```
 //!
 //! Reader discipline: fresh `shm_open`+`mmap` per call (producer
@@ -52,16 +53,18 @@
 //! `CLOCK_MONOTONIC` timestamps correlate frames: `age = receipt - header`.
 //!
 //! FDs are borrowed numbers used directly (no `SCM_RIGHTS`/re-open/close,
-//! never closed by the reader); valid only `> 2`, `-1` until published.
-//! Memory FDs are (re)imported on epoch change. Fence FDs are single-use
-//! snapshots: always use the current read's numbers, never a cached copy
-//! across frames — the producer closes and replaces a slot's fence FD on
-//! reuse, and reuse is gated on the slot being unpinned, so a held pin
-//! keeps polled numbers stable. `reserved0/reserved_pad/reserved`
-//! must be tolerated nonzero (forward-compat; never checked). Viability
-//! is `is_viable()` AND `alloc_covers(bpp)` AND `validate_near_far()` —
-//! none implies the others. `eye_w() == w/2` truncates; odd `w` is rejected
-//! by `dims_plausible`, never rounded.
+//! never closed by the reader); mem FDs valid only `> 2`, fence FDs valid
+//! only `> 2` or `== -1` (UNFENCED single-copy: sample without waiting).
+//! `-1` until published. Memory FDs are (re)imported on epoch change.
+//! Fence FDs are single-use snapshots: always use the current read's
+//! numbers, never a cached copy across frames — the producer closes and
+//! replaces a slot's fence FD on reuse, and reuse is gated on the slot
+//! being unpinned, so a held pin keeps polled numbers stable. The app
+//! words (`app_fd`/`app_off`/`app_size`) are additive: old producers leave
+//! them zeroed (absent), new readers use them when `app_fd > 2`.
+//! Viability is `is_viable()` AND `alloc_covers(bpp)` AND
+//! `validate_near_far()` — none implies the others. `eye_w() == w/2`
+//! truncates; odd `w` is rejected by `dims_plausible`, never rounded.
 //! The reader never `shm_unlink`s/truncates/writes the header except
 //! `pinned[]`; mappings are `munmap`ed+closed on drop with no caching, and
 //! disappearance is treated like generation 0 (drop imports, plain frame,
@@ -113,7 +116,8 @@ pub const READ_RETRIES: usize = 4;
 /// Mirror of the C `rx_shm_v4`. Must stay 96 bytes with the exact offsets
 /// below. Keep in sync with `reprojex/src/shm.h`. Offsets are unchanged
 /// from v3; only `version` and the `fence_fds` semantics changed (v3 used
-/// timeline semaphores, v4 exports one-shot fence sync_files).
+/// timeline semaphores, v4 exports one-shot fence sync_files), plus the
+/// additive zero-copy app words (+28/+76/+88, still version 4).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct XdShmHeaderV4 {
@@ -124,17 +128,17 @@ pub struct XdShmHeaderV4 {
     pub h: u32,              // +16
     pub format: i32,         // +20
     pub epoch: u32,          // +24
-    pub reserved0: u32,      // +28
+    pub app_fd: i32,         // +28 app depth block FD (-1 = none)
     pub generation: u64,     // +32
     pub time_mono_ns: u64,   // +40
     pub mem_fds: [i32; 2],   // +48 dma-buf memory
-    pub fence_fds: [i32; 2], // +56 one-shot sync_file per publish
+    pub fence_fds: [i32; 2], // +56 one-shot sync_file per publish, -1 = UNFENCED single-copy
     pub alloc_bytes: u32,    // +64
     pub near_z: f32,         // +68
     pub far_z: f32,          // +72
-    pub reserved_pad: u32,   // +76
+    pub app_size: u32,       // +76 app block size (import size)
     pub pinned: [u32; 2],    // +80 consumer-written, outside seqlock
-    pub reserved: [u32; 2],  // +88
+    pub app_off: u64,        // +88 app image offset within app_fd block
 }
 
 // Pinned at build time, not just under test: a drifted offset is a
@@ -148,7 +152,7 @@ const _: () = {
     assert!(std::mem::offset_of!(XdShmHeaderV4, h) == 16);
     assert!(std::mem::offset_of!(XdShmHeaderV4, format) == 20);
     assert!(std::mem::offset_of!(XdShmHeaderV4, epoch) == 24);
-    assert!(std::mem::offset_of!(XdShmHeaderV4, reserved0) == 28);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, app_fd) == 28);
     assert!(std::mem::offset_of!(XdShmHeaderV4, generation) == 32);
     assert!(std::mem::offset_of!(XdShmHeaderV4, time_mono_ns) == 40);
     assert!(std::mem::offset_of!(XdShmHeaderV4, mem_fds) == 48);
@@ -156,10 +160,10 @@ const _: () = {
     assert!(std::mem::offset_of!(XdShmHeaderV4, alloc_bytes) == 64);
     assert!(std::mem::offset_of!(XdShmHeaderV4, near_z) == 68);
     assert!(std::mem::offset_of!(XdShmHeaderV4, far_z) == 72);
-    assert!(std::mem::offset_of!(XdShmHeaderV4, reserved_pad) == 76);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, app_size) == 76);
     assert!(std::mem::offset_of!(XdShmHeaderV4, pinned) == PINNED_OFF);
     assert!(std::mem::offset_of!(XdShmHeaderV4, pinned) + 4 == 84);
-    assert!(std::mem::offset_of!(XdShmHeaderV4, reserved) == 88);
+    assert!(std::mem::offset_of!(XdShmHeaderV4, app_off) == 88);
 };
 
 /// Snapshot of the v4 control header. `pinned[]` is deliberately absent:
@@ -180,7 +184,17 @@ pub struct DepthControl {
     /// a slot's fence FD on reuse (gated on the slot being unpinned), so a
     /// cached copy across frames may name a closed or recycled FD. The held
     /// pin keeps the polled numbers stable for this frame.
+    /// -1 entries mean UNFENCED (single-copy regime): no fence exists to
+    /// wait on — sample torn-tolerant with no wait.
     pub fence_fds: [i32; 2],
+    /// Zero-copy app block (whole-block OPAQUE_FD export of the app's
+    /// own depth memory, -1 = absent this publish). When valid, the
+    /// consumer imports it with `app_off` and samples the pick directly.
+    pub app_fd: i32,
+    /// Byte offset of the pick image within `app_fd`.
+    pub app_off: u64,
+    /// Block size of `app_fd` (import size; 0 = unknown, tolerate).
+    pub app_size: u32,
     pub near_z: f32,
     pub far_z: f32,
     /// Observed segment length; viable only when exactly 96.
@@ -222,16 +236,23 @@ impl DepthControl {
         self.alloc_bytes == 0 || self.want_bytes(bpp) <= u64::from(self.alloc_bytes)
     }
 
-    /// All four FDs must be real (stdin/stdout/stderr are never depth).
+    /// All mem FDs must be real (stdin/stdout/stderr are never depth).
     /// The producer's pre-publish sentinel is -1. Memory FDs persist per
-    /// epoch; fence FDs are single-use snapshots (see field docs).
-    /// Intentionally strict (first publish after a build leaves the idle
-    /// slot at -1, forcing one plain frame): per-slot viability would arm
-    /// a frame earlier at the cost of a second gate shape for zero safety
-    /// gain — the snapshot's other-slot numbers are meaningless for the
-    /// sampled generation anyway.
+    /// epoch; fence FDs are single-use snapshots (see field docs), except
+    /// -1 fence entries which mean UNFENCED (single-copy: no fence exists,
+    /// sample without waiting). Intentionally strict on mem (first publish
+    /// after a build leaves the idle slot at -1, forcing one plain frame):
+    /// per-slot viability would arm a frame earlier at the cost of a second
+    /// gate shape for zero safety gain — the snapshot's other-slot numbers
+    /// are meaningless for the sampled generation anyway.
     pub fn fds_valid(&self) -> bool {
-        self.mem_fds.iter().all(|&f| f > 2) && self.fence_fds.iter().all(|&f| f > 2)
+        self.mem_fds.iter().all(|&f| f > 2)
+            && self.fence_fds.iter().all(|&f| f > 2 || f == -1)
+    }
+
+    /// Whether a valid app zero-copy export rides this snapshot.
+    pub fn app_valid(&self) -> bool {
+        self.app_fd > 2
     }
 
     /// Reader-policy gate: even `w` required for the SBS split. The wire
@@ -247,11 +268,11 @@ impl DepthControl {
 
     /// Full viability gate: published epoch+generation, depth format
     /// (D32F preferred, D32S8 fallback per `reprojex/src/catalog.c`), plausible
-    /// dims, exact 96-byte segment, all FDs real. `epoch != 0` has no
-    /// contract sentence; it holds because the producer zero-inits the
-    /// mapping and its epoch is process-monotonic starting at 1. `alloc`
-    /// and `near/far` are deliberately excluded — callers must AND
-    /// [`Self::alloc_covers`] and [`validate_near_far`].
+    /// dims, exact 96-byte segment, mem FDs real and fence FDs real-or-UNFENCED.
+    /// `epoch != 0` has no contract sentence; it holds because the producer
+    /// zero-inits the mapping and its epoch is process-monotonic starting
+    /// at 1. `alloc` and `near/far` are deliberately excluded — callers
+    /// must AND [`Self::alloc_covers`] and [`validate_near_far`].
     pub fn is_viable(&self) -> bool {
         self.epoch != 0
             && self.generation != 0
@@ -476,6 +497,9 @@ impl DepthFeed {
                 far_z: h.far_z,
                 seg_len: map_len,
                 alloc_bytes: h.alloc_bytes,
+                app_fd: h.app_fd,
+                app_off: h.app_off,
+                app_size: h.app_size,
             });
         }
         // Exhausted: caller-invisible (no snapshot to bucket), so throttled
@@ -907,7 +931,7 @@ mod tests {
             h,
             format: FORMAT_D32F,
             epoch: 7,
-            reserved0: 0,
+            app_fd: -1,
             generation,
             time_mono_ns: now_mono_ns(),
             mem_fds: [11, 12],
@@ -915,9 +939,9 @@ mod tests {
             alloc_bytes: 8 * 2 * 4,
             near_z: 0.00742,
             far_z: 10000.0,
-            reserved_pad: 0,
+            app_size: 0,
             pinned: [0, 0],
-            reserved: [0, 0],
+            app_off: 0,
         };
         tweak(&mut hdr);
         unsafe {
@@ -974,7 +998,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, h), 16);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, format), 20);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, epoch), 24);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, reserved0), 28);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, app_fd), 28);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, generation), 32);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, time_mono_ns), 40);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, mem_fds), 48);
@@ -982,10 +1006,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, alloc_bytes), 64);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, near_z), 68);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, far_z), 72);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, reserved_pad), 76);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, app_size), 76);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, pinned), PINNED_OFF);
         assert_eq!(std::mem::offset_of!(XdShmHeaderV4, pinned) + 4, 84);
-        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, reserved), 88);
+        assert_eq!(std::mem::offset_of!(XdShmHeaderV4, app_off), 88);
     }
 
     #[test]
@@ -1033,19 +1057,22 @@ mod tests {
 
     #[test]
     fn reserved_nonzero_still_viable_and_alloc_zero_tolerated() {
-        // Forward-compat: reserved words are never checked.
+        // Forward-compat: app words are never viability-gated (absent or
+        // garbage, the slot path still arms; import success is decided
+        // later, per frame).
         let pid = std::process::id();
         let name = format!("/xrizer-depth-test-{pid}-rsv");
         let _seg = make_seg(&name, 8, 2, 3, |h| {
-            h.reserved0 = 0xdead_beef;
-            h.reserved_pad = 1;
-            h.reserved = [7, 8];
+            h.app_fd = -1;
+            h.app_off = 0xdead_beef_dead_beef;
+            h.app_size = 1;
             h.alloc_bytes = 0;
         });
         let ctl = DepthFeed::open_for_test(&name)
             .read_control()
             .expect("readable");
-        assert!(ctl.is_viable(), "reserved nonzero must not gate");
+        assert!(ctl.is_viable(), "app words must not gate");
+        assert!(!ctl.app_valid(), "app_fd -1 is absent");
         assert!(
             ctl.alloc_covers(4),
             "alloc==0 tolerates any want as unknown"
@@ -1054,6 +1081,18 @@ mod tests {
             ctl.alloc_covers(u64::MAX),
             "alloc==0 tolerates even huge want"
         );
+        // Present-but-odd app export still arms (import decides later).
+        let name = format!("/xrizer-depth-test-{pid}-rsv2");
+        let _seg = make_seg(&name, 8, 2, 3, |h| {
+            h.app_fd = 45;
+            h.app_off = 7;
+            h.app_size = 9;
+        });
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(ctl.is_viable(), "odd app export must not gate");
+        assert!(ctl.app_valid(), "app_fd 45 is present");
     }
 
     #[test]
@@ -1135,6 +1174,9 @@ mod tests {
             far_z: 200.0,
             seg_len: HEADER_SIZE,
             alloc_bytes: 0,
+            app_fd: -1,
+            app_off: 0,
+            app_size: 0,
         };
         assert_eq!(mk(8).eye_w(), 4);
         assert_eq!(mk(7).eye_w(), 3);
@@ -1235,7 +1277,9 @@ mod tests {
     #[test]
     fn sentinel_and_low_fds_rejected() {
         let pid = std::process::id();
-        let cases: [(i32, i32); 5] = [(-1, 21), (0, 21), (1, 21), (2, 21), (11, 2)];
+        // mem must be real; fence accepts real or UNFENCED (-1). Low
+        // fence words 0/1/2 are still dead (neither a valid FD nor -1).
+        let cases: [(i32, i32); 4] = [(-1, 21), (0, 21), (1, 21), (2, 21)];
         for (i, (mem0, fence0)) in cases.iter().enumerate() {
             let name = format!("/xrizer-depth-test-{pid}-fd{i}");
             let _seg = make_seg(&name, 8, 2, 3, |h| {
@@ -1248,6 +1292,34 @@ mod tests {
             assert!(
                 !ctl.fds_valid() && !ctl.is_viable(),
                 "fds ({mem0}, {fence0}) must not arm"
+            );
+        }
+        // Fence UNFENCED (-1) with real mem arms (single-copy regime).
+        {
+            let name = format!("/xrizer-depth-test-{pid}-fd-unfenced");
+            let _seg = make_seg(&name, 8, 2, 3, |h| {
+                h.fence_fds = [-1, -1];
+            });
+            let ctl = DepthFeed::open_for_test(&name)
+                .read_control()
+                .expect("header readable");
+            assert!(
+                ctl.fds_valid() && ctl.is_viable(),
+                "fence -1 with real mem must arm (UNFENCED)"
+            );
+        }
+        // Low fence word 2 (not >2, not -1) still rejects.
+        {
+            let name = format!("/xrizer-depth-test-{pid}-fd-lowfence");
+            let _seg = make_seg(&name, 8, 2, 3, |h| {
+                h.fence_fds[0] = 2;
+            });
+            let ctl = DepthFeed::open_for_test(&name)
+                .read_control()
+                .expect("header readable");
+            assert!(
+                !ctl.fds_valid() && !ctl.is_viable(),
+                "fence 2 must not arm"
             );
         }
         // Second lane is checked too, plus the all-sentinel pre-publish.
@@ -1272,6 +1344,35 @@ mod tests {
             .read_control()
             .expect("header readable");
         assert!(!ctl.fds_valid() && !ctl.is_viable(), "all -1 must not arm");
+    }
+
+    #[test]
+    fn app_words_round_trip_and_gate() {
+        let pid = std::process::id();
+        // Absent export: app_fd -1, zero offset/size.
+        let name = format!("/xrizer-depth-test-{pid}-app-absent");
+        let _seg = make_seg(&name, 8, 2, 3, |_| {});
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(!ctl.app_valid(), "default app_fd -1 is absent");
+        assert_eq!(ctl.app_off, 0);
+        assert_eq!(ctl.app_size, 0);
+        assert!(ctl.is_viable(), "absent app export must not gate slot path");
+        // Present export: FD + offset + size ride the snapshot.
+        let name = format!("/xrizer-depth-test-{pid}-app-present");
+        let _seg = make_seg(&name, 8, 2, 3, |h| {
+            h.app_fd = 45;
+            h.app_off = 1751040;
+            h.app_size = 33554432;
+        });
+        let ctl = DepthFeed::open_for_test(&name)
+            .read_control()
+            .expect("readable");
+        assert!(ctl.app_valid(), "app_fd 45 is present");
+        assert_eq!(ctl.app_off, 1751040);
+        assert_eq!(ctl.app_size, 33554432);
+        assert!(ctl.is_viable(), "app export must not gate viability");
     }
 
     #[test]
@@ -1350,6 +1451,9 @@ mod tests {
             far_z: 10000.0,
             seg_len: HEADER_SIZE,
             alloc_bytes: 64,
+            app_fd: -1,
+            app_off: 0,
+            app_size: 0,
         };
         // 90 Hz frame: 11_111_111ns period, 2ms margin.
         let receipt = 10_000_000_000u64;

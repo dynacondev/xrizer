@@ -30,9 +30,15 @@ pub struct GlData {
     /// Last FD key whose import failed + earliest retry time. A failed
     /// import for an epoch never succeeds later (FDs are fixed per epoch),
     /// so back off instead of paying blocking GL errors every frame.
-    fd_failed_key: Option<(u32, u32, u32, i32)>,
+    fd_failed_key: Option<FdImportKey>,
     fd_next_retry: Option<Instant>,
 }
+
+/// Import identity: ring geometry plus the zero-copy app triple. `None`
+/// app means the slot-mirror path; `Some` means direct app-block import.
+/// The app triple rides along because FD numbers recycle after close —
+/// (epoch, fd, off, size) must all match to reuse GL objects.
+type FdImportKey = (u32, u32, u32, i32, Option<(i32, u64, u32)>);
 
 /// Cooldown between import retries for the same failing key.
 const FD_IMPORT_RETRY_COOLDOWN: Duration = Duration::from_secs(2);
@@ -50,10 +56,25 @@ struct DepthFdCache {
     vk_format: i32,
     alloc_bytes: u32,
     slots: [DepthFdSlot; 2],
+    /// Zero-copy app import (whole-block import, pick at `app_off`).
+    /// `None` when the publish carries no app export or its import failed
+    /// (slot path stays the fallback either way).
+    app: Option<AppImport>,
     /// In-flight copy completion fence: (fence bits, generation). At most
     /// one — the caller holds at most one SHM pin, so at most one copy is
     /// ever outstanding. Polled (zero timeout) before the next pin.
     pending: Option<(u64, u64)>,
+}
+
+/// Direct app-block import: one GL memory object + one full-pick texture
+/// reading the pick at `off` bytes into the block.
+#[derive(Copy, Clone)]
+struct AppImport {
+    fd: i32,
+    off: u64,
+    size: u32,
+    mem: u32,
+    tex: u32,
 }
 
 /// Required GL extensions for the FD import path (memory only: fence
@@ -224,6 +245,13 @@ unsafe fn get_visualid(
         } else {
             Some((&raw const (*visual).visualid).read() as u32)
         }
+    }
+}
+
+impl DepthFdCache {
+    /// Key identity for reimport decisions (see `FdImportKey`).
+    fn app_key(&self) -> Option<(i32, u64, u32)> {
+        self.app.map(|a| (a.fd, a.off, a.size))
     }
 }
 
@@ -548,13 +576,19 @@ impl GraphicsBackend for GlData {
             return inert();
         }
         let dst = self.depth_images[req.depth_image_index];
+        // Zero-copy app source when the publish carries it: import the
+        // app's own block (pick at app_off) and copy from the pick
+        // directly — no mirror copy exists in single-copy mode. Falls
+        // back to the slot mirror below when absent or unimportable.
+        let use_app = req.app_fd > 2;
         // Reimport on epoch/dims/format change (old GL objects first).
         // Segment size is deliberately NOT part of the identity.
-        let key = (req.epoch, req.w, req.h, req.vk_format);
+        let app_key = use_app.then_some((req.app_fd, req.app_off, req.app_size));
+        let key = (req.epoch, req.w, req.h, req.vk_format, app_key);
         let cached_key = self
             .depth_fd
             .as_ref()
-            .map(|c| (c.epoch, c.w, c.h, c.vk_format));
+            .map(|c| (c.epoch, c.w, c.h, c.vk_format, c.app_key()));
         if cached_key != Some(key) {
             // Failed imports never heal for this key (FDs are fixed per
             // epoch): skip the blocking GL errors until the key changes or
@@ -576,6 +610,21 @@ impl GraphicsBackend for GlData {
                 warn!(
                     "depth FD setup rejected: want {want} > alloc {} (epoch {}, {}x{} fmt {})",
                     req.alloc_bytes, req.epoch, req.w, req.h, req.vk_format,
+                );
+                self.fd_failed_key = Some(key);
+                self.fd_next_retry = Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
+                return inert();
+            }
+            // App-block bound (zero-copy): off + w*h*bpp must fit the
+            // published block (0 = unknown, tolerate). Misaligned offsets
+            // fail at texture-storage time below and fall back to slots.
+            if use_app
+                && req.app_size != 0
+                && req.app_off.saturating_add(want) > req.app_size as u64
+            {
+                warn!(
+                    "depth FD setup rejected: app off {} + want {want} > app_size {} (epoch {})",
+                    req.app_off, req.app_size, req.epoch,
                 );
                 self.fd_failed_key = Some(key);
                 self.fd_next_retry = Some(Instant::now() + FD_IMPORT_RETRY_COOLDOWN);
@@ -603,6 +652,27 @@ impl GraphicsBackend for GlData {
             self.drop_depth_imports();
             match Self::import_fd_slots(req, bpp, internal) {
                 Some(slots) => {
+                    // Best-effort zero-copy app import (same key family):
+                    // failure only drops the fast path — the slot copy
+                    // below still carries the frame (and the failed-key
+                    // cooldown above covers the retry rate).
+                    let app = if use_app {
+                        Self::import_app(req, bpp, internal)
+                    } else {
+                        None
+                    };
+                    if use_app && app.is_none() {
+                        warn!(
+                            "depth FD app import failed (epoch {}, {}x{} fmt {} fd {} off {} size {}), slot fallback",
+                            req.epoch,
+                            req.w,
+                            req.h,
+                            req.vk_format,
+                            req.app_fd,
+                            req.app_off,
+                            req.app_size,
+                        );
+                    }
                     self.depth_fd = Some(DepthFdCache {
                         epoch: req.epoch,
                         w: req.w,
@@ -610,6 +680,7 @@ impl GraphicsBackend for GlData {
                         vk_format: req.vk_format,
                         alloc_bytes: req.alloc_bytes,
                         slots,
+                        app,
                         pending: None,
                     });
                     self.fd_failed_key = None;
@@ -625,19 +696,23 @@ impl GraphicsBackend for GlData {
         let Some(cache) = self.depth_fd.as_mut() else {
             return inert();
         };
-        // No GL-side sync here by design: the caller polled this
-        // generation's fence sync_file (bounded, while holding the slot's
-        // SHM pin) before calling, so the producer's copy completed. There
-        // is no semaphore object to wait on — fence FDs are single-use
-        // snapshots with no persistent state to go stale across skipped
-        // generations, which is what made the previous semaphore design
-        // unsound (stale-signal early sample, then a never-completing wait
-        // wedging the pin forever).
+        // Copy source: the app pick when its import is live (zero-copy,
+        // torn-tolerant unsync sample of the app's own depth), else the
+        // slot mirror written by the producer's copy. No GL-side sync
+        // here by design (see below).
         let slot = (req.generation % 2) as usize;
+        let (src_tex, src_label) = match cache.app {
+            Some(a) => (a.tex, "app"),
+            None => (cache.slots[slot].tex, "slot"),
+        };
+        // No GL-side sync here by design: the caller samples torn-tolerant
+        // (UNFENCED single-copy or timeout-0 unsync probe) instead of any
+        // semaphore wait — fence FDs are single-use snapshots with no
+        // persistent state to go stale across skipped generations.
         let ok = unsafe {
             for eye in 0..2u32 {
                 gl::CopyImageSubData(
-                    cache.slots[slot].tex,
+                    src_tex,
                     gl::TEXTURE_2D,
                     0,
                     (eye * req.eye_w) as i32,
@@ -657,6 +732,7 @@ impl GraphicsBackend for GlData {
             gl::GetError() == gl::NO_ERROR
         };
         if !ok {
+            debug!("depth FD copy failed (src {src_label} gen {})", req.generation);
             return inert();
         }
         let sync = unsafe { gl::FenceSync(gl::SYNC_GPU_COMMANDS_COMPLETE, 0) };
@@ -721,6 +797,12 @@ impl GraphicsBackend for GlData {
                     gl::DeleteTextures(1, &s.tex);
                     if let Some(f) = DEPTH_EXT.delete_memory {
                         f(1, &s.mem);
+                    }
+                }
+                if let Some(a) = cache.app {
+                    gl::DeleteTextures(1, &a.tex);
+                    if let Some(f) = DEPTH_EXT.delete_memory {
+                        f(1, &a.mem);
                     }
                 }
             }
@@ -842,6 +924,87 @@ impl GlData {
                 f(1, &s.mem);
             }
         }
+    }
+
+    /// Import the app's own depth block once and bind a full-pick texture
+    /// reading the pick at `req.app_off`. Same dup-and-keep FD discipline
+    /// as [`Self::import_fd_slots`]. `None` on any failure (misaligned
+    /// offset, undersized block, driver refusal) — the caller falls back
+    /// to the slot mirror.
+    fn import_app(req: &DepthFdRequest, bpp: u64, internal: u32) -> Option<AppImport> {
+        let want = (req.w as u64)
+            .saturating_mul(req.h as u64)
+            .saturating_mul(bpp);
+        let size = if req.app_size != 0 {
+            (req.app_size as u64).max(req.app_off.saturating_add(want))
+        } else {
+            req.app_off.saturating_add(want)
+        };
+        if size == 0 || size > u64::from(u32::MAX) {
+            return None;
+        }
+        let import_mem = DEPTH_EXT.import_memory_fd?;
+        let create_mem = DEPTH_EXT.create_memory?;
+        let tex_storage = DEPTH_EXT.texture_storage_mem_2d?;
+        let mut mem = 0;
+        let mut tex = 0;
+        // Defensive dup (see import_fd_slots docs): the import sees only
+        // our number; success leaves it open by design.
+        let mem_fd = unsafe { libc::dup(req.app_fd) };
+        if mem_fd < 0 {
+            return None;
+        }
+        for _ in 0..8 {
+            if unsafe { gl::GetError() } == gl::NO_ERROR {
+                break;
+            }
+        }
+        let ok = unsafe {
+            create_mem(1, &mut mem);
+            if gl::GetError() != gl::NO_ERROR || mem == 0 {
+                false
+            } else {
+                import_mem(mem, size, HANDLE_TYPE_OPAQUE_FD, mem_fd);
+                if gl::GetError() != gl::NO_ERROR {
+                    false
+                } else {
+                    gl::GenTextures(1, &mut tex);
+                    gl::BindTexture(gl::TEXTURE_2D, tex);
+                    tex_storage(
+                        tex,
+                        1,
+                        internal,
+                        req.w as i32,
+                        req.h as i32,
+                        mem,
+                        req.app_off,
+                    );
+                    gl::BindTexture(gl::TEXTURE_2D, 0);
+                    gl::GetError() == gl::NO_ERROR && tex != 0
+                }
+            }
+        };
+        if !ok {
+            unsafe {
+                libc::close(mem_fd);
+                if tex != 0 {
+                    gl::DeleteTextures(1, &tex);
+                }
+                if mem != 0
+                    && let Some(f) = DEPTH_EXT.delete_memory
+                {
+                    f(1, &mem);
+                }
+            }
+            return None;
+        }
+        Some(AppImport {
+            fd: req.app_fd,
+            off: req.app_off,
+            size: req.app_size,
+            mem,
+            tex,
+        })
     }
 }
 

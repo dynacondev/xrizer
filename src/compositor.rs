@@ -1895,6 +1895,19 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_alloc = self.hb_alloc.saturating_add(1);
             return DepthEnd::Plain;
         }
+        // Zero-copy app import bound: when the producer publishes its own
+        // block, the import covers app_off + w*h*bpp — the block must hold
+        // it (0 = unknown, tolerate like the slot bound above).
+        if ctl.app_valid()
+            && ctl.app_size != 0
+            && ctl
+                .app_off
+                .saturating_add(ctl.want_bytes(bpp))
+                > u64::from(ctl.app_size)
+        {
+            self.hb_alloc = self.hb_alloc.saturating_add(1);
+            return DepthEnd::Plain;
+        }
         let (near_z, far_z) = match validate_near_far(ctl.near_z, ctl.far_z) {
             Some(v) => v,
             None => {
@@ -2087,6 +2100,21 @@ impl<G: GraphicsBackend> FrameController<G> {
         let t1 = now_mono_ns();
         let fence_fd = ctl.fence_fds[slot];
         let mut unsync_sampled = false;
+        if fence_fd <= 2 {
+            // UNFENCED single-copy publish (fence -1): the inbatch copy
+            // retires with the app batch, so no fence exists to wait on.
+            // Sample immediately, torn-tolerant — same steady state as
+            // the unsync probe path below, minus the probe.
+            unsync_sampled = true;
+            self.hb_unsync = self.hb_unsync.saturating_add(1);
+            if !self.evt_unsync_logged {
+                self.evt_unsync_logged = true;
+                info!(
+                    "[xrizer] exp12 unfenced: sampling gen {} with no fence (single-copy)",
+                    ctl.generation
+                );
+            }
+        } else {
         match poll_fence_fd(fence_fd, 0) {
             FencePoll::Ready => {}
             FencePoll::Timeout => {
@@ -2116,6 +2144,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 return DepthEnd::Plain;
             }
         }
+        } // end fenced timeout-0 probe (unfenced skips both polls)
         if !unsync_sampled {
             match poll_fence_fd(fence_fd, DEPTH_FENCE_POLL_TIMEOUT_MS) {
                 FencePoll::Ready => {}
@@ -2166,6 +2195,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             eye_w,
             eye_h,
             alloc_bytes: ctl.alloc_bytes,
+            app_fd: ctl.app_fd,
+            app_off: ctl.app_off,
+            app_size: ctl.app_size,
         });
         // Release before end (color path releases before end too). Scope
         // discipline: every post-acquire path releases exactly once.

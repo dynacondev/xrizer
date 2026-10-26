@@ -97,6 +97,9 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
     /// slot's SHM pin across this call and has already polled the slot's
     /// fence FD for producer-copy completion — no semaphore wait happens
     /// here. The backend fences its own completion for deferred unpin.
+    /// Zero-copy: when the request carries a valid app block, the backend
+    /// imports that (with offset) and copies from the pick directly; the
+    /// slot mirror is then only a fallback/legacy path.
     /// Default: unsupported (keeps other backends compiling untouched).
     fn import_and_copy_depth_fd(&mut self, req: &DepthFdRequest) -> DepthFdResult {
         let _ = req;
@@ -128,10 +131,18 @@ pub struct DepthFdRequest {
     pub depth_image_index: usize,
     pub eye_w: u32,
     pub eye_h: u32,
-    /// Driver-reported allocation size from the SHM header. The GL import
+    /// Driver-reported mirror allocation size from the SHM header. The GL import
     /// covers the full allocation; `want > alloc` (non-zero) rejects the
     /// setup before any GL call. 0 = unknown, use `w*h*bpp`.
     pub alloc_bytes: u32,
+    /// Zero-copy app block: whole-block FD of the app's own depth memory
+    /// (`-1` = absent this publish), byte offset of the pick within it, and
+    /// block size. When valid the backend imports this instead of the slot
+    /// mirror and the copy reads the pick directly (no mirror copy exists
+    /// in single-copy mode).
+    pub app_fd: i32,
+    pub app_off: u64,
+    pub app_size: u32,
 }
 
 /// Outcome of [`GraphicsBackend::import_and_copy_depth_fd`].
