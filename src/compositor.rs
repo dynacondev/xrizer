@@ -1296,6 +1296,11 @@ struct FrameController<G: GraphicsBackend> {
     dw_sum_ns: u64,
     dw_max_ns: u64,
     dw_min_ns: u64,
+    sg_gates: SegStat,
+    sc_copy: SegStat,
+    se_depth_end: SegStat,
+    sp_plain_end: SegStat,
+    sl_sample_log: SegStat,
     hb_depth_swapchains: u64,
     age_stats: AgeStats,
     acq_count: u64,
@@ -1315,6 +1320,43 @@ struct FrameController<G: GraphicsBackend> {
     last_seen_h: u32,
 }
 supported_backends_enum!(enum DynFrameController: FrameController);
+
+/// Per-segment wall timings inside the depth path (gates, copy,
+/// depth/ plain end calls, sample log line). Heartbeat stats like the
+/// acquire/poll timings; count/sum/max only, reset per window.
+#[derive(Default)]
+struct SegStat {
+    count: u64,
+    sum_ns: u64,
+    max_ns: u64,
+}
+
+impl SegStat {
+    fn sample(&mut self, ns: u64) {
+        self.count = self.count.saturating_add(1);
+        self.sum_ns = self.sum_ns.saturating_add(ns);
+        self.max_ns = self.max_ns.max(ns);
+    }
+
+    fn avg_ms(&self) -> String {
+        if self.count == 0 {
+            "—".to_string()
+        } else {
+            format!(
+                "{:.3}ms",
+                self.sum_ns as f64 / self.count as f64 / 1_000_000.0
+            )
+        }
+    }
+
+    fn max_ms(&self) -> f64 {
+        self.max_ns as f64 / 1_000_000.0
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 impl<G: GraphicsBackend> FrameController<G> {
     fn init_swapchain(
@@ -1458,6 +1500,11 @@ impl<G: GraphicsBackend> FrameController<G> {
             dw_sum_ns: 0,
             dw_max_ns: 0,
             dw_min_ns: u64::MAX,
+            sg_gates: SegStat::default(),
+            sc_copy: SegStat::default(),
+            se_depth_end: SegStat::default(),
+            sp_plain_end: SegStat::default(),
+            sl_sample_log: SegStat::default(),
             hb_depth_swapchains: 0,
             age_stats: AgeStats::new(),
             acq_count: 0,
@@ -1789,9 +1836,12 @@ impl<G: GraphicsBackend> FrameController<G> {
             layers.extend(overlay_layers.iter().map(Deref::deref));
         }
 
+        let t_pend0 = now_mono_ns();
         self.stream
             .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
             .unwrap();
+        self.sp_plain_end
+            .sample(now_mono_ns().saturating_sub(t_pend0));
 
         trace!("frame submitted");
     }
@@ -2015,6 +2065,10 @@ impl<G: GraphicsBackend> FrameController<G> {
     {
         // Guards already checked by the wrapper; the feed open below is
         // the first real work (and the wall clock starts there).
+        // t_seg0 anchors the gates segment (feed open, SHM read, all
+        // gates up to acquire); sampled at t0 below on paths that get
+        // that far.
+        let t_seg0 = now_mono_ns();
         if self.depth_feed.is_none()
             && let Some(feed) = DepthFeed::open()
         {
@@ -2225,6 +2279,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         // Acquire (bounded): the only CPU-blocking depth call on this path.
         // Timed for the heartbeat avg/max.
         let t0 = now_mono_ns();
+        self.sg_gates.sample(t0.saturating_sub(t_seg0));
         enum Acquire {
             Done(usize),
             NoImage,
@@ -2270,6 +2325,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         };
         self.sample_acquire_ns(now_mono_ns().saturating_sub(t0));
+        let t_post_acq = now_mono_ns();
         // Pin FIRST (contract order: pin → sample), from the
         // generation just read. A vanished segment mid-frame fails here.
         // The pin lands late (after gates + bounded acquire), not at the
@@ -2354,6 +2410,9 @@ impl<G: GraphicsBackend> FrameController<G> {
             app_off: ctl.app_off,
             app_size: ctl.app_size,
         });
+        // Copy segment: pin + poll + GL import/copy enqueue.
+        self.sc_copy
+            .sample(now_mono_ns().saturating_sub(t_post_acq));
         // Release before end (color path releases before end too). Scope
         // discipline: every post-acquire path releases exactly once.
         Self::release_depth_image(&mut self.depth_swapchain);
@@ -2370,13 +2429,16 @@ impl<G: GraphicsBackend> FrameController<G> {
             return self.plain(PlainWhy::CopyFail);
         }
         if DEPTH_SAMPLE_LOG_ON {
-            info!(
+            let t_log0 = now_mono_ns();
+            debug!(
                 "[xrizer] depth sample gen {} tc {}.{:03} src {}",
                 ctl.generation,
                 tc_ns / 1_000_000_000,
                 (tc_ns / 1_000_000) % 1000,
                 if res.src_app { "app" } else { "slot" },
             );
+            self.sl_sample_log
+                .sample(now_mono_ns().saturating_sub(t_log0));
         }
         if res.src_app {
             self.hb_src_app = self.hb_src_app.saturating_add(1);
@@ -2536,6 +2598,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             overlay_layers = overlay_man.get_layers(session_data, self.app_fade_grid);
             layers.extend(overlay_layers.iter().map(Deref::deref));
         }
+        let t_end0 = now_mono_ns();
         match self
             .stream
             .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
@@ -2559,6 +2622,8 @@ impl<G: GraphicsBackend> FrameController<G> {
                         ctl.format,
                     );
                 }
+                self.se_depth_end
+                    .sample(now_mono_ns().saturating_sub(t_end0));
                 DepthEnd::WithDepth
             }
             Err(e) => {
@@ -2578,6 +2643,8 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.depth_end_fail_warned = true;
                     warn!("depth frame end failed ({e}); frame dropped");
                 }
+                self.se_depth_end
+                    .sample(now_mono_ns().saturating_sub(t_end0));
                 DepthEnd::EndFailed
             }
         }
@@ -2740,7 +2807,7 @@ impl<G: GraphicsBackend> FrameController<G> {
              read[absent {} size {} torn {} magic {} version {}] \
              gate[nonviable {} t0 {} repeat {} alloc {} clip {} window {} dims {} flip {}] \
              copy[noctx {} acq_fail {} acq_timeout {} unsync {} src_app {} src_slot {} copyfail {} pinfail {} pinheld {} swapchain {} epochrace {} endfail {}] \
-             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] wall[avg {} max {:.3}ms min {:.3}ms] seen[gen {} epoch {} {}x{}]",
+             swapchains {} age[n {} avg {} max {} min {} neg {:.0}%] acq[avg {} max {:.3}ms] poll[avg {} max {:.3}ms] wall[avg {} max {:.3}ms min {:.3}ms] seg[gates {}/{} copy {}/{} endd {}/{} endp {}/{} log {}/{}] seen[gen {} epoch {} {}x{}]",
             self.hb_frames as f64 / secs,
             self.hb_frames,
             self.hb_depth,
@@ -2783,6 +2850,16 @@ impl<G: GraphicsBackend> FrameController<G> {
             wall_avg,
             self.dw_max_ns as f64 / 1_000_000.0,
             wall_min_ms,
+            self.sg_gates.avg_ms(),
+            self.sg_gates.max_ms(),
+            self.sc_copy.avg_ms(),
+            self.sc_copy.max_ms(),
+            self.se_depth_end.avg_ms(),
+            self.se_depth_end.max_ms(),
+            self.sp_plain_end.avg_ms(),
+            self.sp_plain_end.max_ms(),
+            self.sl_sample_log.avg_ms(),
+            self.sl_sample_log.max_ms(),
             self.last_seen_gen,
             self.last_seen_epoch,
             self.last_seen_w,
@@ -2828,6 +2905,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.dw_sum_ns = 0;
         self.dw_max_ns = 0;
         self.dw_min_ns = u64::MAX;
+        self.sg_gates.clear();
+        self.sc_copy.clear();
+        self.se_depth_end.clear();
+        self.sp_plain_end.clear();
+        self.sl_sample_log.clear();
     }
 }
 
