@@ -23,8 +23,8 @@ pub struct GlData {
     draw_fbo: u32,
     depth_images: Vec<u32>,
     depth_format: u32,
-    /// GL_EXT_memory_object(_fd) present (fence sync_files are polled
-    /// with libc, never imported into GL).
+    /// GL_EXT_memory_object(_fd) present (no SHM fence exists: the +56
+    /// reserved words are ignored, never imported into GL).
     fd_import_viable: bool,
     depth_fd: Option<DepthFdCache>,
     /// Last FD key whose import failed + earliest retry time. A failed
@@ -77,8 +77,8 @@ struct AppImport {
     tex: u32,
 }
 
-/// Required GL extensions for the FD import path (memory only: fence
-/// sync_files are polled with libc, never imported into GL).
+/// Required GL extensions for the FD import path (memory only: no SHM
+/// fence exists, nothing else is imported into GL).
 const FD_IMPORT_EXTS: [&str; 2] = ["GL_EXT_memory_object", "GL_EXT_memory_object_fd"];
 
 /// Opaque-fd handle type for memory imports.
@@ -570,8 +570,8 @@ impl GraphicsBackend for GlData {
             return inert();
         }
         // Stdin/stdout/stderr are never valid depth FDs; the producer's
-        // pre-publish sentinel is -1. (Fence FDs are validated by the
-        // caller's poll, not here — they are never imported.)
+        // pre-publish sentinel is -1. (No SHM fence exists — the +56
+        // reserved words are ignored, never imported.)
         if req.mem_fds.iter().any(|&f| f <= 2) {
             return inert();
         }
@@ -720,9 +720,9 @@ impl GraphicsBackend for GlData {
             None => (cache.slots[slot].tex, "slot", false),
         };
         // No GL-side sync here by design: the caller samples torn-tolerant
-        // (UNFENCED single-copy or timeout-0 unsync probe) instead of any
-        // semaphore wait — fence FDs are single-use snapshots with no
-        // persistent state to go stale across skipped generations.
+        // (unfenced single-copy; no SHM fence exists) instead of any wait —
+        // the sampler's own FenceSync below governs the pin, and skipped
+        // generations leave no sync debt behind.
         let ok = unsafe {
             for eye in 0..2u32 {
                 gl::CopyImageSubData(
@@ -831,8 +831,8 @@ impl GraphicsBackend for GlData {
 }
 
 impl GlData {
-    /// Import both mirror slots (memory + depth texture each; fence FDs
-    /// are polled by the caller, never imported).
+    /// Import both mirror slots (memory + depth texture each; the +56
+    /// reserved words are ignored, never imported).
     /// FD ownership across the import is driver-defined (dup-and-keep vs
     /// consume differ across the matrix), so each FD is `dup()`ed and the
     /// dup — never the producer's number — is handed over:

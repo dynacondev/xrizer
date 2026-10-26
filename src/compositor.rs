@@ -1735,8 +1735,8 @@ impl<G: GraphicsBackend> FrameController<G> {
     /// Depth path for `end_frame`: single late copy of the newest published
     /// generation, chained as `CompositionLayerDepthInfoKHR` views. No waits
     /// beyond bounded acquire (5ms); the GL copy
-    /// itself is queued with its own FenceSync, never a semaphore wait (v4
-    /// fence-FD design). Worst case the acquire bound hits (5ms on a wedged producer); typical is immediate.
+    /// itself is queued with its own FenceSync, never an SHM fence (+56
+    /// reserved words are ignored). Worst case the acquire bound hits (5ms on a wedged producer); typical is immediate.
     fn try_end_frame_with_depth(
         &mut self,
         session_data: &SessionData,
@@ -2067,27 +2067,17 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.hb_pin_held = self.hb_pin_held.saturating_add(1);
             return DepthEnd::Plain;
         }
-        // Unfenced sample: no fence exists (producer publishes -1).
-        // The pin keeps the slot stable across the sample.
+        // Unfenced sample: no SHM fence exists (+56 reserved words are
+        // never read). The pin keeps the slot stable across the sample.
         // Tear-verdict sample stamp (experiment, hardcoded on): log the
         // queue time Tc per WithDepth sample. The producer logs (rec R,
         // first-available A, gpu dt) per generation; pairing offline by
         // gen gives clean (Tc > A) / certain-overlap (Tc < R) / hazard.
         const DEPTH_SAMPLE_LOG_ON: bool = true;
-        // Single-copy UNFENCED: the producer publishes fence -1 (the inbatch
-        // copy retires with the app batch, so no fence exists). Sample
-        // immediately, torn-tolerant, after the pin. A fenced publish
-        // would be a contract violation — fail safe to plain.
+        // Single-copy: the producer's copy retires with the app batch, so
+        // no per-slot fence exists. Sample immediately, torn-tolerant,
+        // after the pin.
         let t1 = now_mono_ns();
-        let fence_fd = ctl.fence_fds[slot];
-        if fence_fd > 2 {
-            self.sample_poll_ns(now_mono_ns().saturating_sub(t1));
-            self.unpin_now();
-            Self::release_depth_image(&mut self.depth_swapchain);
-            warn!("depth fenced publish (contract violation, expected unfenced)");
-            self.evt_depth_streak = 0;
-            return DepthEnd::Plain;
-        }
         self.hb_unsync = self.hb_unsync.saturating_add(1);
         if !self.evt_unsync_logged {
             self.evt_unsync_logged = true;

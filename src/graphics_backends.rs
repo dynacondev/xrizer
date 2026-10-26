@@ -94,9 +94,9 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 
     /// Ensure memory-FD imports for (epoch, dims, format); GPU-copy both
     /// halves of `generation` into `depth_image_index`. The caller holds the
-    /// slot's SHM pin across this call and has already polled the slot's
-    /// fence FD for producer-copy completion — no semaphore wait happens
-    /// here. The backend fences its own completion for deferred unpin.
+    /// slot's SHM pin across this call — no SHM fence exists (+56 reserved
+    /// words are ignored); the sample is torn-tolerant by design.
+    /// The backend fences its own completion for deferred unpin.
     /// Zero-copy: when the request carries a valid app block, the backend
     /// imports that (with offset) and copies from the pick directly; the
     /// slot mirror is then only a fallback/legacy path.
@@ -121,9 +121,9 @@ pub trait GraphicsBackend: Into<SupportedBackend> {
 
 /// One FD-mode frame for [`GraphicsBackend::import_and_copy_depth_fd`].
 /// Two slots (`generation % 2`); FDs are borrowed numbers, never closed.
-/// Fence sync_file FDs are deliberately NOT part of the request: the caller
-/// polls the current snapshot's fence number directly (they are single-use
-/// snapshots, never cached across frames).
+/// No SHM fence words ride this request: the +56 reserved words are ignored
+/// and the sample is torn-tolerant by design (the sampler's own GL fence
+/// governs the pin).
 pub struct DepthFdRequest {
     pub epoch: u32,
     pub w: u32,
