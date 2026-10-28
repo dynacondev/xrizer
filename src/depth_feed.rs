@@ -330,6 +330,20 @@ impl Drop for MappedSeg {
 // for ownership transfer across threads; `!Sync` is intentional).
 unsafe impl Send for MappedSeg {}
 
+/// Throttled debug for segment-absent reads (one line per 5 s, not ~90/s).
+/// The errno decides the case: ENOENT (2) = name unlinked/never created
+/// (producer teardown or external unlink — a live writer keeps publishing
+/// into a detached mapping); EMFILE (24)/ENFILE (23) = fd exhaustion;
+/// anything else at the fstat/mmap stages is a kernel-level failure.
+fn absent_log(syscall: &str, errno: i32) {
+    static LAST_ABSENT_LOG_NS: AtomicU64 = AtomicU64::new(0);
+    let now = now_mono_ns();
+    if now.saturating_sub(LAST_ABSENT_LOG_NS.load(Ordering::Relaxed)) > 5_000_000_000 {
+        LAST_ABSENT_LOG_NS.store(now, Ordering::Relaxed);
+        debug!("depth feed: {} failed (absent), errno={}", syscall, errno);
+    }
+}
+
 /// Open + mmap the current segment. A fresh mapping every call picks up
 /// producer recreates (epoch or size changes) with no stale fd.
 ///
@@ -343,19 +357,16 @@ fn map_segment(name: &CString, write: bool) -> Result<MappedSeg, ReadSkip> {
     // Mode is ignored without O_CREAT; kept explicit for readability.
     let fd = unsafe { libc::shm_open(name.as_ptr(), oflag, 0o600) };
     if fd < 0 {
-        // Per-frame when the layer is absent: throttle so RUST_LOG=debug
-        // stays readable (one line per 5 s, not ~90/s).
-        static LAST_ABSENT_LOG_NS: AtomicU64 = AtomicU64::new(0);
-        let now = now_mono_ns();
-        if now.saturating_sub(LAST_ABSENT_LOG_NS.load(Ordering::Relaxed)) > 5_000_000_000 {
-            LAST_ABSENT_LOG_NS.store(now, Ordering::Relaxed);
-            debug!("depth feed: shm_open failed (absent)");
-        }
+        // Capture before anything else runs: later calls may clobber errno.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+        absent_log("shm_open", errno);
         return Err(ReadSkip::Absent);
     }
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
         unsafe { libc::close(fd) };
+        absent_log("fstat", errno);
         return Err(ReadSkip::Absent);
     }
     // `st_size` is signed; compare in-domain before casting (a negative
@@ -369,17 +380,21 @@ fn map_segment(name: &CString, write: bool) -> Result<MappedSeg, ReadSkip> {
     let prot = libc::PROT_READ | (if write { libc::PROT_WRITE } else { 0 });
     let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, prot, libc::MAP_SHARED, fd, 0) };
     if ptr == libc::MAP_FAILED || ptr.is_null() {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
         unsafe { libc::close(fd) };
+        absent_log("mmap", errno);
         return Err(ReadSkip::Absent);
     }
     // Re-check size after mapping: a recreate between the first fstat and
     // the mmap would otherwise leave a mapping over a replaced object.
     let mut stat2: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat2) } != 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
         unsafe {
             libc::munmap(ptr, map_len);
             libc::close(fd);
         }
+        absent_log("fstat_after_mmap", errno);
         return Err(ReadSkip::Absent);
     }
     if stat2.st_size != HEADER_SIZE as libc::off_t {
