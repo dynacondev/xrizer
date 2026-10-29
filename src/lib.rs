@@ -6,6 +6,7 @@ mod clientcore;
 mod compositor;
 mod depth_feed;
 mod graphics_backends;
+mod hands_shm;
 mod input;
 mod misc_unknown;
 mod openxr_data;
