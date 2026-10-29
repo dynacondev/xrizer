@@ -225,6 +225,23 @@ impl TrackedDevice {
         }
     }
 
+    /// Locate this controller's hand joints in `base` at `time` for the
+    /// out-of-process hand feed. Returns `None` when this device has no hand
+    /// tracker (extension missing/unsupported) or the hand is inactive.
+    /// Unlike [`TrackedDevice::get_hand_skeleton`] this bypasses the
+    /// per-base-space cache and locates in the caller-chosen (world) space.
+    pub fn locate_hand_joints_in(
+        &self,
+        base: &xr::Space,
+        time: xr::Time,
+    ) -> Option<xr::HandJointLocations> {
+        let TrackedDeviceType::Controller { hand_tracker, .. } = self.get_type() else {
+            return None;
+        };
+        base.locate_hand_joints(hand_tracker.as_ref()?, time)
+            .unwrap_or_default()
+    }
+
     pub fn has_connected_changed(&mut self) -> bool {
         if self.previous_connected != self.connected {
             self.previous_connected = self.connected;

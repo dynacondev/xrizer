@@ -1460,8 +1460,36 @@ impl<C: openxr_data::Compositor> Input<C> {
             .unwrap();
     }
 
+    /// Best-effort publish of both hands' joints to `/xplane-hands-v1`.
+    ///
+    /// Joints are located in the current tracking space (Standing → STAGE,
+    /// Seated → LOCAL — the same frame the WaitGetPoses poses live in), in
+    /// meters, OpenXR Y-up, OpenXR joint order. The writer is seqlocked and
+    /// fail-silent: it never crashes or blocks the frame when SHM is absent.
+    /// Called once per frame from [`Input::frame_start_update`], so legacy
+    /// and action-manifest apps alike publish exactly one sample per frame.
+    fn publish_hands_shm(&self) {
+        let data = self.openxr.session_data.get();
+        let time = self.openxr.display_time.get();
+        let base = data.tracking_space();
+        let devices = data.input_data.devices.read().unwrap();
+        let left = devices
+            .get_controller(Hand::Left)
+            .and_then(|d| d.locate_hand_joints_in(base, time));
+        let right = devices
+            .get_controller(Hand::Right)
+            .and_then(|d| d.locate_hand_joints_in(base, time));
+        drop(devices);
+        drop(data);
+        crate::hands_shm::publish(left.as_ref(), right.as_ref());
+    }
+
     pub fn frame_start_update(&self) {
         tracy_span!();
+        // Out-of-process hand joint feed for the hands/ shim. Fresh every
+        // frame (display_time was just advanced by maybe_wait_frame); safe to
+        // run before the caches below are cleared (separate base space).
+        self.publish_hands_shm();
         let data = self.openxr.session_data.get();
         let devices = data.input_data.devices.read().unwrap();
 
