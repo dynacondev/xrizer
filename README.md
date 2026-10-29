@@ -88,6 +88,8 @@ _XRIZER_TRACKER_SERIALS_ - This is a semi-colon (`;`) separated list of device s
 
 _XRIZER_DEPTH_SHM_ - Depth-feed kill-switch (default on). Explicit `0/false/no/off` disables depth submission; anything unparseable warns once and stays on. When depth is on and the runtime supports `khr_composition_layer_depth`, xrizer reads the reprojex depth feed (`/xplane-depth-v4`, see `reprojex/CONSUMER_CONTRACT.md`) and chains depth layers. The `depth …/s` heartbeat line (every 5 s) reports frames with/without depth, per-reason skip buckets, signed age stats, and `seen[gen/epoch/dims]` — the last observed header identity, which diagnoses stale-feed stalls even when an earlier gate rejects every frame.
 
+_XRIZER_HANDS_SHM_ - Hand-joint feed kill-switch (default on). Explicit `0/false/no/off` disables publishing; anything unparseable warns once and stays on. When on, xrizer publishes both hands' joints once per frame into `/xplane-hands-v1` (byte-exact layout in `hands/src/shm.h`: magic `XPH1`, version 1, 1488 bytes, seqlock + 2×26 joints). Joints are in xrizer's current tracking space (Standing → STAGE, Seated → LOCAL), meters, OpenXR Y-up, OpenXR joint order — the same frame as the WaitGetPoses poses. `generation` bumps once per frame (even with no hands tracked, as a writer-alive heartbeat) and `flags` carries per-hand validity; readers retry while `seq` is odd and treat a stalled generation as stale.
+
 # See also
 
 - [OpenComposite](https://gitlab.com/znixian/OpenOVR) - The original OpenVR/OpenXR implementation, much more mature than xrizer. Some of the code in this repo was rewritten based on OpenComposite.
