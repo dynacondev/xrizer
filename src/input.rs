@@ -34,8 +34,8 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 
 new_key_type! {
@@ -1408,19 +1408,29 @@ impl<C: openxr_data::Compositor> Input<C> {
                 if let Some(controller) = controller.as_mut() {
                     controller.profile_data = Some(data);
                 } else {
-                    let hand_tracker = session_data
-                        .session
-                        .create_hand_tracker(hand.into())
-                        .inspect_err(|e| {
-                            if !matches!(
-                                *e,
-                                xr::sys::Result::ERROR_EXTENSION_NOT_PRESENT
-                                    | xr::sys::Result::ERROR_FEATURE_UNSUPPORTED
-                            ) {
-                                log::warn!("Failed to create hand tracker for hand {hand:?}: {e}");
-                            }
-                        })
-                        .ok();
+                    // Hand trackers need XR_EXT_hand_tracking; without it (or on
+                    // runtimes that reject the request) we keep a tracker-less
+                    // controller so grip poses still work and the SHM feed
+                    // reports that hand inactive.
+                    let hand_tracker = match session_data.session.create_hand_tracker(hand.into()) {
+                        Ok(tracker) => {
+                            info!("created hand tracker for {hand:?}");
+                            Some(tracker)
+                        }
+                        Err(e)
+                            if e == xr::sys::Result::ERROR_EXTENSION_NOT_PRESENT
+                                || e == xr::sys::Result::ERROR_FEATURE_UNSUPPORTED =>
+                        {
+                            info!(
+                                "hand tracker for {hand:?} unavailable: {e:?} ({e}) — continuing without hand tracking"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            warn!("Failed to create hand tracker for {hand:?}: {e:?} ({e})");
+                            None
+                        }
+                    };
                     devices_to_create.push((
                         TrackedDeviceType::Controller {
                             hand,
@@ -1473,15 +1483,84 @@ impl<C: openxr_data::Compositor> Input<C> {
         let time = self.openxr.display_time.get();
         let base = data.tracking_space();
         let devices = data.input_data.devices.read().unwrap();
-        let left = devices
-            .get_controller(Hand::Left)
-            .and_then(|d| d.locate_hand_joints_in(base, time));
-        let right = devices
-            .get_controller(Hand::Right)
-            .and_then(|d| d.locate_hand_joints_in(base, time));
+        let left_dev = devices.get_controller(Hand::Left);
+        let right_dev = devices.get_controller(Hand::Right);
+        let left_has_tracker = left_dev.is_some_and(|d| {
+            matches!(
+                d.get_type(),
+                TrackedDeviceType::Controller {
+                    hand_tracker: Some(_),
+                    ..
+                }
+            )
+        });
+        let right_has_tracker = right_dev.is_some_and(|d| {
+            matches!(
+                d.get_type(),
+                TrackedDeviceType::Controller {
+                    hand_tracker: Some(_),
+                    ..
+                }
+            )
+        });
+        let left = left_dev.and_then(|d| d.locate_hand_joints_in(base, time));
+        let right = right_dev.and_then(|d| d.locate_hand_joints_in(base, time));
+        let left_active = left.is_some();
+        let right_active = right.is_some();
         drop(devices);
         drop(data);
         crate::hands_shm::publish(left.as_ref(), right.as_ref());
+        Self::log_hands_locate_throttled(
+            left_has_tracker,
+            left_active,
+            right_has_tracker,
+            right_active,
+        );
+    }
+
+    /// Throttled per-frame hand-locate summary: logs on state change or at
+    /// most once per second (never per-frame spam). States distinguish
+    /// no-tracker (extension missing/unsupported or no controller yet) from
+    /// inactive (tracker exists but runtime reports no active joints).
+    fn log_hands_locate_throttled(
+        left_has_tracker: bool,
+        left_active: bool,
+        right_has_tracker: bool,
+        right_active: bool,
+    ) {
+        static LAST_STATE: AtomicU32 = AtomicU32::new(u32::MAX);
+        static LAST_LOG_NS: AtomicU64 = AtomicU64::new(0);
+        const LOG_EVERY_NS: u64 = 1_000_000_000;
+
+        let state: u32 = (u32::from(left_has_tracker))
+            | (u32::from(left_active) << 1)
+            | (u32::from(right_has_tracker) << 2)
+            | (u32::from(right_active) << 3);
+        let now = crate::hands_shm::now_mono_ns();
+        let last_state = LAST_STATE.load(Ordering::Relaxed);
+        let last_log = LAST_LOG_NS.load(Ordering::Relaxed);
+        let changed = state != last_state;
+        let due = now.wrapping_sub(last_log) >= LOG_EVERY_NS;
+        if !changed && !due {
+            return;
+        }
+        LAST_STATE.store(state, Ordering::Relaxed);
+        LAST_LOG_NS.store(now, Ordering::Relaxed);
+
+        fn hand_str(has_tracker: bool, active: bool) -> &'static str {
+            if active {
+                "active"
+            } else if has_tracker {
+                "inactive"
+            } else {
+                "no-tracker"
+            }
+        }
+        info!(
+            "hands locate L={} R={}",
+            hand_str(left_has_tracker, left_active),
+            hand_str(right_has_tracker, right_active),
+        );
     }
 
     pub fn frame_start_update(&self) {
