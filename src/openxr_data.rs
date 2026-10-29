@@ -130,6 +130,21 @@ impl<C: Compositor> OpenXrData<C> {
         exts.khr_opengl_enable = supported_exts.khr_opengl_enable;
         exts.khr_convert_timespec_time = supported_exts.khr_convert_timespec_time;
         exts.ext_hand_tracking = supported_exts.ext_hand_tracking;
+        // Needed on runtimes (e.g. WiVRn/Monado) that gate controller-emulated or
+        // application-requested hand data behind the data-source extension. The
+        // openxr 0.22 `create_hand_tracker` wrapper does not chain
+        // `XrHandTrackingDataSourceInfoEXT`, so enabling this changes no call
+        // parameters — it only advertises support. When the runtime lacks it
+        // the flag stays false and behavior is unchanged (graceful fallback).
+        exts.ext_hand_tracking_data_source = supported_exts.ext_hand_tracking_data_source;
+        // NOTE: XR_EXT_hand_interaction is deliberately NOT enabled. Nothing in
+        // the codebase binds or handles its interaction profile
+        // ("/interaction_profiles/ext/hand_interaction_ext"): `profiles.rs`
+        // only knows controller profiles (vive, knuckles, oculus, ...), and
+        // `interaction_profile_changed` creates hand trackers only for those
+        // known profiles. Enabling the extension without a matching profile
+        // would let the runtime report an unknown profile we cannot bind,
+        // so it would be incoherent. Revisit if hand-only input support lands.
         exts.khr_visibility_mask = supported_exts.khr_visibility_mask;
         exts.khr_composition_layer_cylinder = supported_exts.khr_composition_layer_cylinder;
         exts.khr_composition_layer_equirect2 = supported_exts.khr_composition_layer_equirect2;
@@ -144,6 +159,13 @@ impl<C: Compositor> OpenXrData<C> {
             supported_exts.htc_vive_focus3_controller_interaction;
         exts.meta_touch_controller_plus = supported_exts.meta_touch_controller_plus;
         exts.fb_display_refresh_rate = supported_exts.fb_display_refresh_rate;
+        info!(
+            "hand tracking exts supported: ext_hand_tracking={}, ext_hand_tracking_data_source={} (enabled: {}, {})",
+            supported_exts.ext_hand_tracking,
+            supported_exts.ext_hand_tracking_data_source,
+            exts.ext_hand_tracking,
+            exts.ext_hand_tracking_data_source,
+        );
 
         // Extension that enables simple full body tracking support via generic tracked devices.
         // Available only in the Monado OpenXR runtime.
