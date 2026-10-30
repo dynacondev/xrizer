@@ -32,7 +32,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
-use log::warn;
+use log::{info, warn};
 
 pub const HX_SHM_NAME: &str = "/xplane-hands-v1";
 pub const HX_MAGIC: u32 = 0x58504831; // 'XPH1'
@@ -159,6 +159,14 @@ static SLOT: LazyLock<Mutex<Slot>> = LazyLock::new(|| Mutex::new(Slot::new()));
 /// Monotonic publish counter; stored as `generation` (starts at 1, 0 = none).
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static WARNED_SHM: AtomicBool = AtomicBool::new(false);
+/// Throttled-diagnostic counters (no new env vars; reuse log channels).
+/// Counts silent `publish` early-outs so a dead feed is distinguishable.
+static DISABLED_N: AtomicU64 = AtomicU64::new(0);
+static UNMAPPED_N: AtomicU64 = AtomicU64::new(0);
+/// One-shot "feed live" marker after priming; 1 Hz heartbeat throttle.
+static FEED_LIVE_LOGGED: AtomicBool = AtomicBool::new(false);
+static LAST_HB_NS: AtomicU64 = AtomicU64::new(0);
+const HB_EVERY_NS: u64 = 1_000_000_000;
 
 fn warn_shm_once(msg: String) {
     if !WARNED_SHM.swap(true, Ordering::Relaxed) {
@@ -214,6 +222,12 @@ fn map_shm() -> Option<(std::os::fd::RawFd, *mut HxShmV1)> {
         let shm = base as *mut HxShmV1;
         (&raw mut (*shm).magic).write(HX_MAGIC);
         (&raw mut (*shm).version).write(HX_VERSION);
+        if !FEED_LIVE_LOGGED.swap(true, Ordering::Relaxed) {
+            info!(
+                "hands-shm: feed live path={} size={} magic={:#010x}",
+                HX_SHM_NAME, HX_SIZE, HX_MAGIC
+            );
+        }
         Some((fd, shm))
     }
 }
@@ -231,18 +245,42 @@ fn copy_hand(dst: &mut [HxJoint; HX_JOINTS], src: &xr::HandJointLocations) {
 /// `generation` on success — including all-invalid samples, which act as a
 /// writer-alive heartbeat. Fail-silent: no-op when disabled or unmapped.
 /// Never blocks on a reader (seqlock only).
-pub fn publish(left: Option<&xr::HandJointLocations>, right: Option<&xr::HandJointLocations>) {
+///
+/// Returns `(generation, flags, left_wrist, right_wrist)` as written (zeros
+/// when disabled/unmapped) so the per-second `hands locate` line in
+/// `input.rs` can prove real data flows (wave test: successive lines must
+/// show wrist delta > 0.01 m when hands move).
+pub fn publish(
+    left: Option<&xr::HandJointLocations>,
+    right: Option<&xr::HandJointLocations>,
+) -> (u64, u32, [f32; 3], [f32; 3]) {
     if !hands_shm_enabled() {
-        return;
+        let n = DISABLED_N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 {
+            warn_shm_once(format!(
+                "hands-shm: disabled via XRIZER_HANDS_SHM, hand feed off"
+            ));
+        } else if n % 3600 == 0 {
+            info!("hands-shm: disabled via XRIZER_HANDS_SHM, hand feed off n={n}");
+        }
+        return (0, 0, [0.0; 3], [0.0; 3]);
     }
     let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
     let Some(shm) = slot.ensure_locked() else {
-        return;
+        let n = UNMAPPED_N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 {
+            warn_shm_once(format!("hands-shm: shm unmapped n={n}, hand feed off"));
+        } else if n % 3600 == 0 {
+            info!("hands-shm: shm unmapped n={n}, hand feed off");
+        }
+        return (0, 0, [0.0; 3], [0.0; 3]);
     };
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let now = now_mono_ns();
     let mut flags = 0u32;
-    unsafe {
+    // Captured while the slot is locked so the heartbeat below reports
+    // exactly what was written this sample.
+    let (l0, r0) = unsafe {
         // Seqlock: odd = writer inside.
         (*shm).seq.fetch_add(1, Ordering::AcqRel);
         (&raw mut (*shm).magic).write(HX_MAGIC);
@@ -267,7 +305,22 @@ pub fn publish(left: Option<&xr::HandJointLocations>, right: Option<&xr::HandJoi
         std::sync::atomic::fence(Ordering::Release);
         // Even = complete.
         (*shm).seq.fetch_add(1, Ordering::AcqRel);
+        (
+            (&raw const (*shm).joints[0][0].pos).read(),
+            (&raw const (*shm).joints[1][0].pos).read(),
+        )
+    };
+    // 1 Hz heartbeat while the slot is still locked (same wrapping-sub due
+    // check as `log_hands_locate_throttled` in input.rs).
+    let last_hb = LAST_HB_NS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last_hb) >= HB_EVERY_NS {
+        LAST_HB_NS.store(now, Ordering::Relaxed);
+        info!(
+            "hands-shm: hb gen={} flags={:#04b} L0=({:.3},{:.3},{:.3}) mono_ns={}",
+            generation, flags, l0[0], l0[1], l0[2], now
+        );
     }
+    (generation, flags, l0, r0)
 }
 
 #[cfg(test)]

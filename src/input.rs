@@ -1509,12 +1509,17 @@ impl<C: openxr_data::Compositor> Input<C> {
         let right_active = right.is_some();
         drop(devices);
         drop(data);
-        crate::hands_shm::publish(left.as_ref(), right.as_ref());
+        let (shm_gen, shm_flags, l_wrist, r_wrist) =
+            crate::hands_shm::publish(left.as_ref(), right.as_ref());
         Self::log_hands_locate_throttled(
             left_has_tracker,
             left_active,
             right_has_tracker,
             right_active,
+            shm_gen,
+            shm_flags,
+            l_wrist,
+            r_wrist,
         );
     }
 
@@ -1527,6 +1532,10 @@ impl<C: openxr_data::Compositor> Input<C> {
         left_active: bool,
         right_has_tracker: bool,
         right_active: bool,
+        shm_gen: u64,
+        shm_flags: u32,
+        l_wrist: [f32; 3],
+        r_wrist: [f32; 3],
     ) {
         static LAST_STATE: AtomicU32 = AtomicU32::new(u32::MAX);
         static LAST_LOG_NS: AtomicU64 = AtomicU64::new(0);
@@ -1557,9 +1566,17 @@ impl<C: openxr_data::Compositor> Input<C> {
             }
         }
         info!(
-            "hands locate L={} R={}",
+            "hands locate L={} R={} shm gen={} flags={:#04b} Lw=({:.3},{:.3},{:.3}) Rw=({:.3},{:.3},{:.3})",
             hand_str(left_has_tracker, left_active),
             hand_str(right_has_tracker, right_active),
+            shm_gen,
+            shm_flags,
+            l_wrist[0],
+            l_wrist[1],
+            l_wrist[2],
+            r_wrist[0],
+            r_wrist[1],
+            r_wrist[2],
         );
     }
 

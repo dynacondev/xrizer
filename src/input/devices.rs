@@ -17,7 +17,7 @@ use openxr_mndx_xdev_space::{SessionXDevExtensionMNDX, XDev, XR_MNDX_XDEV_SPACE_
 use crate::input::profiles::ProfileProperties;
 use crate::openxr_data::{self, Hand, OpenXrData, SessionData};
 use crate::tracy_span;
-use log::trace;
+use log::{debug, trace};
 
 use super::{Input, InteractionProfile, profiles::MainAxisType};
 
@@ -238,8 +238,13 @@ impl TrackedDevice {
         let TrackedDeviceType::Controller { hand_tracker, .. } = self.get_type() else {
             return None;
         };
-        base.locate_hand_joints(hand_tracker.as_ref()?, time)
-            .unwrap_or_default()
+        match base.locate_hand_joints(hand_tracker.as_ref()?, time) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("locate_hand_joints failed: {e:?} ({e})");
+                None
+            }
+        }
     }
 
     pub fn has_connected_changed(&mut self) -> bool {
