@@ -1470,18 +1470,22 @@ impl<C: openxr_data::Compositor> Input<C> {
             .unwrap();
     }
 
-    /// Best-effort publish of both hands' joints to `/xplane-hands-v1`.
+    /// Best-effort publish of both hands' joints to `/xplane-hands-v2`.
     ///
-    /// Joints are located in the current tracking space (Standing → STAGE,
-    /// Seated → LOCAL — the same frame the WaitGetPoses poses live in), in
-    /// meters, OpenXR Y-up, OpenXR joint order. The writer is seqlocked and
-    /// fail-silent: it never crashes or blocks the frame when SHM is absent.
-    /// Called once per frame from [`Input::frame_start_update`], so legacy
-    /// and action-manifest apps alike publish exactly one sample per frame.
+    /// Joints and linear velocities are located in the current tracking space
+    /// (Standing → STAGE, Seated → LOCAL — the same frame the WaitGetPoses
+    /// poses live in), in meters / m/s, OpenXR Y-up, OpenXR joint order.
+    /// The space identity (`space_kind`, derived from the same STAGE/LOCAL
+    /// decision) and the runtime's `XrHandJointVelocitiesEXT` output travel
+    /// in the same sample. The writer is seqlocked and fail-silent: it never
+    /// crashes or blocks the frame when SHM is absent. Called once per
+    /// frame from [`Input::frame_start_update`], so legacy and
+    /// action-manifest apps alike publish exactly one sample per frame.
     fn publish_hands_shm(&self) {
         let data = self.openxr.session_data.get();
         let time = self.openxr.display_time.get();
         let base = data.tracking_space();
+        let space_kind = crate::hands_shm::space_kind_for_origin(data.current_origin);
         let devices = data.input_data.devices.read().unwrap();
         let left_dev = devices.get_controller(Hand::Left);
         let right_dev = devices.get_controller(Hand::Right);
@@ -1503,14 +1507,26 @@ impl<C: openxr_data::Compositor> Input<C> {
                 }
             )
         });
-        let left = left_dev.and_then(|d| d.locate_hand_joints_in(base, time));
-        let right = right_dev.and_then(|d| d.locate_hand_joints_in(base, time));
+        let left = left_dev.and_then(|d| d.relate_hand_joints_in(base, time));
+        let right = right_dev.and_then(|d| d.relate_hand_joints_in(base, time));
         let left_active = left.is_some();
         let right_active = right.is_some();
         drop(devices);
         drop(data);
+        let left_sample = left.as_ref().map(|(locations, velocities)| {
+            crate::hands_shm::HandSample {
+                locations,
+                velocities: velocities.as_ref(),
+            }
+        });
+        let right_sample = right.as_ref().map(|(locations, velocities)| {
+            crate::hands_shm::HandSample {
+                locations,
+                velocities: velocities.as_ref(),
+            }
+        });
         let (shm_gen, shm_flags, l_wrist, r_wrist) =
-            crate::hands_shm::publish(left.as_ref(), right.as_ref());
+            crate::hands_shm::publish(left_sample, right_sample, space_kind);
         Self::log_hands_locate_throttled(
             left_has_tracker,
             left_active,

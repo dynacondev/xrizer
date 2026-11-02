@@ -225,23 +225,30 @@ impl TrackedDevice {
         }
     }
 
-    /// Locate this controller's hand joints in `base` at `time` for the
-    /// out-of-process hand feed. Returns `None` when this device has no hand
+    /// Locate this controller's hand joints AND linear velocities in `base`
+    /// at `time` for the out-of-process hand feed. Returns the joint
+    /// locations plus the runtime's `XrHandJointVelocitiesEXT` output when
+    /// the hand is active (`None` velocities when inactive or untracked).
+    /// Per-joint `LINEAR_VALID` checking is the SHM writer's job
+    /// (`hands_shm::publish` zeroes the row and clears the hand's vel bit
+    /// unless every joint is valid), so the raw velocity array is passed
+    /// through unchecked here. Returns `None` when this device has no hand
     /// tracker (extension missing/unsupported) or the hand is inactive.
     /// Unlike [`TrackedDevice::get_hand_skeleton`] this bypasses the
     /// per-base-space cache and locates in the caller-chosen (world) space.
-    pub fn locate_hand_joints_in(
+    pub fn relate_hand_joints_in(
         &self,
         base: &xr::Space,
         time: xr::Time,
-    ) -> Option<xr::HandJointLocations> {
+    ) -> Option<(xr::HandJointLocations, Option<xr::HandJointVelocities>)> {
         let TrackedDeviceType::Controller { hand_tracker, .. } = self.get_type() else {
             return None;
         };
-        match base.locate_hand_joints(hand_tracker.as_ref()?, time) {
-            Ok(v) => v,
+        match base.relate_hand_joints(hand_tracker.as_ref()?, time) {
+            Ok(Some((locations, velocities))) => Some((locations, Some(velocities))),
+            Ok(None) => None,
             Err(e) => {
-                debug!("locate_hand_joints failed: {e:?} ({e})");
+                debug!("relate_hand_joints failed: {e:?} ({e})");
                 None
             }
         }
