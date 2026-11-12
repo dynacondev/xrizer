@@ -2,8 +2,8 @@ use crate::{
     AtomicF64,
     clientcore::{Injected, Injector},
     depth_feed::{
-        AgeStats, DepthFeed, FORMAT_D32F, FORMAT_D32S8, MAX_DEPTH, MIN_DEPTH, ReadSkip,
-        depth_master_enabled, is_same_generation, now_mono_ns, validate_near_far,
+        AgeStats, DEPTH_MAX_AGE_NS, DepthFeed, FORMAT_D32F, FORMAT_D32S8, MAX_DEPTH, MIN_DEPTH,
+        ReadSkip, depth_master_enabled, is_fresh_generation, now_mono_ns, validate_near_far,
     },
     graphics_backends::{
         DepthFdRequest, GraphicsBackend, SupportedBackend, supported_backends_enum,
@@ -1169,7 +1169,7 @@ struct PlainBreak {
     has_snapshot: bool,
     generation: u64,
     age_ns: i64,
-    period_ns: i64,
+    bound_ns: i64,
 }
 
 struct SwapchainData<G: xr::Graphics> {
@@ -1178,11 +1178,6 @@ struct SwapchainData<G: xr::Graphics> {
     initial_format: G::Format,
 }
 
-/// Same-generation association margin: covers normal present-to-handoff
-/// latency plus clock granularity, tuned later from heartbeat age data.
-/// Deliberately permissive — false-reject kills the feature silently,
-/// while ±1-frame impostors are rejected exactly by the monotonic rule.
-const DEPTH_MARGIN_NS: i64 = 2_000_000;
 /// Bounded depth-swapchain image acquisition: never stall the app thread
 /// on a wedged runtime. Durations are logged (avg/max) on the heartbeat.
 const DEPTH_ACQUIRE_TIMEOUT_NS: i64 = 5_000_000;
@@ -1203,26 +1198,6 @@ const DEPTH_ARM_LOSS_TRIP_FRAMES: u32 = 30;
 /// at most): liveness over the pin, consistent with the
 /// freshness-over-integrity tradeoff. Logging only beyond the release.
 const DEPTH_PIN_MAX_HOLD_FRAMES: u32 = 90;
-/// Display period fallback when the runtime hasn't reported one yet.
-const DEPTH_FALLBACK_PERIOD_NS: i64 = 11_111_111;
-
-/// Clamp the runtime's display period into a sane window before the age
-/// gate. A bogus huge period (pause/transient) would widen the window
-/// into accepting arbitrarily stale depth on first arm; a bogus tiny one
-/// is meaningless. Legit VR periods sit ~8–17ms (120–60Hz). Pure helper
-/// so the clamp is unit-testable.
-fn depth_window_period(display_period_ns: i64) -> i64 {
-    /// 250Hz — nothing legitimate refreshes faster.
-    const MIN_PERIOD_NS: i64 = 4_000_000;
-    /// 20Hz — slower means paused or hitching; gate narrow (plain) rather
-    /// than accept stale.
-    const MAX_PERIOD_NS: i64 = 50_000_000;
-    if display_period_ns <= 0 {
-        DEPTH_FALLBACK_PERIOD_NS
-    } else {
-        display_period_ns.clamp(MIN_PERIOD_NS, MAX_PERIOD_NS)
-    }
-}
 
 struct FrameController<G: GraphicsBackend> {
     stream: xr::FrameStream<G::Api>,
@@ -1986,7 +1961,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             has_snapshot: false,
             generation: 0,
             age_ns: 0,
-            period_ns: 0,
+            bound_ns: 0,
         });
         self.note_plain(why);
         DepthEnd::Plain
@@ -1999,14 +1974,14 @@ impl<G: GraphicsBackend> FrameController<G> {
         why: PlainWhy,
         generation: u64,
         age_ns: i64,
-        period_ns: i64,
+        bound_ns: i64,
     ) -> DepthEnd {
         self.pending_break = Some(PlainBreak {
             why,
             has_snapshot: true,
             generation,
             age_ns,
-            period_ns,
+            bound_ns,
         });
         self.note_plain(why);
         DepthEnd::Plain
@@ -2025,11 +2000,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         };
         if b.has_snapshot {
             info!(
-                "depth plain break: {} gen {} age {:+.1}ms period {:.1}ms",
+                "depth plain break: {} gen {} age {:+.1}ms (bound {:.0}ms)",
                 PlainWhy::NAMES[b.why as usize],
                 b.generation,
                 b.age_ns as f64 / 1_000_000.0,
-                b.period_ns as f64 / 1_000_000.0,
+                b.bound_ns as f64 / 1_000_000.0,
             );
         } else {
             info!(
@@ -2158,7 +2133,7 @@ impl<G: GraphicsBackend> FrameController<G> {
         session_data: &SessionData,
         system: &System,
         display_time: xr::Time,
-        display_period: i64,
+        _display_period: i64,
         _depth_enabled: bool,
         overlays: Option<&OverlayMan>,
     ) -> DepthEnd
@@ -2265,7 +2240,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 PlainWhy::Repeat,
                 ctl.generation,
                 ctl.age_ns(receipt),
-                depth_window_period(display_period),
+                DEPTH_MAX_AGE_NS,
             );
         }
         self.frozen_run = 0;
@@ -2307,11 +2282,10 @@ impl<G: GraphicsBackend> FrameController<G> {
                 return self.plain(PlainWhy::Clip);
             }
         };
-        let period = depth_window_period(display_period);
         let age_ns = ctl.age_ns(receipt);
-        if !is_same_generation(age_ns, period, DEPTH_MARGIN_NS) {
+        if !is_fresh_generation(age_ns) {
             self.hb_window = self.hb_window.saturating_add(1);
-            return self.plain_detailed(PlainWhy::Window, ctl.generation, age_ns, period);
+            return self.plain_detailed(PlainWhy::Window, ctl.generation, age_ns, DEPTH_MAX_AGE_NS);
         }
         // Dims are authoritative per read: never stretch, skip the frame.
         let (cw, ch) = match self.swapchain_data.as_ref() {
@@ -3766,23 +3740,14 @@ mod tests {
         assert_eq!(ctrl.hb_depth, 0);
     }
 
-    /// Heartbeat formats a fabricated window and resets every counter.
-    /// No SHM/GL/runtime needed: same-module access drives the method
-    /// directly with a backdated window start.
+    /// Freshness bound is a fixed constant (see `DEPTH_MAX_AGE_NS`):
+    /// the per-frame window it replaced is gone, and its coverage lives
+    /// in `depth_feed`'s `signed_age_and_freshness_bound` test.
     #[test]
-    fn depth_window_period_clamps() {
-        // Non-positive falls back; sane values pass through; absurd values
-        // clamp (huge must not widen the gate into stale accepts).
-        assert_eq!(depth_window_period(0), DEPTH_FALLBACK_PERIOD_NS);
-        assert_eq!(depth_window_period(-7), DEPTH_FALLBACK_PERIOD_NS);
-        assert_eq!(depth_window_period(11_111_111), 11_111_111);
-        assert_eq!(depth_window_period(8_333_333), 8_333_333);
-        assert_eq!(depth_window_period(1), 4_000_000);
-        assert_eq!(depth_window_period(3_999_999), 4_000_000);
-        assert_eq!(depth_window_period(4_000_000), 4_000_000);
-        assert_eq!(depth_window_period(50_000_000), 50_000_000);
-        assert_eq!(depth_window_period(50_000_001), 50_000_000);
-        assert_eq!(depth_window_period(i64::MAX), 50_000_000);
+    fn depth_freshness_bound_is_one_second() {
+        assert_eq!(DEPTH_MAX_AGE_NS, 1_000_000_000);
+        assert!(is_fresh_generation(22_400_000));
+        assert!(!is_fresh_generation(16_548_900_000));
     }
 
     #[test]
@@ -3907,14 +3872,14 @@ mod tests {
         let b = ctrl.take_plain_break().expect("plain records a break");
         assert!(!b.has_snapshot);
         assert_eq!(PlainWhy::NAMES[b.why as usize], "repeat");
-        ctrl.plain_detailed(PlainWhy::Window, 9327, 49_300_000, 45_000_000);
+        ctrl.plain_detailed(PlainWhy::Window, 9327, 49_300_000, DEPTH_MAX_AGE_NS);
         let b = ctrl
             .take_plain_break()
             .expect("detailed plain records a break");
         assert!(b.has_snapshot);
         assert_eq!(
-            (b.generation, b.age_ns, b.period_ns),
-            (9327, 49_300_000, 45_000_000)
+            (b.generation, b.age_ns, b.bound_ns),
+            (9327, 49_300_000, DEPTH_MAX_AGE_NS)
         );
         assert_eq!(PlainWhy::NAMES[b.why as usize], "window");
         ctrl.plain(PlainWhy::Window);

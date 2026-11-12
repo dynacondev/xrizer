@@ -63,19 +63,20 @@
 //! disappearance is treated like generation 0 (drop imports, plain frame,
 //! re-open).
 //!
-//! Submission gating is [`is_same_generation`] on the signed
-//! frame-vs-depth age — there is deliberately no absolute-age "stale"
-//! gate. A tight per-frame window (period + small margin) subsumes
-//! liveness: same-generation success implies fresh, and a frozen
-//! `generation` across frames (not a clock comparison) is the stalled
-//! producer signal. Feed [`AgeStats`] with one [`depth_age_ns`] sample per
+//! Submission gating is [`is_fresh_generation`] on the signed
+//! frame-vs-depth age: anything older (or newer) than [`DEPTH_MAX_AGE_NS`]
+//! is discarded as clearly stale. The bound is deliberately far wider
+//! than any frame cadence — normal present-to-handoff latency is single
+//! milliseconds — so app jitter never trips it; a frozen `generation`
+//! across frames (not a clock comparison) remains the stalled-producer
+//! signal. Feed [`AgeStats`] with one [`depth_age_ns`] sample per
 //! successful read only — misses carry no timestamp, so they are counted
 //! via [`ReadSkip`] buckets instead — and report it on the heartbeat to
 //! catch sync drift.
 //!
-//! Removed knobs: `XRIZER_DEPTH_MAX_AGE_MS` (absolute-age gate) no longer
-//! exists — if set it is ignored; the kill-switch `XRIZER_DEPTH_SHM` is
-//! the only depth env var.
+//! Staleness bound is hardcoded ([`DEPTH_MAX_AGE_NS`]), not configurable:
+//! `XRIZER_DEPTH_MAX_AGE_MS`, if set, is ignored; the kill-switch
+//! `XRIZER_DEPTH_SHM` is the only depth env var.
 //!
 //! No new crates: `libc` + `log` only.
 
@@ -643,20 +644,22 @@ pub fn depth_age_ns(receipt_mono_ns: u64, header_mono_ns: u64) -> i64 {
     }
 }
 
-/// Same-generation rule from the wire contract: `-margin <= age <
-/// period + margin`. A timestamp inside the last frame period before
-/// Submit is that frame's depth; a marginally newer stamp is the same
-/// frame arriving just after wakeup — freshest case, not an error.
-/// This is the ONLY submission gate: there is no absolute-age "stale"
-/// check. Same-generation success implies fresh (the window sits strictly
-/// inside any sane liveness bound); a stalled producer shows up as a
-/// frozen `generation` across frames, not a clock comparison.
-/// Callers may additionally reject `time_ns == 0` (never-published
-/// sentinel): a failed receipt clock (0) coinciding with a zero stamp
-/// reads as age 0 and would otherwise pass.
-pub fn is_same_generation(age_ns: i64, frame_period_ns: i64, margin_ns: i64) -> bool {
-    debug_assert!(margin_ns >= 0 && frame_period_ns >= 0);
-    age_ns >= margin_ns.saturating_neg() && age_ns < frame_period_ns.saturating_add(margin_ns)
+/// Absolute freshness bound: snapshots older (or newer) than this are
+/// discarded as clearly stale. Generous on purpose — normal handoff
+/// latency is single milliseconds, so this only fires on dead/restarted
+/// producers and long stalls, never on app jitter. Frozen producers are
+/// still detected by identical `generation` across frames (the repeat
+/// gate), not by this clock comparison.
+pub const DEPTH_MAX_AGE_NS: i64 = 1_000_000_000;
+
+/// Freshness gate: the only clock comparison on the submit path. Accepts
+/// any age within ±[`DEPTH_MAX_AGE_NS`] (both directions: straddled
+/// presents read slightly negative, hitches read positive). Callers may
+/// additionally reject `time_ns == 0` (never-published sentinel): a failed
+/// receipt clock (0) coinciding with a zero stamp reads as age 0 and would
+/// otherwise pass.
+pub fn is_fresh_generation(age_ns: i64) -> bool {
+    age_ns > -DEPTH_MAX_AGE_NS && age_ns < DEPTH_MAX_AGE_NS
 }
 
 /// Running signed frame-vs-depth age stats for one heartbeat window.
@@ -771,9 +774,10 @@ pub fn depth_master_enabled() -> bool {
 }
 
 /// `CLOCK_MONOTONIC` in ns. Same clock the producer stamps `time_mono_ns`
-/// with, same machine. Returns 0 on `clock_gettime` failure; [`depth_age_ns`]
-/// maps 0 to a large negative age that [`is_same_generation`] rejects, so
-/// the failure direction is fail-safe to plain frames.
+/// with, same machine. Returns 0 on `clock_gettime` failure; a 0 receipt
+/// against a zero stamp reads as age 0 (inside the freshness bound, hence
+/// the separate `time_ns == 0` gate), while any real receipt against a
+/// zero stamp reads hugely positive and is rejected as stale.
 pub fn now_mono_ns() -> u64 {
     let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     let r = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
@@ -990,13 +994,9 @@ mod tests {
         assert!(ctl.is_viable(), "viable");
         assert_eq!(ctl.eye_w(), 4, "eye_w = w/2");
         assert_eq!(ctl.slot(), 0, "42 % 2"); // 42 % 2
-        // Fresh snapshot: age near zero lands inside the same-generation
-        // window (90Hz period + 2ms margin).
+        // Fresh snapshot: age near zero is inside the freshness bound.
         let age = ctl.age_ns(now_mono_ns());
-        assert!(
-            is_same_generation(age, 11_111_111, 2_000_000),
-            "fresh age {age} in window"
-        );
+        assert!(is_fresh_generation(age), "fresh age {age} in bound");
         assert!(ctl.alloc_covers(4), "alloc covers bpp=4");
         assert!(!ctl.alloc_covers(4 * 1000), "alloc rejects huge want");
     }
@@ -1364,9 +1364,10 @@ mod tests {
 
     #[test]
     fn age_gate_is_symmetric_frame_vs_depth() {
-        // No absolute "stale" gate exists: submission is gated purely on the
-        // signed frame-vs-depth age. Old AND far-future headers both read
-        // fine (viable) — the tight same-generation window rejects them.
+        // Freshness is a wide absolute bound, not a per-frame window:
+        // sub-second snapshots read viable AND associate (late samples of
+        // the current frame arm); only clearly-stale (or far-future)
+        // headers are discarded.
         let mk = |time_ns: u64| DepthControl {
             epoch: 1,
             w: 8,
@@ -1383,36 +1384,29 @@ mod tests {
             app_off: 0,
             app_size: 0,
         };
-        // 90 Hz frame: 11_111_111ns period, 2ms margin.
+        // Fixed receipt clock for exact age arithmetic.
         let receipt = 10_000_000_000u64;
-        // 500ms-old depth: viable snapshot, rejected association.
+        // 500ms-old depth: viable snapshot that still associates (late
+        // sample of a recent frame, not a stuck producer).
         let old = mk(receipt - 500_000_000);
         assert!(old.is_viable());
         let age = old.age_ns(receipt);
         assert_eq!(age, 500_000_000);
-        assert!(!is_same_generation(age, 11_111_111, 2_000_000));
+        assert!(is_fresh_generation(age));
         // Far-future depth (clock breakage): symmetric rejection.
         let fut = mk(receipt + 5_000_000_000);
         assert!(fut.is_viable(), "future still reads viable");
         let age = fut.age_ns(receipt);
         assert_eq!(age, -5_000_000_000);
-        assert!(!is_same_generation(age, 11_111_111, 2_000_000));
+        assert!(!is_fresh_generation(age));
         // Small-negative (straddled present, freshest case): accepted.
         let fresh = mk(receipt + 1_000_000);
-        assert!(is_same_generation(
-            fresh.age_ns(receipt),
-            11_111_111,
-            2_000_000
-        ));
+        assert!(is_fresh_generation(fresh.age_ns(receipt)));
         // Zero stamp: viable snapshot (time is not a viability input),
-        // but the huge age misses every window.
+        // but the huge age misses the freshness bound.
         let zero = mk(0);
         assert!(zero.is_viable(), "time is not viability-gated");
-        assert!(!is_same_generation(
-            zero.age_ns(receipt),
-            11_111_111,
-            2_000_000
-        ));
+        assert!(!is_fresh_generation(zero.age_ns(receipt)));
     }
 
     #[test]
@@ -1431,9 +1425,10 @@ mod tests {
         assert!(ctl.is_viable(), "old header still viable snapshot");
         let age = ctl.age_ns(now_mono_ns());
         // One-sided: post-read time can only be later, so slow CI only
-        // grows the age — an upper bound would flake.
+        // grows the age — and the 1s bound leaves wide headroom above
+        // the ~500ms setup age.
         assert!(age >= 499_000_000, "age >= ~500ms, got {age}");
-        assert!(!is_same_generation(age, 11_111_111, 2_000_000));
+        assert!(is_fresh_generation(age), "sub-second age associates");
         let name2 = format!("/xrizer-depth-test-{pid}-futhdr");
         let _seg2 = make_seg(&name2, 8, 2, 8, |h| {
             h.time_mono_ns = now_mono_ns().saturating_add(5_000_000_000);
@@ -1444,7 +1439,7 @@ mod tests {
         assert!(ctl2.is_viable(), "future header still viable snapshot");
         let age2 = ctl2.age_ns(now_mono_ns());
         assert!(age2 < -4_000_000_000, "age hugely negative, got {age2}");
-        assert!(!is_same_generation(age2, 11_111_111, 2_000_000));
+        assert!(!is_fresh_generation(age2));
     }
 
     #[test]
@@ -1528,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_age_and_same_generation() {
+    fn signed_age_and_freshness_bound() {
         // Older header: positive age.
         assert_eq!(depth_age_ns(1_000, 900), 100);
         // Newer header (straddled present): negative age.
@@ -1536,18 +1531,20 @@ mod tests {
         // Saturation at the extremes (untrusted u64 inputs).
         assert_eq!(depth_age_ns(u64::MAX, 0), i64::MAX);
         assert_eq!(depth_age_ns(0, u64::MAX), -i64::MAX);
-        // Same-generation window: last period plus small negative margin.
-        assert!(is_same_generation(5_000_000, 11_111_111, 2_000_000));
-        assert!(is_same_generation(-1_000_000, 11_111_111, 2_000_000));
-        assert!(!is_same_generation(-3_000_000, 11_111_111, 2_000_000));
-        assert!(!is_same_generation(15_000_000, 11_111_111, 2_000_000));
-        // Boundaries: -margin inclusive, period+margin exclusive.
-        assert!(is_same_generation(-2_000_000, 11_111_111, 2_000_000));
-        assert!(!is_same_generation(-2_000_001, 11_111_111, 2_000_000));
-        assert!(!is_same_generation(13_111_111, 11_111_111, 2_000_000));
-        assert!(is_same_generation(13_111_110, 11_111_111, 2_000_000));
-        // Overflow-safe at the extremes.
-        assert!(is_same_generation(0, i64::MAX, i64::MAX));
+        // Freshness bound: anything strictly within ±1s associates.
+        assert!(is_fresh_generation(0));
+        assert!(is_fresh_generation(22_400_000));
+        assert!(is_fresh_generation(-1_000_000));
+        assert!(is_fresh_generation(999_999_999));
+        assert!(is_fresh_generation(-999_999_999));
+        // Boundaries: ±1s rejected.
+        assert!(!is_fresh_generation(1_000_000_000));
+        assert!(!is_fresh_generation(-1_000_000_000));
+        assert!(!is_fresh_generation(16_548_900_000));
+        assert!(!is_fresh_generation(-5_000_000_000));
+        // Overflow-safe: extremes reject, zero passes.
+        assert!(!is_fresh_generation(i64::MAX));
+        assert!(!is_fresh_generation(-i64::MAX));
     }
 
     #[test]
