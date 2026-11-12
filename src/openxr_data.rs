@@ -12,7 +12,7 @@ use std::sync::{
     RwLock,
     atomic::{AtomicI64, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "monado")]
 use openxr_mndx_xdev_space::XR_MNDX_XDEV_SPACE_EXTENSION_NAME;
@@ -206,38 +206,61 @@ impl<C: Compositor> OpenXrData<C> {
 
     pub fn poll_events(&self) {
         let data = self.session_data.get();
-        if let Some(state) = self.poll_events_impl(&data) {
+        let mut state = None;
+        if let Err(e) = self.poll_events_impl(&data, &mut state, true) {
+            warn!("Failed to poll OpenXR events: {e:?}");
+        }
+        if let Some(state) = state {
             drop(data);
             self.session_data.0.write().unwrap().state = state;
         }
     }
 
-    fn poll_events_impl(&self, session_data: &SessionData) -> Option<xr::SessionState> {
+    /// Drain queued OpenXR events, accumulating the latest session state into
+    /// `state_out` (kept even if a later event in the same batch fails).
+    /// When `dispatch_profile_changes` is false, interaction-profile events are
+    /// dropped instead of dispatched: teardown draining must not run input
+    /// callbacks that unwrap runtime calls and would panic once the runtime
+    /// is gone.
+    fn poll_events_impl(
+        &self,
+        session_data: &SessionData,
+        state_out: &mut Option<xr::SessionState>,
+        dispatch_profile_changes: bool,
+    ) -> xr::Result<()> {
         let mut buf = xr::EventDataBuffer::new();
-        let mut state = None;
-        while let Some(event) = self.instance.poll_event(&mut buf).unwrap() {
-            match event {
-                xr::Event::SessionStateChanged(event) => {
-                    state = Some(event.state());
-                    info!("OpenXR session state changed: {:?}", event.state());
-                }
-                xr::Event::InteractionProfileChanged(_) => {
-                    if let Some(input) = self.input.get() {
-                        input.interaction_profile_changed(session_data);
+        loop {
+            match self.instance.poll_event(&mut buf) {
+                Ok(Some(event)) => match event {
+                    xr::Event::SessionStateChanged(event) => {
+                        *state_out = Some(event.state());
+                        info!("OpenXR session state changed: {:?}", event.state());
                     }
-                }
-                _ => {
-                    info!("unknown event");
-                }
+                    xr::Event::InteractionProfileChanged(_) => {
+                        if dispatch_profile_changes {
+                            if let Some(input) = self.input.get() {
+                                input.interaction_profile_changed(session_data);
+                            }
+                        }
+                    }
+                    _ => {
+                        info!("unknown event");
+                    }
+                },
+                Ok(None) => break,
+                Err(e) => return Err(e),
             }
         }
 
-        state
+        Ok(())
     }
 
     pub fn restart_session(&self) {
         let mut session_guard = self.session_data.0.write().unwrap();
-        self.end_session(&mut session_guard);
+        if !self.end_session(&mut session_guard) {
+            warn!("Aborting session restart: previous session did not shut down cleanly");
+            return;
+        }
 
         let origin = session_guard.current_origin;
         let comp = self
@@ -252,7 +275,7 @@ impl<C: Compositor> OpenXrData<C> {
 
         let (session, waiter, stream) =
             SessionData::new(&self.instance, self.system_id, origin, Some(&info))
-                .expect("Failed to initalize new session");
+                .expect("Failed to initialize new session");
 
         comp.post_session_restart(&session, waiter, stream);
 
@@ -356,25 +379,101 @@ impl<C: Compositor> OpenXrData<C> {
             .unwrap_or_else(|_| get_fallback_rate())
     }
 
-    fn end_session(&self, session_data: &mut SessionData) {
-        session_data.session.request_exit().unwrap();
+    /// Shut the session down (request_exit -> STOPPING -> end -> EXITING).
+    /// Never panics: returns false when the runtime is gone or wedged, in
+    /// which case there is nothing (left) to shut down and the caller must
+    /// not proceed with anything requiring a cleanly exited session.
+    fn end_session(&self, session_data: &mut SessionData) -> bool {
+        // The runtime may already be gone (e.g. Monado/WiVRn IPC disconnect
+        // surfaces as ERROR_INSTANCE_LOST from poll_event), or the session may
+        // never have been running - either way there is nothing to exit.
+        if let Err(e) = session_data.session.request_exit() {
+            warn!("Failed to request OpenXR session exit: {e:?}");
+            return false;
+        }
         let mut state = session_data.state;
-        while state != xr::SessionState::STOPPING {
-            if let Some(s) = self.poll_events_impl(session_data) {
-                state = s;
-            }
+        // Already exited (EXITING was consumed by an earlier poll_events).
+        if state == xr::SessionState::EXITING {
+            return true;
+        }
+        if !wait_for_state(self, session_data, &mut state, xr::SessionState::STOPPING)
+            && state != xr::SessionState::EXITING
+        {
+            session_data.state = state;
+            return false;
+        }
+        session_data.state = state;
+        if state == xr::SessionState::EXITING {
+            // Runtime jumped straight to EXITING: nothing left to end.
+            return true;
         }
         #[cfg(test)]
         if let Some(comp) = self.compositor.get() {
             comp.on_restart();
         }
-        session_data.session.end().unwrap();
-        while state != xr::SessionState::EXITING {
-            if let Some(s) = self.poll_events_impl(session_data) {
-                state = s;
+        if let Err(e) = session_data.session.end() {
+            warn!("Failed to end OpenXR session: {e:?}");
+            return false;
+        }
+        if !wait_for_state(self, session_data, &mut state, xr::SessionState::EXITING) {
+            session_data.state = state;
+            return false;
+        }
+        session_data.state = state;
+        true
+    }
+}
+
+/// How long to wait for the runtime to deliver STOPPING/EXITING during teardown
+/// before giving up. The runtime usually responds within milliseconds; this only
+/// bounds the worst case (wedged/dead runtime) so shutdown can't hang forever.
+const END_SESSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// After the instance, session, or handles are lost, session calls are invalid -
+/// bail out of teardown instead of panicking or hanging.
+fn is_session_dead(e: xr::sys::Result) -> bool {
+    e == xr::sys::Result::ERROR_INSTANCE_LOST
+        || e == xr::sys::Result::ERROR_SESSION_LOST
+        || e == xr::sys::Result::ERROR_HANDLE_INVALID
+}
+
+/// Drain events until `*state == target`. Returns false if the runtime went
+/// away or the wait timed out, so callers can abort teardown instead of
+/// hanging. `*state` is updated incrementally and kept on false.
+fn wait_for_state<C: Compositor>(
+    data: &OpenXrData<C>,
+    session_data: &SessionData,
+    state: &mut xr::SessionState,
+    target: xr::SessionState,
+) -> bool {
+    let deadline = Instant::now() + END_SESSION_TIMEOUT;
+    let mut warned = false;
+    while *state != target {
+        let mut out = None;
+        let res = data.poll_events_impl(session_data, &mut out, false);
+        if let Some(s) = out {
+            *state = s;
+        }
+        if *state == target {
+            return true;
+        }
+        if let Err(e) = res {
+            if is_session_dead(e) {
+                warn!("OpenXR runtime lost while waiting for {target:?} (still {state:?})");
+                return false;
+            }
+            if !warned {
+                warned = true;
+                warn!("Error polling OpenXR events while waiting for {target:?}: {e:?}");
             }
         }
+        if Instant::now() >= deadline {
+            warn!("Timed out waiting for OpenXR session state {target:?} (still {state:?})");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
+    true
 }
 
 pub struct AtomicXrTime(AtomicI64);
