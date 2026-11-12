@@ -120,15 +120,29 @@ impl Compositor {
         #[macros::any_graphics(DynFrameController)]
         fn wait_frame<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
-        ) -> (xr::Time, i64) {
+        ) -> xr::Result<(xr::Time, i64)> {
             ctrl.wait_frame()
         }
 
-        let (display_time, display_period) = ctrl.with_any_graphics_mut::<wait_frame>(());
-        self.openxr.display_time.set(display_time);
-        self.openxr
-            .display_period_nanos
-            .store(display_period, Ordering::Relaxed);
+        match ctrl.with_any_graphics_mut::<wait_frame>(()) {
+            Ok((display_time, display_period)) => {
+                self.openxr.display_time.set(display_time);
+                self.openxr
+                    .display_period_nanos
+                    .store(display_period, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if openxr_data::is_session_dead(e) {
+                    if self.openxr.mark_session_lost() {
+                        warn!(
+                            "OpenXR session lost during wait_frame ({e:?}); degrading to no-op frames"
+                        );
+                    }
+                } else {
+                    warn!("OpenXR wait_frame failed: {e:?}");
+                }
+            }
+        }
     }
 
     fn maybe_begin_frame(&self, session_data: &SessionData) {
@@ -149,11 +163,30 @@ impl Compositor {
         };
 
         #[macros::any_graphics(DynFrameController)]
-        fn begin_frame<G: GraphicsBackend + 'static>(ctrl: &mut FrameController<G>) {
+        fn begin_frame<G: GraphicsBackend + 'static>(
+            ctrl: &mut FrameController<G>,
+        ) -> xr::Result<()> {
             ctrl.begin_frame()
         }
 
-        ctrl.with_any_graphics_mut::<begin_frame>(());
+        if let Err(e) = ctrl.with_any_graphics_mut::<begin_frame>(()) {
+            // A failed begin() means no frame was begun: revert so the next
+            // PostPresentHandoff doesn't end() a frame that was never begun
+            // (which the runtime would reject).
+            self.frame_state
+                .lock()
+                .unwrap()
+                .advance_to(FrameState::Waited);
+            if openxr_data::is_session_dead(e) {
+                if self.openxr.mark_session_lost() {
+                    warn!(
+                        "OpenXR session lost during begin_frame ({e:?}); degrading to no-op frames"
+                    );
+                }
+            } else {
+                warn!("OpenXR begin_frame failed: {e:?}");
+            }
+        }
     }
 
     pub fn initialize_real_session(
@@ -382,6 +415,10 @@ impl vr::IVRCompositor029_Interface for Compositor {
 
         if !self.focused.is_completed() {
             // SteamVR doesn't seem to return an error in this case...
+            return vr::EVRCompositorError::None;
+        }
+
+        if self.openxr.session_lost.load(Ordering::Relaxed) {
             return vr::EVRCompositorError::None;
         }
 
@@ -672,6 +709,12 @@ impl vr::IVRCompositor029_Interface for Compositor {
         true
     }
     fn PostPresentHandoff(&self) {
+        // Also a direct app entry point (explicit timing): never touch a
+        // dead runtime even if the caller skipped the WaitGetPoses guard.
+        if self.openxr.session_lost.load(Ordering::Relaxed) {
+            return;
+        }
+
         #[macros::any_graphics(DynFrameController)]
         fn end_frame<G: GraphicsBackend + 'static>(
             ctrl: &mut FrameController<G>,
@@ -681,7 +724,8 @@ impl vr::IVRCompositor029_Interface for Compositor {
             display_period: i64,
             depth_enabled: bool,
             overlays: Option<&OverlayMan>,
-        ) where
+        ) -> Option<xr::sys::Result>
+        where
             for<'b> &'b crate::overlay::AnySwapchainMap:
                 TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
             for<'a> &'a openxr_data::GraphicalSession:
@@ -716,14 +760,18 @@ impl vr::IVRCompositor029_Interface for Compositor {
         let depth_enabled = self.openxr.enabled_extensions.khr_composition_layer_depth;
         let overlays = self.overlays.get();
 
-        ctrl.with_any_graphics_mut::<end_frame>((
+        if let Some(e) = ctrl.with_any_graphics_mut::<end_frame>((
             &session_data,
             &system,
             display_time,
             display_period,
             depth_enabled,
             overlays.as_deref(),
-        ));
+        )) {
+            if self.openxr.mark_session_lost() {
+                warn!("OpenXR session lost during frame end ({e:?}); degrading to no-op frames");
+            }
+        }
 
         self.frame_state
             .lock()
@@ -793,6 +841,15 @@ impl vr::IVRCompositor029_Interface for Compositor {
 
         if !self.focused.is_completed() {
             return vr::EVRCompositorError::DoNotHaveFocus;
+        }
+
+        // Silently drop frames once the runtime is gone; WaitGetPoses
+        // reports the loss. Returning EVRCompositorError::None keeps the app
+        // closest to normal operation until it exits. A lost runtime cannot
+        // recover in-process, so the flag stays set (until a successful
+        // restart_session, which requires a live runtime anyway).
+        if self.openxr.session_lost.load(Ordering::Relaxed) {
+            return vr::EVRCompositorError::None;
         }
 
         let mut session_lock = self.openxr.session_data.get();
@@ -921,33 +978,41 @@ impl vr::IVRCompositor029_Interface for Compositor {
         // This should be called every frame - we must regularly poll events
         self.openxr.poll_events();
         self.focused.call_once(|| {});
-        {
-            let session_data = self.openxr.session_data.get();
-            let timing_mode = *self.timing_mode.lock().unwrap();
-            if matches!(
-                timing_mode,
-                vr::EVRCompositorTimingMode::Implicit
-                    | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
-            ) && *self.frame_state.lock().unwrap() == FrameState::Begun
+        // A dead runtime stays dead: skip every runtime call below and still
+        // report (stale) poses, so the app can keep pumping until it exits.
+        if !self.openxr.session_lost.load(Ordering::Relaxed) {
             {
-                self.PostPresentHandoff();
-            }
+                let session_data = self.openxr.session_data.get();
+                let timing_mode = *self.timing_mode.lock().unwrap();
+                if matches!(
+                    timing_mode,
+                    vr::EVRCompositorTimingMode::Implicit
+                        | vr::EVRCompositorTimingMode::Explicit_RuntimePerformsPostPresentHandoff
+                ) && *self.frame_state.lock().unwrap() == FrameState::Begun
+                {
+                    self.PostPresentHandoff();
+                }
 
-            if *self.frame_state.lock().unwrap() == FrameState::Waited {
-                // discard frame
-                self.maybe_begin_frame(&session_data);
-            }
-            self.maybe_wait_frame(&session_data);
+                if *self.frame_state.lock().unwrap() == FrameState::Waited {
+                    // discard frame
+                    self.maybe_begin_frame(&session_data);
+                }
+                self.maybe_wait_frame(&session_data);
 
-            if timing_mode == vr::EVRCompositorTimingMode::Implicit {
-                self.maybe_begin_frame(&session_data);
+                if timing_mode == vr::EVRCompositorTimingMode::Implicit {
+                    self.maybe_begin_frame(&session_data);
+                }
             }
-        }
-        if let Some(system) = self.system.get() {
-            system.reset_views();
-        }
-        if let Some(input) = self.input.get() {
-            input.frame_start_update();
+            // The session may have died mid-frame above, and the input sync
+            // below unwraps runtime calls — re-check before touching it.
+            if !self.openxr.session_lost.load(Ordering::Relaxed) {
+                if let Some(system) = self.system.get() {
+                    system.reset_views();
+                }
+                if let Some(input) = self.input.get() {
+                    input.frame_start_update();
+                }
+            }
         }
 
         self.GetLastPoses(
@@ -1064,15 +1129,16 @@ struct SubmittedEye {
 
 /// Depth submission outcome: distinguishes a failed runtime `end()`
 /// (frame is terminal — re-ending without a new `begin` is invalid and
-/// the plain path's `unwrap()` would panic) from ordinary gate misses
-/// (caller falls back to color-only `end()`).
+/// the frame must be dropped) from ordinary gate misses (caller falls
+/// back to color-only `end()`).
 #[derive(PartialEq, Eq)]
 enum DepthEnd {
     WithDepth,
     Plain,
     /// No regression test: fakexr's end() never fails, so this arm is
-    /// reachable only against a real rejecting runtime.
-    EndFailed,
+    /// reachable only against a real rejecting runtime. Carries the
+    /// rejection so the caller can flag a dead session.
+    EndFailed(xr::sys::Result),
 }
 
 /// One bucket charged per non-WithDepth frame (see `plain`): the
@@ -1536,7 +1602,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         &mut self,
         session_data: &SessionData,
         mut create_info: xr::SwapchainCreateInfo<G::Api>,
-    ) where
+    ) -> xr::Result<()>
+    where
         for<'a> &'a openxr_data::GraphicalSession:
             TryInto<&'a openxr_data::Session<G::Api>, Error: std::fmt::Display>,
         <G::Api as xr::Graphics>::Format: PartialEq + std::fmt::Debug,
@@ -1549,11 +1616,14 @@ impl<G: GraphicsBackend> FrameController<G> {
             info: create_info,
             initial_format,
         });
-        self.acquire_swapchain_image();
+        // Reset before acquiring: a failed acquire must still leave
+        // consistent state (the new swapchain stays installed for retry).
         self.eyes_submitted = Default::default();
         // Color geometry is the depth size source; a recreate invalidates
         // any armed depth (dims, imports, pins) — reset to unarmed.
         self.drop_depth_state();
+        self.acquire_swapchain_image()?;
+        Ok(())
     }
 
     /// Release a held pin (if any), drop FD imports and the depth
@@ -1586,62 +1656,60 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.flush_depth_heartbeat();
     }
 
-    fn acquire_swapchain_image(&mut self) {
+    fn acquire_swapchain_image(&mut self) -> xr::Result<()> {
         let swapchain = &mut self
             .swapchain_data
             .as_mut()
             .expect("Can't acquire swapchain image with no swapchain!")
             .swapchain;
 
-        self.image_index = swapchain
-            .acquire_image()
-            .expect("Failed to acquire swapchain image") as usize;
+        self.image_index = swapchain.acquire_image()? as usize;
 
         trace!("waiting image");
         {
             tracy_span!("wait swapchain image");
-            swapchain
-                .wait_image(xr::Duration::INFINITE)
-                .expect("Failed to wait for swapchain image");
+            swapchain.wait_image(xr::Duration::INFINITE)?;
         }
 
         self.image_acquired = true;
+        Ok(())
     }
 
-    fn wait_frame(&mut self) -> (xr::Time, i64) {
+    fn wait_frame(&mut self) -> xr::Result<(xr::Time, i64)> {
         let frame_state = {
             tracy_span!("wait frame");
-            self.waiter.wait().unwrap()
+            self.waiter.wait()?
         };
         self.should_render = frame_state.should_render && !self.app_suspend_render;
-        (
+        Ok((
             frame_state.predicted_display_time,
             frame_state.predicted_display_period.as_nanos(),
-        )
+        ))
     }
 
-    fn begin_frame(&mut self) {
+    fn begin_frame(&mut self) -> xr::Result<()> {
         if self.image_acquired {
             tracy_span!("release old swapchain image");
             self.swapchain_data
                 .as_mut()
                 .expect("Image is acquired, yet we have no swapchain?")
                 .swapchain
-                .release_image()
-                .unwrap();
+                .release_image()?;
+            self.image_acquired = false;
         }
 
         if self.swapchain_data.is_some() {
-            self.acquire_swapchain_image();
+            self.acquire_swapchain_image()?;
         }
 
         {
             tracy_span!("begin frame");
-            self.stream.begin().expect("Couldn't begin frame");
+            self.stream.begin()?;
         }
         self.eyes_submitted = [None; 2];
         self.submitting_null = false;
         trace!("frame begin");
+        Ok(())
     }
 
     fn submit_impl(
@@ -1670,37 +1738,36 @@ impl<G: GraphicsBackend> FrameController<G> {
                 .backend
                 .swapchain_info_for_texture(texture, bounds, color_space);
 
-            is_valid_swapchain_info(&new_info)
-                .then(|| {
-                    assert!(
-                        !self.submitting_null,
-                        "App submitted a null texture and a normal texture in the same frame"
-                    );
+            if !is_valid_swapchain_info(&new_info) {
+                trace!("submitting null this frame");
+                self.submitting_null = true;
+                Some(Default::default())
+            } else {
+                assert!(
+                    !self.submitting_null,
+                    "App submitted a null texture and a normal texture in the same frame"
+                );
 
-                    if !self.swapchain_data.as_ref().is_some_and(|data| {
-                        is_usable_swapchain(&data.info, data.initial_format, &new_info)
-                    }) {
-                        info!("recreating swapchain (for {eye:?})");
-                        self.recreate_swapchain(session_data, new_info);
-                    }
+                if !self.swapchain_data.as_ref().is_some_and(|data| {
+                    is_usable_swapchain(&data.info, data.initial_format, &new_info)
+                }) {
+                    info!("recreating swapchain (for {eye:?})");
+                    self.recreate_swapchain(session_data, new_info)
+                        .map_err(|_| vr::EVRCompositorError::RequestFailed)?;
+                }
 
-                    SubmittedEye {
-                        extent: self.backend.copy_texture_to_swapchain(
-                            eye,
-                            texture,
-                            color_space,
-                            bounds,
-                            self.image_index,
-                            submit_flags,
-                        ),
-                        flip_vertically: bounds.vertically_flipped(),
-                    }
+                Some(SubmittedEye {
+                    extent: self.backend.copy_texture_to_swapchain(
+                        eye,
+                        texture,
+                        color_space,
+                        bounds,
+                        self.image_index,
+                        submit_flags,
+                    ),
+                    flip_vertically: bounds.vertically_flipped(),
                 })
-                .or_else(|| {
-                    trace!("submitting null this frame");
-                    self.submitting_null = true;
-                    Some(Default::default())
-                })
+            }
         } else {
             Some(Default::default())
         };
@@ -1712,14 +1779,25 @@ impl<G: GraphicsBackend> FrameController<G> {
                 && let Some(data) = self.swapchain_data.as_mut()
             {
                 trace!("releasing image");
-                data.swapchain.release_image().unwrap();
+                // Best-effort: a dead runtime can't take the image back (the
+                // next end() flags the session lost and frames stop), so only
+                // a success clears the acquire — a transient failure keeps
+                // image_acquired set, so the next begin_frame retries the
+                // release of the same image instead of leaking the acquire.
+                if data.swapchain.release_image().is_ok() {
+                    self.image_acquired = false;
+                } else {
+                    warn!("Failed to release swapchain image; will retry next frame");
+                }
             }
-            self.image_acquired = false;
         }
 
         Ok(())
     }
 
+    /// Present one frame. Returns the dead-session error if this frame
+    /// observed the runtime dying (depth or plain `end()`), so the caller
+    /// can flag the session lost. `None` means healthy or already handled.
     fn end_frame(
         &mut self,
         session_data: &SessionData,
@@ -1728,7 +1806,8 @@ impl<G: GraphicsBackend> FrameController<G> {
         display_period: i64,
         depth_enabled: bool,
         overlays: Option<&OverlayMan>,
-    ) where
+    ) -> Option<xr::sys::Result>
+    where
         for<'b> &'b crate::overlay::AnySwapchainMap:
             TryInto<&'b crate::overlay::SwapchainMap<G::Api>, Error: std::fmt::Display>,
         for<'a> &'a openxr_data::GraphicalSession:
@@ -1781,8 +1860,11 @@ impl<G: GraphicsBackend> FrameController<G> {
         if depth_end != DepthEnd::Plain {
             // WithDepth: submitted. EndFailed: the failed end() already
             // concluded the frame — re-ending without a new begin is
-            // invalid (and the plain path unwraps), so stop here.
-            return;
+            // invalid, so stop here.
+            return match depth_end {
+                DepthEnd::EndFailed(e) if openxr_data::is_session_dead(e) => Some(e),
+                _ => None,
+            };
         }
 
         let mut proj_layer_views = Vec::new();
@@ -1862,13 +1944,28 @@ impl<G: GraphicsBackend> FrameController<G> {
         }
 
         let t_pend0 = now_mono_ns();
-        self.stream
+        match self
+            .stream
             .end(display_time, xr::EnvironmentBlendMode::OPAQUE, &layers)
-            .unwrap();
-        self.sp_plain_end
-            .sample(now_mono_ns().saturating_sub(t_pend0));
-
-        trace!("frame submitted");
+        {
+            Ok(()) => {
+                self.sp_plain_end
+                    .sample(now_mono_ns().saturating_sub(t_pend0));
+                trace!("frame submitted");
+                None
+            }
+            Err(e) => {
+                // A failed end() concludes the frame: the caller must not
+                // re-end. A dead runtime degrades to dropped frames
+                // (flagged by the caller); anything else indicates a caller
+                // bug, so stay loud.
+                if openxr_data::is_session_dead(e) {
+                    return Some(e);
+                }
+                warn!("frame end failed ({e}); frame dropped");
+                None
+            }
+        }
     }
 
     /// Poll the outstanding depth-copy fence (zero timeout, never blocks).
@@ -2384,10 +2481,11 @@ impl<G: GraphicsBackend> FrameController<G> {
                 .wait_image(xr::Duration::from_nanos(DEPTH_ACQUIRE_TIMEOUT_NS))
                 .is_err()
             {
-                // A timed-out wait must release the image — otherwise each
-                // event permanently consumes one swapchain image until the
-                // feed latches off instead of skipping a tick.
-                let _ = data.swapchain.release_image();
+                // The image stays acquired: the openxr wrapper asserts that
+                // wait succeeded before release, so releasing here would
+                // panic. The leaked image just shrinks the pool until this
+                // surfaces as NoImage (plain frame), the designed fallback
+                // for a wedged producer.
                 return Some(Acquire::TimedOut);
             }
             Some(Acquire::Done(idx))
@@ -2731,7 +2829,7 @@ impl<G: GraphicsBackend> FrameController<G> {
                 }
                 self.se_depth_end
                     .sample(now_mono_ns().saturating_sub(t_end0));
-                DepthEnd::EndFailed
+                DepthEnd::EndFailed(e)
             }
         }
     }

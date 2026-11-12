@@ -10,7 +10,7 @@ use openxr as xr;
 use std::mem::ManuallyDrop;
 use std::sync::{
     RwLock,
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,11 @@ pub struct OpenXrData<C: Compositor> {
     pub display_time: AtomicXrTime,
     pub display_period_nanos: AtomicI64,
     pub enabled_extensions: xr::ExtensionSet,
+    /// Set once the runtime/session is observed dead (lost errors from
+    /// poll/wait/begin/end). Frame entry points check this to degrade to
+    /// no-op frames instead of hammering a dead runtime. Cleared by
+    /// `restart_session` on a clean rebuild.
+    pub session_lost: AtomicBool,
 
     /// should only be externally accessed for testing
     pub(crate) input: Injected<crate::input::Input<C>>,
@@ -199,16 +204,29 @@ impl<C: Compositor> OpenXrData<C> {
             display_time: AtomicXrTime(display_time.into()), // This will get replaced on the first WaitGetPoses
             display_period_nanos: 11111111.into(), // This will get replaced on the first WaitGetPoses
             enabled_extensions: exts,
+            session_lost: AtomicBool::new(false),
             input: injector.inject(),
             compositor: injector.inject(),
         })
+    }
+
+    /// Flag the session as lost. Returns true if this call flipped the flag,
+    /// so the first observer logs and the rest stay quiet.
+    pub fn mark_session_lost(&self) -> bool {
+        !self.session_lost.swap(true, Ordering::Relaxed)
     }
 
     pub fn poll_events(&self) {
         let data = self.session_data.get();
         let mut state = None;
         if let Err(e) = self.poll_events_impl(&data, &mut state, true) {
-            warn!("Failed to poll OpenXR events: {e:?}");
+            if is_session_dead(e) {
+                if self.mark_session_lost() {
+                    warn!("OpenXR runtime lost ({e:?}); degrading to no-op frames");
+                }
+            } else {
+                warn!("Failed to poll OpenXR events: {e:?}");
+            }
         }
         if let Some(state) = state {
             drop(data);
@@ -284,6 +302,7 @@ impl<C: Compositor> OpenXrData<C> {
         }
 
         *session_guard = ManuallyDrop::new(session);
+        self.session_lost.store(false, Ordering::Relaxed);
     }
 
     pub fn set_tracking_space(&self, space: vr::ETrackingUniverseOrigin) {
@@ -431,7 +450,7 @@ const END_SESSION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// After the instance, session, or handles are lost, session calls are invalid -
 /// bail out of teardown instead of panicking or hanging.
-fn is_session_dead(e: xr::sys::Result) -> bool {
+pub(crate) fn is_session_dead(e: xr::sys::Result) -> bool {
     e == xr::sys::Result::ERROR_INSTANCE_LOST
         || e == xr::sys::Result::ERROR_SESSION_LOST
         || e == xr::sys::Result::ERROR_HANDLE_INVALID

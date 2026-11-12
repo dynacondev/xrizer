@@ -1483,21 +1483,30 @@ impl<C: openxr_data::Compositor> Input<C> {
                 && (right_hand.is_none_or(|hand| !hand.connected))
             {
                 debug!("no controllers connected - syncing info set");
-                data.session
+                if let Err(e) = data
+                    .session
                     .sync_actions(&[xr::ActiveActionSet::new(&loaded.info_set)])
-                    .unwrap();
+                {
+                    warn!("Failed to sync info action set: {e:?}");
+                    if openxr_data::is_session_dead(e) {
+                        return;
+                    }
+                }
             }
             return;
         }
 
         match input_data.get_legacy_actions() {
             Some(actions) => {
-                data.session
-                    .sync_actions(&[
-                        xr::ActiveActionSet::new(&actions.set),
-                        xr::ActiveActionSet::new(&input_data.pose_data.get().unwrap().set),
-                    ])
-                    .unwrap();
+                if let Err(e) = data.session.sync_actions(&[
+                    xr::ActiveActionSet::new(&actions.set),
+                    xr::ActiveActionSet::new(&input_data.pose_data.get().unwrap().set),
+                ]) {
+                    warn!("Failed to sync legacy actions: {e:?}");
+                    if openxr_data::is_session_dead(e) {
+                        return;
+                    }
+                }
 
                 self.legacy_state.on_action_sync();
             }
