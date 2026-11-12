@@ -1141,6 +1141,21 @@ impl PlainWhy {
     }
 }
 
+/// Snapshot for the first-plain-after-depth log: the gate that fired plus
+/// the header identity and age that explain it. Set on every plain (the
+/// `plain` choke point); gates that know the snapshot upgrade it via
+/// `plain_detailed`. Consumed once in `end_frame` when a plain breaks a
+/// WithDepth streak, so isolated single-frame drops arrive with a cause
+/// attached while storms stay quiet (one line + the 30-frame trip).
+#[derive(Copy, Clone)]
+struct PlainBreak {
+    why: PlainWhy,
+    has_snapshot: bool,
+    generation: u64,
+    age_ns: i64,
+    period_ns: i64,
+}
+
 struct SwapchainData<G: xr::Graphics> {
     swapchain: xr::Swapchain<G>,
     info: xr::SwapchainCreateInfo<G>,
@@ -1288,6 +1303,11 @@ struct FrameController<G: GraphicsBackend> {
     /// Reset on WithDepth only (never on the heartbeat) so a loss
     /// spanning windows still reports its full-run dominant gate.
     arm_win: [u64; PlainWhy::COUNT],
+    /// Pending first-plain-after-depth attribution (see `PlainBreak`).
+    /// Set on every plain, upgraded with the snapshot by gates that
+    /// know it, consumed once when a plain breaks a WithDepth streak,
+    /// cleared on WithDepth and on `drop_depth_state`.
+    pending_break: Option<PlainBreak>,
     /// Per-end_frame depth-path wall time in ns (outer wrapper samples
     /// every attempted frame: SHM reads, gates, bounded acquire, GL
     /// copy, epoch re-read, layer build, end()). Heartbeat stats like
@@ -1496,6 +1516,7 @@ impl<G: GraphicsBackend> FrameController<G> {
             arm_plain_run: 0,
             arm_loss_logged: false,
             arm_win: [0; PlainWhy::COUNT],
+            pending_break: None,
             dw_count: 0,
             dw_sum_ns: 0,
             dw_max_ns: 0,
@@ -1546,8 +1567,9 @@ impl<G: GraphicsBackend> FrameController<G> {
 
     /// Release a held pin (if any), drop FD imports and the depth
     /// swapchain, and reset arming to unarmed. Safe with no feed/segment:
-    /// unpin on a vanished segment is a no-op false. Counters, stats, and
-    /// the heartbeat window survive recreates.
+    /// unpin on a vanished segment is a no-op false. The heartbeat window
+    /// reports-and-resets here (partial window) so teardown/recreate
+    /// can't swallow the final plains; other stats survive recreates.
     fn drop_depth_state(&mut self) {
         if let (Some(feed), Some(slot)) = (self.depth_feed.as_ref(), self.pinned_slot) {
             feed.unpin_slot(slot);
@@ -1567,6 +1589,10 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.arm_plain_run = 0;
         self.arm_loss_logged = false;
         self.arm_win = [0; PlainWhy::COUNT];
+        self.pending_break = None;
+        // Report the partial window before the counters keep going:
+        // teardown/recreate would otherwise swallow the final plains.
+        self.flush_depth_heartbeat();
     }
 
     fn acquire_swapchain_image(&mut self) {
@@ -1746,7 +1772,15 @@ impl<G: GraphicsBackend> FrameController<G> {
             self.arm_plain_run = 0;
             self.arm_loss_logged = false;
             self.arm_win = [0; PlainWhy::COUNT];
+            self.pending_break = None;
         } else {
+            if self.arm_plain_run == 0 {
+                // First plain after a WithDepth streak (or startup): one
+                // line with the gate and snapshot identity. Isolated
+                // single-frame drops arrive with a cause attached; storms
+                // stay quiet here (the 30-frame trip names the run).
+                self.log_plain_break();
+            }
             self.arm_plain_run = self.arm_plain_run.saturating_add(1);
             if self.arm_plain_run == DEPTH_ARM_LOSS_TRIP_FRAMES && !self.arm_loss_logged {
                 self.arm_loss_logged = true;
@@ -1927,10 +1961,66 @@ impl<G: GraphicsBackend> FrameController<G> {
     }
 
     /// Charge one arming-loss window bucket and fall back to plain.
-    /// Counter increment only — no logging, no control effect.
+    /// Counter increment only — no logging, no control effect. Records
+    /// the pending first-plain-after-depth attribution (gate only; gates
+    /// with a snapshot use `plain_detailed` instead).
     fn plain(&mut self, why: PlainWhy) -> DepthEnd {
+        self.pending_break = Some(PlainBreak {
+            why,
+            has_snapshot: false,
+            generation: 0,
+            age_ns: 0,
+            period_ns: 0,
+        });
         self.note_plain(why);
         DepthEnd::Plain
+    }
+
+    /// `plain` with the SHM snapshot attached for the break log. Use at
+    /// gates that have already read a viable header (repeat, window).
+    fn plain_detailed(
+        &mut self,
+        why: PlainWhy,
+        generation: u64,
+        age_ns: i64,
+        period_ns: i64,
+    ) -> DepthEnd {
+        self.pending_break = Some(PlainBreak {
+            why,
+            has_snapshot: true,
+            generation,
+            age_ns,
+            period_ns,
+        });
+        self.note_plain(why);
+        DepthEnd::Plain
+    }
+
+    fn take_plain_break(&mut self) -> Option<PlainBreak> {
+        self.pending_break.take()
+    }
+
+    /// One-line attribution for a plain that breaks a WithDepth streak:
+    /// the gate plus (when known) the header identity and age that fired
+    /// it. Logging only — counter state is untouched.
+    fn log_plain_break(&mut self) {
+        let Some(b) = self.take_plain_break() else {
+            return;
+        };
+        if b.has_snapshot {
+            info!(
+                "depth plain break: {} gen {} age {:+.1}ms period {:.1}ms",
+                PlainWhy::NAMES[b.why as usize],
+                b.generation,
+                b.age_ns as f64 / 1_000_000.0,
+                b.period_ns as f64 / 1_000_000.0,
+            );
+        } else {
+            info!(
+                "depth plain break: {} (no snapshot)",
+                PlainWhy::NAMES[b.why as usize],
+            );
+        }
     }
 
     /// Charge one arming-loss window bucket without changing the outcome
@@ -2155,7 +2245,12 @@ impl<G: GraphicsBackend> FrameController<G> {
                     self.last_armed_gen, self.frozen_run,
                 );
             }
-            return self.plain(PlainWhy::Repeat);
+            return self.plain_detailed(
+                PlainWhy::Repeat,
+                ctl.generation,
+                ctl.age_ns(receipt),
+                depth_window_period(display_period),
+            );
         }
         self.frozen_run = 0;
         if self.frozen_tripped {
@@ -2197,9 +2292,10 @@ impl<G: GraphicsBackend> FrameController<G> {
             }
         };
         let period = depth_window_period(display_period);
-        if !is_same_generation(ctl.age_ns(receipt), period, DEPTH_MARGIN_NS) {
+        let age_ns = ctl.age_ns(receipt);
+        if !is_same_generation(age_ns, period, DEPTH_MARGIN_NS) {
             self.hb_window = self.hb_window.saturating_add(1);
-            return self.plain(PlainWhy::Window);
+            return self.plain_detailed(PlainWhy::Window, ctl.generation, age_ns, period);
         }
         // Dims are authoritative per read: never stretch, skip the frame.
         let (cw, ch) = match self.swapchain_data.as_ref() {
@@ -2752,8 +2848,23 @@ impl<G: GraphicsBackend> FrameController<G> {
     /// the last observed header identity (gen/epoch/dims, never reset). Hot
     /// path pays counter increments only; formatting happens here.
     fn maybe_log_depth_heartbeat(&mut self) {
+        self.log_depth_heartbeat(false);
+    }
+
+    /// Emit the pending window now (teardown/recreate): silent when the
+    /// window holds no frames so idle drops stay quiet. Covers the
+    /// app-exit-before-next-tick case where the final partial window (and
+    /// its plain buckets) would otherwise never be reported.
+    fn flush_depth_heartbeat(&mut self) {
+        self.log_depth_heartbeat(true);
+    }
+
+    fn log_depth_heartbeat(&mut self, force: bool) {
         let now = Instant::now();
-        if now.duration_since(self.hb_start) < DEPTH_HEARTBEAT_INTERVAL {
+        if !force && now.duration_since(self.hb_start) < DEPTH_HEARTBEAT_INTERVAL {
+            return;
+        }
+        if force && self.hb_frames == 0 {
             return;
         }
         let secs = now.duration_since(self.hb_start).as_secs_f64().max(0.001);
@@ -2910,6 +3021,15 @@ impl<G: GraphicsBackend> FrameController<G> {
         self.se_depth_end.clear();
         self.sp_plain_end.clear();
         self.sl_sample_log.clear();
+    }
+}
+
+impl<G: GraphicsBackend> Drop for FrameController<G> {
+    fn drop(&mut self) {
+        // Last-chance partial window (any drop path that bypassed
+        // `drop_depth_state`): silent when empty, so a double flush after
+        // an explicit one can't log.
+        self.flush_depth_heartbeat();
     }
 }
 
@@ -3752,5 +3872,47 @@ mod tests {
         ctrl.hb_frames = 7;
         ctrl.maybe_log_depth_heartbeat();
         assert_eq!(ctrl.hb_frames, 7);
+    }
+
+    /// Plain-break attribution: `plain` records the gate, snapshot gates
+    /// upgrade it with header identity/age, the break log consumes it, and
+    /// the heartbeat flush reports a partial window (silent when empty).
+    #[test]
+    fn plain_break_and_flush() {
+        let f = Fixture::new();
+        f.ensure_real_session(false);
+
+        let data = f.comp.openxr.session_data.get();
+        let mut lock = data.comp_data.0.lock().unwrap();
+        let DynFrameController::Fake(ctrl) = lock.as_mut().unwrap() else {
+            panic!("Frame controller was not set up or not faked!");
+        };
+        ctrl.plain(PlainWhy::Repeat);
+        let b = ctrl.take_plain_break().expect("plain records a break");
+        assert!(!b.has_snapshot);
+        assert_eq!(PlainWhy::NAMES[b.why as usize], "repeat");
+        ctrl.plain_detailed(PlainWhy::Window, 9327, 49_300_000, 45_000_000);
+        let b = ctrl
+            .take_plain_break()
+            .expect("detailed plain records a break");
+        assert!(b.has_snapshot);
+        assert_eq!(
+            (b.generation, b.age_ns, b.period_ns),
+            (9327, 49_300_000, 45_000_000)
+        );
+        assert_eq!(PlainWhy::NAMES[b.why as usize], "window");
+        ctrl.plain(PlainWhy::Window);
+        ctrl.log_plain_break();
+        assert!(
+            ctrl.take_plain_break().is_none(),
+            "break log consumes the break"
+        );
+        ctrl.hb_frames = 5;
+        ctrl.hb_depth = 4;
+        ctrl.flush_depth_heartbeat();
+        assert_eq!(ctrl.hb_frames, 0);
+        assert_eq!(ctrl.hb_depth, 0);
+        ctrl.flush_depth_heartbeat();
+        assert_eq!(ctrl.hb_frames, 0, "empty flush stays silent");
     }
 }
