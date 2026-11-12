@@ -238,7 +238,7 @@ impl openxr_data::Compositor for Compositor {
                     // out manually. The remaining controller state (feed,
                     // waiter, stream) is intentionally not dropped here;
                     // session-scoped teardown releases it.
-                    let mut ctrl = std::mem::ManuallyDrop::new(ctrl);
+                    let ctrl = std::mem::ManuallyDrop::new(ctrl);
                     // SAFETY: `ctrl` is never used again and never dropped
                     // (`ManuallyDrop`), so these reads cannot double-drop;
                     // both places are valid (built with the controller).
