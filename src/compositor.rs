@@ -232,9 +232,25 @@ impl openxr_data::Compositor for Compositor {
                     // forever (silent permanent half-rate until the producer
                     // rebuilds the segment).
                     ctrl.drop_depth_state();
+                    // Moving fields out of a `Drop` type is rejected
+                    // (E0509): the explicit flush above already reported
+                    // the window, so suppress `Drop` and move the parts
+                    // out manually. The remaining controller state (feed,
+                    // waiter, stream) is intentionally not dropped here;
+                    // session-scoped teardown releases it.
+                    let mut ctrl = std::mem::ManuallyDrop::new(ctrl);
+                    // SAFETY: `ctrl` is never used again and never dropped
+                    // (`ManuallyDrop`), so these reads cannot double-drop;
+                    // both places are valid (built with the controller).
+                    let (backend, swapchain_data) = unsafe {
+                        (
+                            std::ptr::read(&ctrl.backend),
+                            std::ptr::read(&ctrl.swapchain_data),
+                        )
+                    };
                     TempBackendData {
-                        backend: ctrl.backend,
-                        swapchain_create_info: ctrl.swapchain_data.map(|d| d.info),
+                        backend,
+                        swapchain_create_info: swapchain_data.map(|d| d.info),
                     }
                     .into()
                 }
