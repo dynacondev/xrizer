@@ -883,7 +883,7 @@ mod tests {
             mem_fds: [11, 12],
             reserved: [-1, -1],
             alloc_bytes: 8 * 2 * 4,
-            near_z: 0.00742,
+            near_z: 0.00842,
             far_z: 10000.0,
             app_size: 0,
             pinned: [0, 0],
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(ctl.epoch, 7, "epoch");
         assert_eq!(ctl.mem_fds, [11, 12], "mem fds");
         assert_eq!(ctl.alloc_bytes, 8 * 2 * 4, "alloc");
-        assert!((ctl.near_z - 0.00742).abs() < f32::EPSILON, "near");
+        assert!((ctl.near_z - 0.00842).abs() < f32::EPSILON, "near");
         assert!((ctl.far_z - 10000.0).abs() < f32::EPSILON, "far");
         assert!(ctl.is_viable(), "viable");
         assert_eq!(ctl.eye_w(), 4, "eye_w = w/2");
@@ -1375,7 +1375,7 @@ mod tests {
             generation: 1,
             time_ns,
             mem_fds: [11, 12],
-            near_z: 0.00742,
+            near_z: 0.00842,
             far_z: 10000.0,
             seg_len: HEADER_SIZE,
             alloc_bytes: 64,
@@ -1514,8 +1514,8 @@ mod tests {
     #[test]
     fn near_far_strict() {
         assert_eq!(
-            validate_near_far(0.00742, 10000.0),
-            Some((0.00742, 10000.0))
+            validate_near_far(0.00842, 10000.0),
+            Some((0.00842, 10000.0))
         );
         assert_eq!(validate_near_far(0.5, 2000.0), Some((0.5, 2000.0)));
         assert_eq!(validate_near_far(0.0, 200.0), None);
